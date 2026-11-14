@@ -120,5 +120,11 @@ export interface StickyNoteRecord {
   schemaVersion: number;
 }
 
-export type NavSection = 'today' | 'tasks' | 'calendar' | 'notes' | 'settings';
+export type NavSection =
+  | 'today'
+  | 'tasks'
+  | 'calendar'
+  | 'notes'
+  | 'import'
+  | 'settings';
 

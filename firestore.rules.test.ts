@@ -1410,3 +1410,35 @@ describe('Step 3 Calendar Events, Sticky Notes & Cross-Isolation', () => {
     await assertFails(fetchAllNotes(suspendedDb, 'teacherSuspended'));
   });
 });
+
+describe('Step 4 Import SourceType Rules Compatibility', () => {
+  it('allows active teacher to create tasks with sourceType import_text and import_ocr under existing rules', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    const textTask = await assertSucceeds(
+      createTask(activeDb, 'teacherActive', {
+        title: '안전교육 이수증 제출',
+        description: '11월 20일까지 행정실 제출',
+        sourceType: 'import_text',
+      }),
+    );
+    const ocrTask = await assertSucceeds(
+      createTask(activeDb, 'teacherActive', {
+        title: '가정통신문 회신 취합',
+        description: '이미지 OCR 추출',
+        sourceType: 'import_ocr',
+      }),
+    );
+
+    const textRecord = await fetchSingleTask(activeDb, 'teacherActive', textTask.id);
+    const ocrRecord = await fetchSingleTask(activeDb, 'teacherActive', ocrTask.id);
+    assert.equal(textRecord?.sourceType, 'import_text');
+    assert.equal(ocrRecord?.sourceType, 'import_ocr');
+  });
+});
+
