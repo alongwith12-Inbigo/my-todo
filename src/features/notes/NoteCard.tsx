@@ -55,6 +55,7 @@ export function NoteCard({
   const noteRef = useRef(note);
   const timerRef = useRef<number | null>(null);
 
+  const isConverted = note.convertedTaskId !== null;
   noteRef.current = note;
   const pending = isNotePending(note.id);
   const style = getNoteColorStyle(note.color);
@@ -75,6 +76,11 @@ export function NoteCard({
     if (!dirtyRef.current) return;
 
     const latestNote = noteRef.current;
+    if (latestNote.convertedTaskId !== null) {
+      dirtyRef.current = false;
+      return;
+    }
+
     const nextText = draftRef.current.trim();
     if (!nextText) {
       setError('메모 내용은 비워둘 수 없습니다. 삭제하려면 휴지통 아이콘을 눌러 주세요.');
@@ -121,6 +127,7 @@ export function NoteCard({
   }, []);
 
   function handleContentChange(value: string) {
+    if (isConverted) return;
     setDraftContent(value);
     draftRef.current = value;
     dirtyRef.current = true;
@@ -136,7 +143,7 @@ export function NoteCard({
   }
 
   async function handleColorChange(nextColor: NoteColor) {
-    if (pending || note.color === nextColor) return;
+    if (isConverted || pending || note.color === nextColor) return;
     setError(null);
     setHasConflict(false);
     try {
@@ -148,7 +155,7 @@ export function NoteCard({
   }
 
   async function handleTogglePin() {
-    if (pending) return;
+    if (isConverted || pending) return;
     setError(null);
     setHasConflict(false);
     try {
@@ -160,7 +167,7 @@ export function NoteCard({
   }
 
   async function handleMove(direction: 'up' | 'down') {
-    if (pending) return;
+    if (isConverted || pending) return;
     setError(null);
     setHasConflict(false);
     try {
@@ -202,74 +209,84 @@ export function NoteCard({
     <article
       className={`rounded-xl border p-4 flex flex-col gap-3 shadow-xs transition-colors ${style.cardBg} ${style.cardBorder}`}
     >
-      {/* Top Action Row: Color swatches + Pin + Order + Delete */}
+      {/* Top Action Row */}
       <div className="flex items-center justify-between gap-2">
-        <div
-          role="group"
-          aria-label={`${contentPreview} 색상 변경`}
-          className="flex items-center gap-1.5"
-        >
-          {NOTE_COLORS.map((c) => {
-            const active = note.color === c.id;
-            return (
-              <button
-                key={c.id}
-                type="button"
-                disabled={pending}
-                onClick={() => void handleColorChange(c.id)}
-                aria-label={`${c.label} 색상`}
-                aria-pressed={active}
-                title={c.label}
-                className={`w-4 h-4 rounded-full border cursor-pointer transition-transform ${c.swatchBg} ${
-                  active
-                    ? 'border-slate-900 scale-110 ring-1 ring-slate-900/30'
-                    : 'border-slate-400/60 hover:scale-105'
-                }`}
-              />
-            );
-          })}
-        </div>
+        {isConverted ? (
+          <span className="text-[11px] font-semibold text-teal-900">
+            업무 전환됨 · 원본 보관
+          </span>
+        ) : (
+          <div
+            role="group"
+            aria-label={`${contentPreview} 색상 변경`}
+            className="flex items-center gap-1.5"
+          >
+            {NOTE_COLORS.map((c) => {
+              const active = note.color === c.id;
+              return (
+                <button
+                  key={c.id}
+                  type="button"
+                  disabled={pending}
+                  onClick={() => void handleColorChange(c.id)}
+                  aria-label={`${c.label} 색상`}
+                  aria-pressed={active}
+                  title={c.label}
+                  className={`w-4 h-4 rounded-full border cursor-pointer transition-transform ${c.swatchBg} ${
+                    active
+                      ? 'border-slate-900 scale-110 ring-1 ring-slate-900/30'
+                      : 'border-slate-400/60 hover:scale-105'
+                  }`}
+                />
+              );
+            })}
+          </div>
+        )}
 
         <div className="flex items-center gap-1">
-          <button
-            type="button"
-            disabled={pending || !canMoveUp}
-            onClick={() => void handleMove('up')}
-            aria-label={`${contentPreview} 순서 위로`}
-            title="앞으로 이동"
-            className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 rounded hover:bg-black/5 cursor-pointer disabled:cursor-default"
-          >
-            <ArrowUp className="w-3.5 h-3.5" aria-hidden="true" />
-          </button>
+          {!isConverted && (
+            <>
+              <button
+                type="button"
+                disabled={pending || !canMoveUp}
+                onClick={() => void handleMove('up')}
+                aria-label={`${contentPreview} 순서 위로`}
+                title="앞으로 이동"
+                className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 rounded hover:bg-black/5 cursor-pointer disabled:cursor-default"
+              >
+                <ArrowUp className="w-3.5 h-3.5" aria-hidden="true" />
+              </button>
 
-          <button
-            type="button"
-            disabled={pending || !canMoveDown}
-            onClick={() => void handleMove('down')}
-            aria-label={`${contentPreview} 순서 아래로`}
-            title="뒤로 이동"
-            className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 rounded hover:bg-black/5 cursor-pointer disabled:cursor-default"
-          >
-            <ArrowDown className="w-3.5 h-3.5" aria-hidden="true" />
-          </button>
+              <button
+                type="button"
+                disabled={pending || !canMoveDown}
+                onClick={() => void handleMove('down')}
+                aria-label={`${contentPreview} 순서 아래로`}
+                title="뒤로 이동"
+                className="p-1 text-slate-600 hover:text-slate-900 disabled:opacity-30 rounded hover:bg-black/5 cursor-pointer disabled:cursor-default"
+              >
+                <ArrowDown className="w-3.5 h-3.5" aria-hidden="true" />
+              </button>
 
-          <button
-            type="button"
-            disabled={pending}
-            onClick={() => void handleTogglePin()}
-            aria-label={note.isPinned ? `${contentPreview} 고정 해제` : `${contentPreview} 상단 고정`}
-            aria-pressed={note.isPinned}
-            title={note.isPinned ? '고정 해제' : '상단 고정'}
-            className={`p-1 rounded hover:bg-black/5 cursor-pointer ${
-              note.isPinned ? 'text-teal-800' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            {note.isPinned ? (
-              <PinOff className="w-3.5 h-3.5" aria-hidden="true" />
-            ) : (
-              <Pin className="w-3.5 h-3.5" aria-hidden="true" />
-            )}
-          </button>
+              <button
+                type="button"
+                disabled={pending}
+                onClick={() => void handleTogglePin()}
+                aria-label={note.isPinned ? `${contentPreview} 고정 해제` : `${contentPreview} 상단 고정`}
+                aria-pressed={note.isPinned}
+                title={note.isPinned ? '고정 해제' : '상단 고정'}
+                className={`p-1 rounded hover:bg-black/5 cursor-pointer ${
+                  note.isPinned ? 'text-teal-800' : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                {note.isPinned ? (
+                  <PinOff className="w-3.5 h-3.5" aria-hidden="true" />
+                ) : (
+                  <Pin className="w-3.5 h-3.5" aria-hidden="true" />
+                )}
+              </button>
+            </>
+          )}
 
           {!confirmDelete ? (
             <button
@@ -304,19 +321,25 @@ export function NoteCard({
         </div>
       </div>
 
-      {/* Inline Editable Textarea */}
+      {/* Note Content (Editable when active, Read-only archive when converted) */}
       <div>
         <label htmlFor={`note-textarea-${note.id}`} className="sr-only">
-          포스트잇 메모 내용
+          {isConverted ? '전환된 원본 포스트잇 메모 내용' : '포스트잇 메모 내용'}
         </label>
         <textarea
           id={`note-textarea-${note.id}`}
           rows={4}
           maxLength={VALIDATION_LIMITS.NOTE_CONTENT_MAX_LEN}
+          readOnly={isConverted}
+          aria-readonly={isConverted}
           value={draftContent}
           onChange={(e) => handleContentChange(e.target.value)}
           onBlur={() => void flushContentSave()}
-          className="w-full bg-transparent text-sm text-slate-900 placeholder:text-slate-500 leading-relaxed resize-y focus:outline-none focus:ring-1 focus:ring-slate-900/20 rounded-md p-1 -m-1"
+          className={`w-full bg-transparent text-sm text-slate-900 placeholder:text-slate-500 leading-relaxed resize-y rounded-md p-1 -m-1 focus:outline-none ${
+            isConverted
+              ? 'cursor-default focus:ring-0'
+              : 'focus:ring-1 focus:ring-slate-900/20'
+          }`}
         />
       </div>
 
@@ -339,7 +362,7 @@ export function NoteCard({
         </div>
       )}
 
-      {/* Footer: Timestamp / Auto-save status + Task conversion */}
+      {/* Footer: Timestamp / Auto-save status + Task action */}
       <div className="pt-2 border-t border-black/10 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-700">
         <div className="tabular-nums">
           {saveState === 'saving' ? (
@@ -352,25 +375,24 @@ export function NoteCard({
         </div>
 
         {note.convertedTaskId ? (
-          <div className="flex items-center gap-2">
+          onOpenTask ? (
+            <button
+              type="button"
+              onClick={() => onOpenTask(note.convertedTaskId!)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-teal-900 bg-white/85 border border-teal-700/30 rounded-md hover:bg-white hover:text-teal-950 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <span>업무 보기</span>
+              <ExternalLink className="w-3 h-3" aria-hidden="true" />
+            </button>
+          ) : (
             <span className="font-medium text-teal-900">업무 전환됨</span>
-            {onOpenTask && (
-              <button
-                type="button"
-                onClick={() => onOpenTask(note.convertedTaskId!)}
-                className="inline-flex items-center gap-1 font-semibold text-teal-800 hover:text-teal-950 underline underline-offset-2 cursor-pointer"
-              >
-                <span>업무 보기</span>
-                <ExternalLink className="w-3 h-3" aria-hidden="true" />
-              </button>
-            )}
-          </div>
+          )
         ) : (
           <button
             type="button"
             disabled={pending}
             onClick={() => onRequestConvert(note)}
-            className="inline-flex items-center gap-1 font-semibold text-slate-900 hover:text-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+            className="inline-flex items-center gap-1 font-semibold text-slate-900 hover:text-teal-800 disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <ArrowRightCircle className="w-3.5 h-3.5 text-teal-800" aria-hidden="true" />
             <span>업무로 전환</span>

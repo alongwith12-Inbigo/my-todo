@@ -178,7 +178,7 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
     async (taskId: string): Promise<TaskRecord | null> => {
       if (!uid) return null;
       const fresh = await fetchSingleTask(uid, taskId);
-      if (fresh) {
+      if (fresh && !fresh.isDeleted && fresh.status !== 'done') {
         setBriefingTasks((prev) => upsertTaskInList(prev, fresh));
       } else {
         setBriefingTasks((prev) => prev.filter((item) => item.id !== taskId));

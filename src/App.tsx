@@ -60,6 +60,12 @@ function AuthenticatedWorkspace({
     setActiveNav('today');
   }
 
+  function handleOpenTaskInTasksView(taskId: string) {
+    setTasksInitialFilter('active');
+    setFocusedTaskId(taskId);
+    setActiveNav('tasks');
+  }
+
   function handleOpenCalendar(eventId?: string) {
     if (eventId) {
       setFocusedEventId(eventId);
@@ -168,6 +174,8 @@ function AuthenticatedWorkspace({
         {activeNav === 'tasks' && (
           <TasksView
             initialFilter={tasksInitialFilter}
+            focusedTaskId={focusedTaskId}
+            onClearFocusedTask={() => setFocusedTaskId(null)}
             onOpenEvent={(eventId) => handleOpenCalendar(eventId)}
           />
         )}
@@ -186,7 +194,7 @@ function AuthenticatedWorkspace({
           <NotesView
             todayKey={todayKey}
             now={now}
-            onOpenTask={handleOpenTask}
+            onOpenTask={handleOpenTaskInTasksView}
           />
         )}
 

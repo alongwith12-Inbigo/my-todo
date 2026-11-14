@@ -194,7 +194,12 @@ export function NoteDataProvider({ children }: { children: ReactNode }) {
       const target = notes.find((n) => n.id === noteId);
       if (!target) return;
 
-      const groupNotes = notes.filter((n) => n.isPinned === target.isPinned);
+      const isConverted = target.convertedTaskId !== null;
+      const groupNotes = notes.filter(
+        (n) =>
+          n.isPinned === target.isPinned &&
+          (n.convertedTaskId !== null) === isConverted,
+      );
       const orderUpdates = computeReorderedNoteUpdates(groupNotes, noteId, direction);
       if (orderUpdates.length === 0) return;
 

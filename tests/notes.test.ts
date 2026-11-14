@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import {
   buildDefaultTaskTitleFromNote,
   computeReorderedNoteUpdates,
+  filterNotesByQuery,
   getNextNoteSortOrder,
+  partitionNotesByConversion,
+  sortConvertedNotes,
   sortStickyNotes,
 } from '../src/lib/notes';
 import type { StickyNoteRecord } from '../src/types/domain';
@@ -85,4 +88,56 @@ test('computeReorderedNoteUpdates handles distinct swaps and colliding sortOrder
 
   assert.equal(getNextNoteSortOrder([]), 10);
   assert.equal(getNextNoteSortOrder([a, b]), 30);
+});
+
+test('partitionNotesByConversion hides converted notes from active list and sorts converted notes by updatedAt desc', () => {
+  const activePinned = makeNote('a1', { isPinned: true, sortOrder: 20 });
+  const activeRegular = makeNote('a2', { isPinned: false, sortOrder: 10 });
+  const convOld = makeNote('c1', {
+    isPinned: true,
+    convertedTaskId: 'task-1',
+    updatedAt: ts('2026-05-15T01:00:00Z'),
+  });
+  const convNew = makeNote('c2', {
+    isPinned: false,
+    convertedTaskId: 'task-2',
+    updatedAt: ts('2026-05-15T04:00:00Z'),
+  });
+
+  const { activeNotes, convertedNotes } = partitionNotesByConversion([
+    activeRegular,
+    convOld,
+    activePinned,
+    convNew,
+  ]);
+
+  assert.deepEqual(
+    activeNotes.map((n) => n.id),
+    ['a1', 'a2'],
+  );
+  assert.deepEqual(
+    convertedNotes.map((n) => n.id),
+    ['c2', 'c1'],
+  );
+  assert.deepEqual(
+    sortConvertedNotes([convOld, convNew]).map((n) => n.id),
+    ['c2', 'c1'],
+  );
+});
+
+test('filterNotesByQuery filters trimmed case-insensitive substrings safely', () => {
+  const notes = [
+    makeNote('1', { content: '현장체험학습 버스 배차' }),
+    makeNote('2', { content: 'Parent Meeting Schedule' }),
+  ];
+
+  assert.equal(filterNotesByQuery(notes, '   ').length, 2);
+  assert.deepEqual(
+    filterNotesByQuery(notes, '버스').map((n) => n.id),
+    ['1'],
+  );
+  assert.deepEqual(
+    filterNotesByQuery(notes, 'parent').map((n) => n.id),
+    ['2'],
+  );
 });

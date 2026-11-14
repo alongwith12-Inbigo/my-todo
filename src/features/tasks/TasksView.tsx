@@ -18,6 +18,8 @@ import { formatTaskErrorMessage } from './taskErrors';
 
 interface TasksViewProps {
   initialFilter?: TaskFilterTab;
+  focusedTaskId?: string | null;
+  onClearFocusedTask?: () => void;
   onOpenEvent?: (eventId: string) => void;
 }
 
@@ -35,10 +37,12 @@ const PAGE_SIZE = 25;
 
 export function TasksView({
   initialFilter = 'active',
+  focusedTaskId,
+  onClearFocusedTask,
   onOpenEvent,
 }: TasksViewProps) {
   const { firebaseUser } = useAuth();
-  const { listVersion } = useTaskData();
+  const { listVersion, briefingTasks, refreshSingleTask } = useTaskData();
   const uid = firebaseUser?.uid ?? null;
 
   const [filterTab, setFilterTab] = useState<TaskFilterTab>(initialFilter);
@@ -54,10 +58,57 @@ export function TasksView({
   const [selectedTask, setSelectedTask] = useState<TaskRecord | null>(null);
 
   const cursorRef = useRef<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const tasksRef = useRef<TaskRecord[]>([]);
+  const briefingTasksRef = useRef<TaskRecord[]>([]);
+  tasksRef.current = tasks;
+  briefingTasksRef.current = briefingTasks;
 
   useEffect(() => {
     setFilterTab(initialFilter);
   }, [initialFilter]);
+
+  useEffect(() => {
+    if (!focusedTaskId) return;
+    const cached =
+      tasksRef.current.find((item) => item.id === focusedTaskId) ??
+      briefingTasksRef.current.find((item) => item.id === focusedTaskId);
+    if (cached) {
+      setSelectedTask(cached);
+      if (cached.isDeleted) {
+        setFilterTab('trash');
+      } else if (cached.status === 'done') {
+        setFilterTab('done');
+      }
+      onClearFocusedTask?.();
+      return;
+    }
+
+    let cancelled = false;
+    void refreshSingleTask(focusedTaskId)
+      .then((fetched) => {
+        if (cancelled) return;
+        if (fetched) {
+          setSelectedTask(fetched);
+          if (fetched.isDeleted) {
+            setFilterTab('trash');
+          } else if (fetched.status === 'done') {
+            setFilterTab('done');
+          }
+        } else {
+          setError('연결된 업무를 찾을 수 없습니다. 이미 영구 삭제되었을 수 있습니다.');
+        }
+        onClearFocusedTask?.();
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(formatTaskErrorMessage(err));
+        onClearFocusedTask?.();
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [focusedTaskId, refreshSingleTask, onClearFocusedTask]);
 
   const querySortField: TaskQuerySortField =
     sortMode === 'dueAt' ? 'dueAt' : 'updatedAt';

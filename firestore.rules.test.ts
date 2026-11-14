@@ -1319,6 +1319,19 @@ describe('Step 3 Calendar Events, Sticky Notes & Cross-Isolation', () => {
     assert.equal(noteAfterConvertSnap.exists(), true);
     assert.equal(noteAfterConvertSnap.data()?.convertedTaskId, conv.taskId);
 
+    // fetchAllNotes still returns the preserved converted note alongside active notes
+    const afterConvertList = await assertSucceeds(fetchAllNotes(activeDb, 'teacherActive'));
+    const activeAfterConvert = afterConvertList.notes.filter((n) => n.convertedTaskId === null);
+    const convertedAfterConvert = afterConvertList.notes.filter((n) => n.convertedTaskId !== null);
+    assert.deepEqual(
+      activeAfterConvert.map((n) => n.id),
+      [n2.id],
+    );
+    assert.deepEqual(
+      convertedAfterConvert.map((n) => n.id),
+      [n1.id],
+    );
+
     // 5. Duplicate conversion rejected by repository AND rules
     await assert.rejects(
       convertNoteToTask(activeDb, 'teacherActive', n1.id, 4, {

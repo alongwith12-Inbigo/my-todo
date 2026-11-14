@@ -135,3 +135,47 @@ export function computeReorderedNoteUpdates(
   });
   return updates;
 }
+
+export function sortConvertedNotes(
+  notes: StickyNoteRecord[],
+): StickyNoteRecord[] {
+  return [...notes].sort((a, b) => {
+    const updatedA = timestampToMillis(a.updatedAt) ?? 0;
+    const updatedB = timestampToMillis(b.updatedAt) ?? 0;
+    if (updatedB !== updatedA) {
+      return updatedB - updatedA;
+    }
+    return a.id.localeCompare(b.id);
+  });
+}
+
+export function partitionNotesByConversion(notes: StickyNoteRecord[]): {
+  activeNotes: StickyNoteRecord[];
+  convertedNotes: StickyNoteRecord[];
+} {
+  const active: StickyNoteRecord[] = [];
+  const converted: StickyNoteRecord[] = [];
+
+  for (const note of notes) {
+    if (note.convertedTaskId !== null) {
+      converted.push(note);
+    } else {
+      active.push(note);
+    }
+  }
+
+  return {
+    activeNotes: sortStickyNotes(active),
+    convertedNotes: sortConvertedNotes(converted),
+  };
+}
+
+export function filterNotesByQuery(
+  notes: StickyNoteRecord[],
+  searchTerm: string,
+): StickyNoteRecord[] {
+  const q = searchTerm.trim().toLowerCase();
+  if (!q) return notes;
+  return notes.filter((n) => n.content.toLowerCase().includes(q));
+}
+

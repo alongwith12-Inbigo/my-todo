@@ -180,13 +180,21 @@ export function TodayBriefingView({
     }
 
     let cancelled = false;
-    void refreshSingleTask(focusedTaskId).then((fetched) => {
-      if (cancelled) return;
-      if (fetched) {
-        setSelectedTask(fetched);
-      }
-      onClearFocusedTask?.();
-    });
+    void refreshSingleTask(focusedTaskId)
+      .then((fetched) => {
+        if (cancelled) return;
+        if (fetched) {
+          setSelectedTask(fetched);
+        } else {
+          setActionError('연결된 업무를 찾을 수 없습니다. 이미 영구 삭제되었을 수 있습니다.');
+        }
+        onClearFocusedTask?.();
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setActionError('연결된 업무를 불러오는 중 오류가 발생했습니다.');
+        onClearFocusedTask?.();
+      });
     return () => {
       cancelled = true;
     };
