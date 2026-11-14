@@ -1,14 +1,26 @@
 import { formatFirebaseErrorMessage } from '../auth/AuthContext';
 import {
+  EventConcurrencyError,
+  EventValidationError,
+} from '../../repositories/eventRepo';
+import {
+  NoteConcurrencyError,
+  NoteValidationError,
+} from '../../repositories/noteRepo';
+import {
   TaskConcurrencyError,
   TaskValidationError,
 } from '../../repositories/taskRepo';
 
 export function formatTaskErrorMessage(error: unknown): string {
-  if (error instanceof TaskConcurrencyError) {
-    return error.message;
-  }
-  if (error instanceof TaskValidationError) {
+  if (
+    error instanceof TaskConcurrencyError ||
+    error instanceof TaskValidationError ||
+    error instanceof EventConcurrencyError ||
+    error instanceof EventValidationError ||
+    error instanceof NoteConcurrencyError ||
+    error instanceof NoteValidationError
+  ) {
     return error.message;
   }
 
@@ -28,8 +40,9 @@ export function formatTaskErrorMessage(error: unknown): string {
   }
 
   if (code === 'not-found' || raw.includes('No document to update')) {
-    return '대상 업무가 이미 삭제되었거나 찾을 수 없습니다. 목록을 새로고침해 주세요.';
+    return '대상 항목이 이미 삭제되었거나 찾을 수 없습니다. 목록을 새로고침해 주세요.';
   }
 
   return formatFirebaseErrorMessage(error);
 }
+

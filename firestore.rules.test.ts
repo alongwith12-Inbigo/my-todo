@@ -40,6 +40,25 @@ import {
   fetchSingleTask,
   fetchTasksPage,
 } from './src/repositories/taskQueries';
+import {
+  createEvent,
+  deleteEvent,
+  EventConcurrencyError,
+  EventValidationError,
+  fetchEventsInRange,
+  fetchSingleEvent,
+  updateEvent,
+} from './src/repositories/eventOperations';
+import {
+  convertNoteToTask,
+  createNote,
+  deleteNote,
+  fetchAllNotes,
+  NoteConcurrencyError,
+  NoteValidationError,
+  reorderNotes,
+  updateNote,
+} from './src/repositories/noteOperations';
 import { classifyTodayBriefing } from './src/lib/briefing';
 
 const PROJECT_ID = 'school-partner-rules-test';
@@ -1125,5 +1144,256 @@ describe('Step 2 Task Operations & Concurrency Compatibility', () => {
     await assertFails(
       fetchBriefingTaskSet(activeDb, 'teacherActive2', { now }),
     );
+  });
+});
+
+describe('Step 3 Calendar Events, Sticky Notes & Cross-Isolation', () => {
+  it('supports Event CRUD, concurrency check, multi-day range queries, and safe task detachment on delete', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    // Create a linked task first
+    const linkedTask = await assertSucceeds(
+      createTask(activeDb, 'teacherActive', {
+        title: '연수 사전 설문 제출',
+      }),
+    );
+
+    // 1. Create timed & multi-day events
+    const startMs = new Date('2026-05-14T15:00:00Z').getTime(); // 2026-05-15 00:00 KST
+    const endMs = new Date('2026-05-16T14:59:59Z').getTime(); // 2026-05-16 23:59 KST
+    const created = await assertSucceeds(
+      createEvent(activeDb, 'teacherActive', {
+        title: '현장체험학습 인솔',
+        startsAt: Timestamp.fromMillis(startMs),
+        endsAt: Timestamp.fromMillis(endMs),
+        allDay: true,
+        location: '수목원',
+        description: '안전 지도 체크',
+        relatedTaskId: linkedTask.id,
+      }),
+    );
+    assert.equal(created.version, 1);
+
+    // Attach relatedEventId back onto task (Branch 1)
+    const updatedTask = await assertSucceeds(
+      updateTaskDetails(activeDb, 'teacherActive', linkedTask.id, 1, {
+        relatedEventId: created.id,
+      }),
+    );
+    assert.equal(updatedTask.version, 2);
+
+    // Query May 16 KST ONLY -> must STILL return multi-day event spanning May 15~16!
+    const may16Start = new Date('2026-05-15T15:00:00Z').getTime();
+    const may16End = new Date('2026-05-16T14:59:59Z').getTime();
+    const rangeEvents = await assertSucceeds(
+      fetchEventsInRange(activeDb, 'teacherActive', may16Start, may16End),
+    );
+    assert.deepEqual(
+      rangeEvents.map((e) => e.id),
+      [created.id],
+    );
+
+    // 2. Update event & verify stale version conflict
+    const edited = await assertSucceeds(
+      updateEvent(activeDb, 'teacherActive', created.id, 1, {
+        title: '현장체험학습 인솔 (최종)',
+        location: '국립수목원 정문',
+      }),
+    );
+    assert.equal(edited.version, 2);
+
+    await assert.rejects(
+      updateEvent(activeDb, 'teacherActive', created.id, 1, {
+        title: '오래된 버전 덮어쓰기',
+      }),
+      EventConcurrencyError,
+    );
+
+    // Invalid inverted range rejected both client & rules side
+    await assert.rejects(
+      createEvent(activeDb, 'teacherActive', {
+        title: '시간 역전',
+        startsAt: Timestamp.fromMillis(endMs),
+        endsAt: Timestamp.fromMillis(startMs),
+        allDay: false,
+      }),
+      EventValidationError,
+    );
+
+    // 3. Deleting linked event clears task.relatedEventId without deleting/harming the task
+    const delResult = await assertSucceeds(
+      deleteEvent(activeDb, 'teacherActive', created.id),
+    );
+    assert.equal(delResult.clearedTaskId, linkedTask.id);
+    assert.equal(await fetchSingleEvent(activeDb, 'teacherActive', created.id), null);
+
+    const taskAfterEventDelete = await fetchSingleTask(
+      activeDb,
+      'teacherActive',
+      linkedTask.id,
+    );
+    assert.ok(taskAfterEventDelete);
+    assert.equal(taskAfterEventDelete.isDeleted, false);
+    assert.equal(taskAfterEventDelete.relatedEventId, null);
+    assert.equal(taskAfterEventDelete.version, 3);
+  });
+
+  it('supports Sticky Note CRUD, reorder transaction, and atomic 1-time note-to-task conversion while keeping source note intact', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    // 1. Create two notes
+    const n1 = await assertSucceeds(
+      createNote(activeDb, 'teacherActive', {
+        content: '학급비 영수증 스캔하기\n행정실 제출 필요',
+        color: 'butter',
+        isPinned: false,
+        sortOrder: 10,
+      }),
+    );
+    const n2 = await assertSucceeds(
+      createNote(activeDb, 'teacherActive', {
+        content: '체육대회 반티 신청 취합',
+        color: 'mint',
+        isPinned: true,
+        sortOrder: 20,
+      }),
+    );
+
+    // 2. Edit note + optimistic lock
+    const n1Edited = await assertSucceeds(
+      updateNote(activeDb, 'teacherActive', n1.id, 1, {
+        color: 'sky',
+        isPinned: true,
+      }),
+    );
+    assert.equal(n1Edited.version, 2);
+
+    await assert.rejects(
+      updateNote(activeDb, 'teacherActive', n1.id, 1, {
+        content: '오래된 수정 시도',
+      }),
+      NoteConcurrencyError,
+    );
+
+    // 3. Reorder notes inside transaction
+    await assertSucceeds(
+      reorderNotes(activeDb, 'teacherActive', [
+        { id: n1.id, expectedVersion: 2, sortOrder: 30 },
+        { id: n2.id, expectedVersion: 1, sortOrder: 10 },
+      ]),
+    );
+    const allNotesRes = await assertSucceeds(fetchAllNotes(activeDb, 'teacherActive'));
+    assert.deepEqual(
+      allNotesRes.notes.map((n) => n.id),
+      [n2.id, n1.id],
+    );
+
+    // 4. Atomic note-to-task conversion keeps original note and sets sourceType='note'
+    const conv = await assertSucceeds(
+      convertNoteToTask(activeDb, 'teacherActive', n1.id, 3, {
+        title: '학급비 영수증 스캔하기',
+        description: '학급비 영수증 스캔하기\n행정실 제출 필요',
+        priority: 'high',
+      }),
+    );
+    assert.equal(conv.noteVersion, 4);
+
+    const createdTask = await fetchSingleTask(activeDb, 'teacherActive', conv.taskId);
+    assert.ok(createdTask);
+    assert.equal(createdTask.sourceType, 'note');
+    assert.equal(createdTask.title, '학급비 영수증 스캔하기');
+
+    const noteAfterConvertSnap = await getDoc(
+      doc(activeDb, 'users', 'teacherActive', 'notes', n1.id),
+    );
+    assert.equal(noteAfterConvertSnap.exists(), true);
+    assert.equal(noteAfterConvertSnap.data()?.convertedTaskId, conv.taskId);
+
+    // 5. Duplicate conversion rejected by repository AND rules
+    await assert.rejects(
+      convertNoteToTask(activeDb, 'teacherActive', n1.id, 4, {
+        title: '중복 생성 시도',
+      }),
+      NoteValidationError,
+    );
+    await assertFails(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'notes', n1.id), {
+        convertedTaskId: 'anotherTask',
+        version: 5,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // 6. Delete note succeeds
+    await assertSucceeds(deleteNote(activeDb, 'teacherActive', n2.id));
+  });
+
+  it('blocks other teachers, admins, and suspended users from accessing events and notes', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+    const otherDb = testEnv
+      .authenticatedContext('teacherActive2', {
+        email: 'active2@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+    const adminDb = testEnv
+      .authenticatedContext('admin1', {
+        email: 'admin1@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+    const suspendedDb = testEnv
+      .authenticatedContext('teacherSuspended', {
+        email: 'suspended@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    const ev = await createEvent(activeDb, 'teacherActive', {
+      title: '비공개 개인 일정',
+      startsAt: Timestamp.fromMillis(1700000000000),
+      endsAt: Timestamp.fromMillis(1700003600000),
+      allDay: false,
+    });
+    const note = await createNote(activeDb, 'teacherActive', {
+      content: '비공개 개인 포스트잇',
+    });
+
+    // Other teacher blocked
+    await assertFails(fetchSingleEvent(otherDb, 'teacherActive', ev.id));
+    await assertFails(fetchAllNotes(otherDb, 'teacherActive'));
+    await assertFails(
+      deleteNote(otherDb, 'teacherActive', note.id),
+    );
+
+    // Admin blocked from teacher private events & notes
+    await assertFails(fetchSingleEvent(adminDb, 'teacherActive', ev.id));
+    await assertFails(fetchAllNotes(adminDb, 'teacherActive'));
+
+    // Suspended user blocked from own workspace events & notes
+    await assertFails(
+      createEvent(suspendedDb, 'teacherSuspended', {
+        title: '정지 계정 일정 시도',
+        startsAt: Timestamp.fromMillis(1700000000000),
+        endsAt: Timestamp.fromMillis(1700003600000),
+        allDay: false,
+      }),
+    );
+    await assertFails(fetchAllNotes(suspendedDb, 'teacherSuspended'));
   });
 });

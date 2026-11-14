@@ -1,21 +1,27 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Timestamp } from 'firebase/firestore';
-import { RefreshCw, RotateCcw, Trash2, X } from 'lucide-react';
+import { Calendar, ExternalLink, RefreshCw, RotateCcw, Trash2, X } from 'lucide-react';
 import { STATUS_LABEL, timestampToDate } from '../../lib/briefing';
 import {
   addKstDaysToDateKey,
   formatKstDateTime,
+  formatKstEventTimeRange,
+  formatKstShortDate,
   getKstDateInputValue,
   getKstDateParts,
   parseKstDateInput,
 } from '../../lib/dateKst';
+import { fetchSingleEvent } from '../../repositories/eventRepo';
 import { TaskConcurrencyError } from '../../repositories/taskRepo';
 import {
   VALIDATION_LIMITS,
+  type CalendarEventRecord,
   type TaskPriority,
   type TaskRecord,
   type TaskStatus,
 } from '../../types/domain';
+import { useAuth } from '../auth/AuthContext';
+import { useEventData } from '../calendar/EventDataContext';
 import { useTaskData } from './TaskDataContext';
 import { formatTaskErrorMessage } from './taskErrors';
 
@@ -23,6 +29,7 @@ interface TaskDetailModalProps {
   task: TaskRecord | null;
   onClose: () => void;
   onTaskUpdated?: (updated: TaskRecord | null) => void;
+  onOpenEvent?: (eventId: string) => void;
 }
 
 const ALL_STATUSES: TaskStatus[] = ['todo', 'doing', 'on_hold', 'done'];
@@ -31,7 +38,10 @@ export function TaskDetailModal({
   task,
   onClose,
   onTaskUpdated,
+  onOpenEvent,
 }: TaskDetailModalProps) {
+  const { firebaseUser } = useAuth();
+  const { events } = useEventData();
   const {
     isTaskPending,
     saveTaskDetails,
@@ -49,6 +59,10 @@ export function TaskDetailModal({
   const [dueDateStr, setDueDateStr] = useState('');
   const [scheduledDateStr, setScheduledDateStr] = useState('');
   const [remindDateStr, setRemindDateStr] = useState('');
+  const [relatedEventId, setRelatedEventId] = useState('');
+  const [linkedEventLookup, setLinkedEventLookup] =
+    useState<CalendarEventRecord | null>(null);
+  const [linkedEventMissing, setLinkedEventMissing] = useState(false);
 
   const [hasConcurrencyConflict, setHasConcurrencyConflict] = useState(false);
   const [confirmPermanentDelete, setConfirmPermanentDelete] = useState(false);
@@ -64,6 +78,7 @@ export function TaskDetailModal({
     setDueDateStr(getKstDateInputValue(timestampToDate(target.dueAt)));
     setScheduledDateStr(getKstDateInputValue(timestampToDate(target.scheduledAt)));
     setRemindDateStr(getKstDateInputValue(timestampToDate(target.remindAt)));
+    setRelatedEventId(target.relatedEventId ?? '');
   }
 
   useEffect(() => {
@@ -75,6 +90,43 @@ export function TaskDetailModal({
       syncFormFromTask(task);
     }
   }, [task]);
+
+  useEffect(() => {
+    if (!currentTask || !relatedEventId || !firebaseUser?.uid) {
+      setLinkedEventLookup(null);
+      setLinkedEventMissing(false);
+      return;
+    }
+
+    const cached = events.find((ev) => ev.id === relatedEventId);
+    if (cached) {
+      setLinkedEventLookup(cached);
+      setLinkedEventMissing(false);
+      return;
+    }
+
+    let cancelled = false;
+    void fetchSingleEvent(firebaseUser.uid, relatedEventId)
+      .then((found) => {
+        if (cancelled) return;
+        if (found) {
+          setLinkedEventLookup(found);
+          setLinkedEventMissing(false);
+        } else {
+          setLinkedEventLookup(null);
+          setLinkedEventMissing(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLinkedEventLookup(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTask, relatedEventId, events, firebaseUser?.uid]);
 
   useEffect(() => {
     if (!currentTask) return;
@@ -166,6 +218,7 @@ export function TaskDetailModal({
         dueAt: dueDate ? Timestamp.fromDate(dueDate) : null,
         scheduledAt: scheduledDate ? Timestamp.fromDate(scheduledDate) : null,
         remindAt: remindDate ? Timestamp.fromDate(remindDate) : null,
+        relatedEventId: relatedEventId.trim() || null,
       });
 
       if (updated) {
@@ -619,6 +672,81 @@ export function TaskDetailModal({
                   </div>
                 )}
               </div>
+            </div>
+
+            <div className="pt-2 border-t border-slate-100 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <label
+                  htmlFor="detail-task-related-event"
+                  className="text-xs font-medium text-slate-800"
+                >
+                  관련 일정 연결 (선택)
+                </label>
+                {relatedEventId && !activeTask.isDeleted && (
+                  <button
+                    type="button"
+                    onClick={() => setRelatedEventId('')}
+                    className="text-xs text-slate-500 hover:text-slate-900 cursor-pointer"
+                  >
+                    연결 해제
+                  </button>
+                )}
+              </div>
+
+              <select
+                id="detail-task-related-event"
+                disabled={activeTask.isDeleted}
+                value={relatedEventId}
+                onChange={(e) => setRelatedEventId(e.target.value)}
+                className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg bg-white disabled:bg-slate-50 focus:outline-none focus:border-teal-700"
+              >
+                <option value="">연결된 일정 없음</option>
+                {events.map((ev) => {
+                  const startDate = timestampToDate(ev.startsAt);
+                  const endDate = timestampToDate(ev.endsAt);
+                  return (
+                    <option key={ev.id} value={ev.id}>
+                      {ev.title} ({formatKstShortDate(startDate)}{' '}
+                      {formatKstEventTimeRange(startDate, endDate, ev.allDay)})
+                    </option>
+                  );
+                })}
+                {relatedEventId && !events.some((ev) => ev.id === relatedEventId) && (
+                  <option value={relatedEventId}>
+                    {linkedEventLookup
+                      ? `${linkedEventLookup.title} (${formatKstShortDate(timestampToDate(linkedEventLookup.startsAt))})`
+                      : '연결된 일정 (삭제되었거나 찾을 수 없음)'}
+                  </option>
+                )}
+              </select>
+
+              {linkedEventLookup && onOpenEvent && (
+                <div className="flex items-center justify-between gap-2 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs">
+                  <span className="inline-flex items-center gap-1.5 text-slate-700 truncate">
+                    <Calendar className="w-3.5 h-3.5 text-teal-700 shrink-0" aria-hidden="true" />
+                    <span className="truncate">
+                      연결된 일정: <strong className="font-semibold">{linkedEventLookup.title}</strong>
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenEvent(linkedEventLookup.id);
+                    }}
+                    className="inline-flex items-center gap-1 font-semibold text-teal-700 hover:text-teal-800 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <span>일정 보기</span>
+                    <ExternalLink className="w-3 h-3" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+
+              {linkedEventMissing && relatedEventId && (
+                <p className="text-xs text-amber-800">
+                  연결되었던 일정을 찾을 수 없습니다. 연결 해제를 누른 뒤 저장하거나 새 일정을 선택해 주세요.
+                </p>
+              )}
             </div>
 
             {!activeTask.isDeleted && (

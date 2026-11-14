@@ -1,22 +1,38 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Calendar,
   ChevronDown,
   ChevronUp,
+  Clock,
+  Link2,
+  MapPin,
+  Plus,
   RefreshCw,
 } from 'lucide-react';
-import { classifyTodayBriefing } from '../../lib/briefing';
-import { formatKstTodayHeader, getKstGreeting } from '../../lib/dateKst';
+import { classifyTodayBriefing, timestampToDate } from '../../lib/briefing';
+import { classifyTodayEvents, getMinutesUntilEventStart } from '../../lib/calendar';
+import {
+  formatKstEventTimeRange,
+  formatKstTodayHeader,
+  getKstGreeting,
+} from '../../lib/dateKst';
 import type { TaskFilterTab } from '../../repositories/taskRepo';
-import type { TaskRecord } from '../../types/domain';
+import type { CalendarEventRecord, TaskRecord } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
+import { useEventData } from '../calendar/EventDataContext';
+import { EventModal } from '../calendar/EventModal';
 import { useTaskData } from './TaskDataContext';
 import { TaskDetailModal } from './TaskDetailModal';
 import { TaskQuickAddBar } from './TaskQuickAddBar';
 import { TaskRow } from './TaskRow';
 
 interface TodayBriefingViewProps {
+  now: Date;
+  todayKey: string;
   onOpenTasksView: (initialFilter?: TaskFilterTab) => void;
+  onOpenCalendar: (eventId?: string) => void;
+  focusedTaskId?: string | null;
+  onClearFocusedTask?: () => void;
 }
 
 const PREVIEW_LIMIT = 5;
@@ -121,7 +137,14 @@ function BriefingSection({
   );
 }
 
-export function TodayBriefingView({ onOpenTasksView }: TodayBriefingViewProps) {
+export function TodayBriefingView({
+  now,
+  todayKey,
+  onOpenTasksView,
+  onOpenCalendar,
+  focusedTaskId,
+  onClearFocusedTask,
+}: TodayBriefingViewProps) {
   const { workspace } = useAuth();
   const {
     briefingTasks,
@@ -131,10 +154,15 @@ export function TodayBriefingView({ onOpenTasksView }: TodayBriefingViewProps) {
     loadingMoreUndated,
     usedIndexFallback,
     refreshBriefing,
+    refreshSingleTask,
     loadMoreUndated,
   } = useTaskData();
+  const { events, eventsLoading, refreshEvents } = useEventData();
 
   const [selectedTask, setSelectedTask] = useState<TaskRecord | null>(null);
+  const [eventModalOpen, setEventModalOpen] = useState(false);
+  const [selectedEvent, setSelectedEvent] =
+    useState<CalendarEventRecord | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [undatedOpen, setUndatedOpen] = useState(false);
   const [unremindedOpen, setUnremindedOpen] = useState(false);
@@ -142,9 +170,36 @@ export function TodayBriefingView({ onOpenTasksView }: TodayBriefingViewProps) {
   const imminentDays = workspace?.preferences.imminentDays ?? 3;
   const displayName = workspace?.profile.displayName ?? '선생님';
 
+  useEffect(() => {
+    if (!focusedTaskId) return;
+    const cached = briefingTasks.find((item) => item.id === focusedTaskId);
+    if (cached) {
+      setSelectedTask(cached);
+      onClearFocusedTask?.();
+      return;
+    }
+
+    let cancelled = false;
+    void refreshSingleTask(focusedTaskId).then((fetched) => {
+      if (cancelled) return;
+      if (fetched) {
+        setSelectedTask(fetched);
+      }
+      onClearFocusedTask?.();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [focusedTaskId, briefingTasks, refreshSingleTask, onClearFocusedTask]);
+
   const summary = useMemo(
-    () => classifyTodayBriefing(briefingTasks, { imminentDays }),
-    [briefingTasks, imminentDays],
+    () => classifyTodayBriefing(briefingTasks, { imminentDays, now }),
+    [briefingTasks, imminentDays, now],
+  );
+
+  const todayEventsSummary = useMemo(
+    () => classifyTodayEvents(events, { now, soonMinutes: 120, upcomingDays: 7 }),
+    [events, now],
   );
 
   const hasAnyPriorityFocus =
@@ -160,7 +215,7 @@ export function TodayBriefingView({ onOpenTasksView }: TodayBriefingViewProps) {
       <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-4">
         <div className="space-y-1">
           <p className="text-xs font-medium text-slate-500">
-            {formatKstTodayHeader()}
+            {formatKstTodayHeader(now)}
             <span aria-hidden="true" className="mx-1.5">
               ·
             </span>
@@ -170,17 +225,18 @@ export function TodayBriefingView({ onOpenTasksView }: TodayBriefingViewProps) {
             오늘의 브리핑
           </h1>
           <p className="text-sm text-slate-600">
-            {getKstGreeting(displayName)}
+            {getKstGreeting(displayName, now)}
           </p>
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
-            disabled={briefingLoading}
+            disabled={briefingLoading || eventsLoading}
             onClick={() => {
               setActionError(null);
               void refreshBriefing();
+              void refreshEvents();
             }}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
           >
@@ -346,24 +402,174 @@ export function TodayBriefingView({ onOpenTasksView }: TodayBriefingViewProps) {
             )}
           </div>
 
-          {/* Secondary Column: Schedule Slot + Collapsible Undated / Unreminded */}
+          {/* Secondary Column: Today Schedule + Collapsible Undated / Unreminded */}
           <aside className="lg:col-span-4 space-y-5">
-            {/* Step 3 Schedule Integration Slot */}
+            {/* Live Today Schedule */}
             <section
               aria-label="오늘의 일정"
-              className="bg-white border border-slate-200 rounded-xl p-5 space-y-2.5"
+              className="bg-white border border-slate-200 rounded-xl p-5 space-y-3.5"
             >
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <Calendar className="w-4 h-4 text-teal-700" aria-hidden="true" />
                   <h2 className="text-sm font-bold text-slate-900">오늘의 일정</h2>
+                  <span className="text-xs font-semibold text-slate-500 tabular-nums">
+                    {todayEventsSummary.totalTodayCount}건
+                  </span>
                 </div>
-                <span className="text-xs text-slate-400">3단계 연동</span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedEvent(null);
+                      setEventModalOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-teal-800 hover:text-teal-950 cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>등록</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onOpenCalendar()}
+                    className="text-xs font-medium text-slate-600 hover:text-teal-700 cursor-pointer"
+                  >
+                    달력 보기
+                  </button>
+                </div>
               </div>
-              <p className="text-xs text-slate-500 leading-relaxed">
-                등록된 오늘의 일정이 아직 없습니다. 3단계에서 학사·회의·개인
-                일정 관리 기능을 연결하면 이 영역에 오늘 일정이 함께 표시됩니다.
-              </p>
+
+              {eventsLoading && todayEventsSummary.totalTodayCount === 0 ? (
+                <p className="text-xs text-slate-500 py-2">
+                  오늘 일정을 불러오는 중입니다...
+                </p>
+              ) : todayEventsSummary.totalTodayCount === 0 ? (
+                <div className="py-2 space-y-2">
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    오늘(Asia/Seoul) 예정된 일정이 없습니다. 회의, 연수, 상담 등
+                    일정을 등록해 두면 이 영역과 알림에서 바로 확인할 수 있습니다.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {todayEventsSummary.startingSoon.length > 0 && (
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] font-semibold text-amber-900 flex items-center gap-1">
+                        <Clock className="w-3 h-3 text-amber-700" aria-hidden="true" />
+                        <span>곧 시작 · 진행 중인 일정</span>
+                      </p>
+                      <div className="space-y-1.5">
+                        {todayEventsSummary.startingSoon.map((ev) => {
+                          const startDate = timestampToDate(ev.startsAt);
+                          const endDate = timestampToDate(ev.endsAt);
+                          const mins = getMinutesUntilEventStart(ev, now);
+                          const timingHint =
+                            mins !== null && mins <= 0
+                              ? '진행 중'
+                              : mins !== null && mins <= 60
+                                ? `${mins}분 후`
+                                : '곧 시작';
+                          return (
+                            <button
+                              key={ev.id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedEvent(ev);
+                                setEventModalOpen(true);
+                              }}
+                              className="w-full text-left p-2.5 rounded-lg border border-amber-200 bg-amber-50/60 hover:bg-amber-50 transition-colors space-y-1 cursor-pointer"
+                            >
+                              <div className="flex items-baseline justify-between gap-2">
+                                <span className="text-xs font-semibold text-slate-900 truncate">
+                                  {ev.title}
+                                </span>
+                                <span className="text-[11px] font-semibold text-amber-900 shrink-0 tabular-nums">
+                                  {timingHint}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-600 tabular-nums">
+                                {formatKstEventTimeRange(startDate, endDate, ev.allDay)}
+                                {ev.location && (
+                                  <>
+                                    <span aria-hidden="true" className="mx-1.5">
+                                      ·
+                                    </span>
+                                    <span>{ev.location}</span>
+                                  </>
+                                )}
+                              </p>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {todayEventsSummary.otherToday.length > 0 && (
+                    <div className="space-y-1.5">
+                      {todayEventsSummary.startingSoon.length > 0 && (
+                        <p className="text-[11px] font-semibold text-slate-600">
+                          오늘의 기타 일정
+                        </p>
+                      )}
+                      <div className="space-y-1.5">
+                        {todayEventsSummary.otherToday.map((ev) => {
+                          const startDate = timestampToDate(ev.startsAt);
+                          const endDate = timestampToDate(ev.endsAt);
+                          return (
+                            <button
+                              key={ev.id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedEvent(ev);
+                                setEventModalOpen(true);
+                              }}
+                              className={`w-full text-left p-2.5 rounded-lg border transition-colors space-y-1 cursor-pointer ${
+                                ev.allDay
+                                  ? 'border-teal-200 bg-teal-50/40 hover:bg-teal-50'
+                                  : 'border-slate-200 bg-white hover:bg-slate-50'
+                              }`}
+                            >
+                              <div className="flex items-baseline justify-between gap-2">
+                                <span className="text-xs font-semibold text-slate-900 truncate">
+                                  {ev.title}
+                                </span>
+                                <span
+                                  className={`text-[11px] font-medium shrink-0 tabular-nums ${
+                                    ev.allDay ? 'text-teal-800' : 'text-slate-600'
+                                  }`}
+                                >
+                                  {formatKstEventTimeRange(
+                                    startDate,
+                                    endDate,
+                                    ev.allDay,
+                                  )}
+                                </span>
+                              </div>
+                              {(ev.location || ev.relatedTaskId) && (
+                                <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[11px] text-slate-500">
+                                  {ev.location && (
+                                    <span className="inline-flex items-center gap-1">
+                                      <MapPin className="w-3 h-3" aria-hidden="true" />
+                                      <span>{ev.location}</span>
+                                    </span>
+                                  )}
+                                  {ev.relatedTaskId && (
+                                    <span className="inline-flex items-center gap-1 text-teal-700">
+                                      <Link2 className="w-3 h-3" aria-hidden="true" />
+                                      <span>업무 연결됨</span>
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
 
             {/* Collapsible: Undated Incomplete Tasks */}
@@ -496,6 +702,29 @@ export function TodayBriefingView({ onOpenTasksView }: TodayBriefingViewProps) {
       <TaskDetailModal
         task={selectedTask}
         onClose={() => setSelectedTask(null)}
+        onOpenEvent={(eventId) => onOpenCalendar(eventId)}
+      />
+
+      <EventModal
+        isOpen={eventModalOpen}
+        event={selectedEvent}
+        initialDateKey={todayKey}
+        onClose={() => {
+          setEventModalOpen(false);
+          setSelectedEvent(null);
+        }}
+        onOpenTask={(taskId) => {
+          setEventModalOpen(false);
+          setSelectedEvent(null);
+          const matched = briefingTasks.find((t) => t.id === taskId);
+          if (matched) {
+            setSelectedTask(matched);
+          } else {
+            void refreshSingleTask(taskId).then((fetched) => {
+              if (fetched) setSelectedTask(fetched);
+            });
+          }
+        }}
       />
     </div>
   );

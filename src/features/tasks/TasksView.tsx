@@ -18,6 +18,7 @@ import { formatTaskErrorMessage } from './taskErrors';
 
 interface TasksViewProps {
   initialFilter?: TaskFilterTab;
+  onOpenEvent?: (eventId: string) => void;
 }
 
 const FILTER_TABS: { id: TaskFilterTab; label: string }[] = [
@@ -32,7 +33,10 @@ const FILTER_TABS: { id: TaskFilterTab; label: string }[] = [
 
 const PAGE_SIZE = 25;
 
-export function TasksView({ initialFilter = 'active' }: TasksViewProps) {
+export function TasksView({
+  initialFilter = 'active',
+  onOpenEvent,
+}: TasksViewProps) {
   const { firebaseUser } = useAuth();
   const { listVersion } = useTaskData();
   const uid = firebaseUser?.uid ?? null;
@@ -313,6 +317,7 @@ export function TasksView({ initialFilter = 'active' }: TasksViewProps) {
       <TaskDetailModal
         task={selectedTask}
         onClose={() => setSelectedTask(null)}
+        onOpenEvent={onOpenEvent}
       />
     </div>
   );

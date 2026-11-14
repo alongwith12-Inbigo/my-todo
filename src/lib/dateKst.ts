@@ -219,3 +219,153 @@ export function isValidFirestoreId(id: string): boolean {
     /^[a-zA-Z0-9_-]+$/.test(id)
   );
 }
+
+const kstTimeFormatter = new Intl.DateTimeFormat('ko-KR', {
+  timeZone: KST_TIMEZONE,
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+export function isValidTimeInputString(value: string): boolean {
+  const match = /^(\d{2}):(\d{2})$/.exec(value.trim());
+  if (!match) return false;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
+export function getKstTimeInputValue(date: Date | null | undefined): string {
+  if (!date) return '09:00';
+  const kstDate = new Date(date.getTime() + KST_OFFSET_MS);
+  const hh = String(kstDate.getUTCHours()).padStart(2, '0');
+  const mm = String(kstDate.getUTCMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+export function parseKstDateTimeInput(dateStr: string, timeStr: string): Date {
+  const trimmedDate = dateStr.trim();
+  const trimmedTime = timeStr.trim();
+  if (!isValidDateInputString(trimmedDate)) {
+    throw new Error('올바른 날짜 형식(YYYY-MM-DD)을 입력해 주세요.');
+  }
+  if (!isValidTimeInputString(trimmedTime)) {
+    throw new Error('올바른 시간 형식(HH:MM)을 입력해 주세요.');
+  }
+  const [year, month, day] = trimmedDate.split('-').map(Number);
+  const [hour, minute] = trimmedTime.split(':').map(Number);
+  const utcMs = Date.UTC(year, month - 1, day, hour, minute, 0, 0) - KST_OFFSET_MS;
+  return new Date(utcMs);
+}
+
+export function parseKstAllDayRange(
+  startDateStr: string,
+  endDateStr: string,
+): { startsAt: Date; endsAt: Date } {
+  const trimmedStart = startDateStr.trim();
+  const trimmedEnd = (endDateStr || startDateStr).trim();
+  if (!isValidDateInputString(trimmedStart) || !isValidDateInputString(trimmedEnd)) {
+    throw new Error('올바른 날짜 형식(YYYY-MM-DD)을 입력해 주세요.');
+  }
+  if (trimmedEnd < trimmedStart) {
+    throw new Error('종료 날짜는 시작 날짜보다 빠를 수 없습니다.');
+  }
+  const [sy, sm, sd] = trimmedStart.split('-').map(Number);
+  const [ey, em, ed] = trimmedEnd.split('-').map(Number);
+  const startsAt = new Date(Date.UTC(sy, sm - 1, sd, 0, 0, 0, 0) - KST_OFFSET_MS);
+  const endsAt = new Date(Date.UTC(ey, em - 1, ed, 23, 59, 59, 999) - KST_OFFSET_MS);
+  return { startsAt, endsAt };
+}
+
+export function getKstDayRangeMs(dateKey: string): { startMs: number; endMs: number } {
+  if (!isValidDateInputString(dateKey)) {
+    throw new Error('올바른 기준 날짜가 아닙니다.');
+  }
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return {
+    startMs: Date.UTC(year, month - 1, day, 0, 0, 0, 0) - KST_OFFSET_MS,
+    endMs: Date.UTC(year, month - 1, day, 23, 59, 59, 999) - KST_OFFSET_MS,
+  };
+}
+
+export function getKstWeekdayIndex(dateKey: string): number {
+  if (!isValidDateInputString(dateKey)) {
+    throw new Error('올바른 기준 날짜가 아닙니다.');
+  }
+  const [year, month, day] = dateKey.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+}
+
+export function getKstMonthGridDays(
+  year: number,
+  month: number,
+): { dateKey: string; day: number; inMonth: boolean }[] {
+  const firstDayKey = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-01`;
+  const startOffset = getKstWeekdayIndex(firstDayKey);
+  const gridStartKey = addKstDaysToDateKey(firstDayKey, -startOffset);
+
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const totalCells = startOffset + daysInMonth > 35 ? 42 : 35;
+
+  const cells: { dateKey: string; day: number; inMonth: boolean }[] = [];
+  for (let i = 0; i < totalCells; i++) {
+    const key = addKstDaysToDateKey(gridStartKey, i);
+    const [cy, cm, cd] = key.split('-').map(Number);
+    cells.push({
+      dateKey: key,
+      day: cd,
+      inMonth: cy === year && cm === month,
+    });
+  }
+  return cells;
+}
+
+export function getKstWeekDays(anchorDateKey: string): string[] {
+  const weekday = getKstWeekdayIndex(anchorDateKey);
+  const sundayKey = addKstDaysToDateKey(anchorDateKey, -weekday);
+  const result: string[] = [];
+  for (let i = 0; i < 7; i++) {
+    result.push(addKstDaysToDateKey(sundayKey, i));
+  }
+  return result;
+}
+
+export function formatKstTime(date: Date | null | undefined): string {
+  if (!date) return '';
+  return kstTimeFormatter.format(date);
+}
+
+export function formatKstMonthLabel(year: number, month: number): string {
+  return `${year}년 ${month}월`;
+}
+
+export function formatKstDateKeyLabel(dateKey: string): string {
+  if (!isValidDateInputString(dateKey)) return dateKey;
+  const { startMs } = getKstDayRangeMs(dateKey);
+  return kstDateFormatter.format(new Date(startMs));
+}
+
+export function formatKstEventTimeRange(
+  startsAt: Date | null,
+  endsAt: Date | null,
+  allDay: boolean,
+): string {
+  if (!startsAt || !endsAt) return '';
+  const startKey = getKstDateParts(startsAt).dateKey;
+  const endKey = getKstDateParts(endsAt).dateKey;
+
+  if (allDay) {
+    if (startKey === endKey) {
+      return '종일';
+    }
+    return `종일 (${formatKstShortDate(startsAt)} ~ ${formatKstShortDate(endsAt)})`;
+  }
+
+  const startTime = formatKstTime(startsAt);
+  const endTime = formatKstTime(endsAt);
+  if (startKey === endKey) {
+    return `${startTime} ~ ${endTime}`;
+  }
+  return `${formatKstShortDate(startsAt)} ${startTime} ~ ${formatKstShortDate(endsAt)} ${endTime}`;
+}
+

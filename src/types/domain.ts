@@ -90,4 +90,35 @@ export interface TaskRecord {
   schemaVersion: number;
 }
 
+export type NoteColor = 'butter' | 'mint' | 'sky' | 'peach' | 'lavender';
+
+export interface CalendarEventRecord {
+  id: string;
+  title: string;
+  startsAt: Timestamp;
+  endsAt: Timestamp;
+  allDay: boolean;
+  location: string;
+  description: string;
+  relatedTaskId: string | null;
+  version: number;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  schemaVersion: number;
+}
+
+export interface StickyNoteRecord {
+  id: string;
+  content: string;
+  color: NoteColor;
+  isPinned: boolean;
+  sortOrder: number;
+  convertedTaskId: string | null;
+  version: number;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  schemaVersion: number;
+}
+
 export type NavSection = 'today' | 'tasks' | 'calendar' | 'notes' | 'settings';
+
