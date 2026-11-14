@@ -152,6 +152,7 @@ export function parseKoreanDateTimeExpression(
   }
 
   // 2) Month/Day without explicit year: 11월 20일, 11/23(월), 11.23.(월)
+  // Rule (Asia/Seoul): today or future -> current year; already passed -> next year; do NOT flag year omission as needing confirmation.
   if (!dateKey && !invalidDateFound) {
     const korMonthDayMatch =
       /(\d{1,2})\s*월\s*(\d{1,2})\s*일(?:\s*\([월화수목금토일]\))?/.exec(text);
@@ -168,14 +169,21 @@ export function parseKoreanDateTimeExpression(
     if (mdMatch) {
       const m = Number(mdMatch[1]);
       const d = Number(mdMatch[2]);
-      const valid = buildDateKeyIfValid(kstNow.year, m, d);
       matchedDateText = mdMatch[0].trim();
-      if (valid) {
-        dateKey = valid;
+
+      const thisYearKey = buildDateKeyIfValid(kstNow.year, m, d);
+      const nextYearKey = buildDateKeyIfValid(kstNow.year + 1, m, d);
+
+      let resolvedKey: string | null = null;
+      if (thisYearKey) {
+        resolvedKey = thisYearKey >= todayKey ? thisYearKey : nextYearKey;
+      } else if (m === 2 && d === 29 && kstNow.month > 2 && nextYearKey) {
+        resolvedKey = nextYearKey;
+      }
+
+      if (resolvedKey) {
+        dateKey = resolvedKey;
         yearExplicit = false;
-        reasons.push(
-          `연도가 명시되지 않은 날짜("${matchedDateText}")로 올해(${kstNow.year}년) 기준 추정값입니다. 연도를 확인해 주세요.`,
-        );
       } else {
         invalidDateFound = true;
         reasons.push(`날짜 표현("${matchedDateText}")이 유효하지 않습니다.`);

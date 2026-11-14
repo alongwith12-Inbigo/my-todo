@@ -1,5 +1,5 @@
 import { useId, useRef } from 'react';
-import { Image as ImageIcon, RefreshCw, ScanText, X } from 'lucide-react';
+import { Image as ImageIcon, RefreshCw, ScanText, Sparkles, X } from 'lucide-react';
 import type { BrowserOcrProgress } from '../../lib/ocrProcessor';
 
 interface ImportImageOcrBoxProps {
@@ -12,12 +12,15 @@ interface ImportImageOcrBoxProps {
   ocrLowQuality: boolean;
   ocrError: string | null;
   ocrEditedText: string;
+  aiEnabled?: boolean;
+  aiRunning?: boolean;
   onChangeText: (nextText: string) => void;
   onReplaceImage: (file: File | null) => void;
   onClearImage: () => void;
   onRerunOcr: () => void;
   onCancelOcr: () => void;
   onAnalyze: () => void;
+  onAnalyzeAi?: () => void;
 }
 
 export function ImportImageOcrBox({
@@ -30,12 +33,15 @@ export function ImportImageOcrBox({
   ocrLowQuality,
   ocrError,
   ocrEditedText,
+  aiEnabled = false,
+  aiRunning = false,
   onChangeText,
   onReplaceImage,
   onClearImage,
   onRerunOcr,
   onCancelOcr,
   onAnalyze,
+  onAnalyzeAi,
 }: ImportImageOcrBoxProps) {
   const replaceInputId = useId();
   const textareaId = useId();
@@ -191,7 +197,7 @@ export function ImportImageOcrBox({
               분석 후 업무·일정 후보를 선택 등록할 수 있습니다.
             </span>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               {ocrEditedText && (
                 <button
                   type="button"
@@ -204,13 +210,25 @@ export function ImportImageOcrBox({
 
               <button
                 type="button"
-                disabled={ocrRunning || !ocrEditedText.trim()}
+                disabled={ocrRunning || aiRunning || !ocrEditedText.trim()}
                 onClick={onAnalyze}
-                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap cursor-pointer"
               >
-                <ScanText className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>내용 분석</span>
+                <ScanText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
+                <span>기본 분석</span>
               </button>
+
+              {aiEnabled && onAnalyzeAi && (
+                <button
+                  type="button"
+                  disabled={ocrRunning || aiRunning || !ocrEditedText.trim()}
+                  onClick={onAnalyzeAi}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>{aiRunning ? 'AI 분석 중...' : 'AI로 분석'}</span>
+                </button>
+              )}
             </div>
           </div>
         </div>

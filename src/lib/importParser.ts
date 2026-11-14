@@ -13,7 +13,7 @@ import {
 } from '../types/domain';
 
 export type ImportCandidateKind = 'task' | 'event';
-export type ImportSourceMode = 'text' | 'ocr';
+export type ImportSourceMode = 'text' | 'ocr' | 'ai';
 
 export interface ImportCandidate {
   id: string;
@@ -37,6 +37,10 @@ export interface ImportCandidate {
   needsConfirmation: boolean;
   confirmationReasons: string[];
   duplicateWarnings: string[];
+  // Optional Step 5 AI metadata
+  origin?: 'rule' | 'ai';
+  aiRationale?: string;
+  semanticDuplicateNote?: string;
 }
 
 export interface ParseSchoolNoticeResult {

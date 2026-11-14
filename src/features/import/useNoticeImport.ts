@@ -8,7 +8,15 @@ import {
   type DragEvent,
 } from 'react';
 import { Timestamp } from 'firebase/firestore';
+import { buildMinimalExistingContext } from '../../lib/aiBriefing';
+import { normalizeAiNoticeCandidates } from '../../lib/aiImportValidator';
 import {
+  getStoredAiEnabled,
+  subscribeAiEnabledChange,
+} from '../../lib/aiPreferences';
+import { AI_LIMITS } from '../../lib/aiTypes';
+import {
+  getKstDateInputValue,
   parseKstAllDayRange,
   parseKstDateInput,
   parseKstDateTimeInput,
@@ -25,6 +33,12 @@ import {
   validateOcrImageFile,
   type BrowserOcrProgress,
 } from '../../lib/ocrProcessor';
+import {
+  inspectAndMaskPrivacy,
+  type PrivacyInspectionResult,
+} from '../../lib/privacyGuard';
+import { AiClientError, requestAiNoticeAnalysis } from '../../services/aiClient';
+import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
 import { formatTaskErrorMessage } from '../tasks/taskErrors';
 import { useTaskData } from '../tasks/TaskDataContext';
@@ -36,9 +50,25 @@ export interface BatchSaveSummary {
   failedCount: number;
 }
 
+export interface PendingAiConsentState {
+  rawSourceText: string;
+  sourceOrigin: 'text' | 'ocr';
+  inspection: PrivacyInspectionResult;
+}
+
 export function useNoticeImport() {
+  const { firebaseUser } = useAuth();
   const { briefingTasks, createNewTask } = useTaskData();
   const { events, createNewEvent } = useEventData();
+
+  const [aiEnabled, setAiEnabled] = useState(() =>
+    getStoredAiEnabled(firebaseUser?.uid),
+  );
+
+  useEffect(() => {
+    setAiEnabled(getStoredAiEnabled(firebaseUser?.uid));
+    return subscribeAiEnabledChange(firebaseUser?.uid, setAiEnabled);
+  }, [firebaseUser?.uid]);
 
   // Image + Browser OCR state (local memory only; never auto-uploaded or auto-saved)
   const [imageFile, setImageFile] = useState<File | null>(null);
@@ -61,7 +91,19 @@ export function useNoticeImport() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [batchSummary, setBatchSummary] = useState<BatchSaveSummary | null>(null);
 
+  // Step 5 AI state
+  const [aiRunning, setAiRunning] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiModelUsed, setAiModelUsed] = useState<string | null>(null);
+  const [aiPendingConsent, setAiPendingConsent] =
+    useState<PendingAiConsentState | null>(null);
+  const [lastAiFallbackSource, setLastAiFallbackSource] = useState<{
+    text: string;
+    origin: 'text' | 'ocr';
+  } | null>(null);
+
   const ocrAbortRef = useRef<AbortController | null>(null);
+  const aiAbortRef = useRef<AbortController | null>(null);
   const submitLockRef = useRef(false);
 
   const ocrSupported = useMemo(() => isBrowserOcrSupported(), []);
@@ -69,6 +111,7 @@ export function useNoticeImport() {
   useEffect(() => {
     return () => {
       ocrAbortRef.current?.abort();
+      aiAbortRef.current?.abort();
     };
   }, []);
 
@@ -144,6 +187,7 @@ export function useNoticeImport() {
       setOcrLowQuality(false);
       setOcrError(null);
       setParseError(null);
+      setAiError(null);
 
       const nextUrl = URL.createObjectURL(file);
       setImageFile(file);
@@ -214,7 +258,20 @@ export function useNoticeImport() {
     [attachImageFile],
   );
 
+  const cancelAiAnalysis = useCallback(() => {
+    aiAbortRef.current?.abort();
+    aiAbortRef.current = null;
+    setAiRunning(false);
+  }, []);
+
   const resetAnalysis = useCallback(() => {
+    aiAbortRef.current?.abort();
+    aiAbortRef.current = null;
+    setAiRunning(false);
+    setAiError(null);
+    setAiModelUsed(null);
+    setAiPendingConsent(null);
+    setLastAiFallbackSource(null);
     setCandidates([]);
     setUnparsedLines([]);
     setAnalysisMode(null);
@@ -229,8 +286,11 @@ export function useNoticeImport() {
   }, [clearImage, resetAnalysis]);
 
   const analyzeNoticeText = useCallback(
-    (sourceText: string, mode: ImportSourceMode) => {
+    (sourceText: string, mode: 'text' | 'ocr') => {
       setParseError(null);
+      setAiError(null);
+      setAiModelUsed(null);
+      setLastAiFallbackSource(null);
       setBatchSummary(null);
 
       if (!sourceText.trim()) {
@@ -258,7 +318,9 @@ export function useNoticeImport() {
         return false;
       }
 
-      setCandidates(parsed.candidates);
+      setCandidates(
+        parsed.candidates.map((c) => ({ ...c, origin: 'rule' })),
+      );
       setUnparsedLines(parsed.unparsedLines);
       setAnalysisMode(mode);
       setSaveStates({});
@@ -266,6 +328,144 @@ export function useNoticeImport() {
     },
     [briefingTasks, events],
   );
+
+  const requestAiAnalysis = useCallback(
+    (sourceText: string, sourceOrigin: 'text' | 'ocr') => {
+      setParseError(null);
+      setAiError(null);
+      setBatchSummary(null);
+
+      if (!aiEnabled) {
+        setAiError(
+          '설정에서 AI 스마트 업무비서 기능이 꺼져 있습니다. 설정에서 켜거나 기본 분석을 이용해 주세요.',
+        );
+        return false;
+      }
+
+      const trimmed = sourceText.trim();
+      if (!trimmed) {
+        setParseError(
+          sourceOrigin === 'ocr'
+            ? '추출된 텍스트가 비어 있습니다. 텍스트를 확인·입력한 뒤 분석을 눌러 주세요.'
+            : '분석할 안내문이나 쪽지 내용을 입력해 주세요.',
+        );
+        return false;
+      }
+
+      if (trimmed.length > AI_LIMITS.MAX_NOTICE_CHARS) {
+        setAiError(
+          `AI 분석은 한 번에 최대 ${AI_LIMITS.MAX_NOTICE_CHARS.toLocaleString()}자까지 지원합니다. 내용을 나누어 분석하거나 기본 분석을 이용해 주세요.`,
+        );
+        setLastAiFallbackSource({ text: trimmed, origin: sourceOrigin });
+        return false;
+      }
+
+      const inspection = inspectAndMaskPrivacy(trimmed);
+      setAiPendingConsent({
+        rawSourceText: trimmed,
+        sourceOrigin,
+        inspection,
+      });
+      return true;
+    },
+    [aiEnabled],
+  );
+
+  const dismissAiConsent = useCallback(() => {
+    setAiPendingConsent(null);
+  }, []);
+
+  const fallbackFromConsentToRule = useCallback(() => {
+    if (!aiPendingConsent) return;
+    const { rawSourceText, sourceOrigin } = aiPendingConsent;
+    setAiPendingConsent(null);
+    analyzeNoticeText(rawSourceText, sourceOrigin);
+  }, [aiPendingConsent, analyzeNoticeText]);
+
+  const confirmAiAnalysis = useCallback(
+    async (applyMasking: boolean) => {
+      if (!aiPendingConsent) return;
+      const { rawSourceText, sourceOrigin, inspection } = aiPendingConsent;
+
+      if (inspection.hasHighRisk && !applyMasking) {
+        setAiError(
+          '고위험 민감정보가 가려지지 않아 외부 AI 전송이 차단되었습니다. 가림 처리 후 다시 시도하거나 기본 분석을 이용해 주세요.',
+        );
+        return;
+      }
+
+      const payloadText = applyMasking
+        ? inspection.maskedText
+        : inspection.originalText;
+
+      setAiPendingConsent(null);
+      setParseError(null);
+      setAiError(null);
+      setLastAiFallbackSource({ text: rawSourceText, origin: sourceOrigin });
+
+      aiAbortRef.current?.abort();
+      const controller = new AbortController();
+      aiAbortRef.current = controller;
+      setAiRunning(true);
+
+      try {
+        const now = new Date();
+        const todayKey = getKstDateInputValue(now);
+        const existingItems = buildMinimalExistingContext(briefingTasks, events);
+
+        const response = await requestAiNoticeAnalysis(
+          {
+            text: payloadText,
+            todayKey,
+            existingItems,
+          },
+          controller.signal,
+        );
+        if (controller.signal.aborted) return;
+
+        const normalized = normalizeAiNoticeCandidates(response.rawOutput, {
+          now,
+          existingTasks: briefingTasks,
+          existingEvents: events,
+        });
+
+        if (normalized.candidates.length === 0) {
+          setAiError(
+            'AI가 업무나 일정 후보를 추출하지 못했습니다. 아래 버튼으로 기본 분석을 실행하거나 문장을 보완해 보세요.',
+          );
+          return;
+        }
+
+        setCandidates(normalized.candidates);
+        setUnparsedLines(normalized.unparsedLines);
+        setAnalysisMode('ai');
+        setAiModelUsed(response.model);
+        setSaveStates({});
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        const message =
+          err instanceof AiClientError
+            ? err.message
+            : err instanceof Error
+              ? err.message
+              : 'AI 분석에 실패했습니다. 기본 분석을 이용해 주세요.';
+        setAiError(message);
+      } finally {
+        if (aiAbortRef.current === controller) {
+          aiAbortRef.current = null;
+          setAiRunning(false);
+        }
+      }
+    },
+    [aiPendingConsent, briefingTasks, events],
+  );
+
+  const runRuleFallbackAfterAiError = useCallback(() => {
+    if (!lastAiFallbackSource) return;
+    const { text, origin } = lastAiFallbackSource;
+    setAiError(null);
+    analyzeNoticeText(text, origin);
+  }, [lastAiFallbackSource, analyzeNoticeText]);
 
   const updateCandidate = useCallback(
     (id: string, updater: (prev: ImportCandidate) => ImportCandidate) => {
@@ -326,7 +526,12 @@ export function useNoticeImport() {
     let succeededTasks = 0;
     let succeededEvents = 0;
     let failedCount = 0;
-    const sourceType = analysisMode === 'ocr' ? 'import_ocr' : 'import_text';
+    const sourceType =
+      analysisMode === 'ai'
+        ? 'import_ai'
+        : analysisMode === 'ocr'
+          ? 'import_ocr'
+          : 'import_text';
 
     try {
       for (const item of targets) {
@@ -465,5 +670,19 @@ export function useNoticeImport() {
     registerSelected,
     resetAnalysis,
     resetAll,
+    // Step 5 AI state & actions
+    aiEnabled,
+    aiRunning,
+    aiError,
+    setAiError,
+    aiModelUsed,
+    aiPendingConsent,
+    canFallbackToRule: Boolean(lastAiFallbackSource),
+    requestAiAnalysis,
+    dismissAiConsent,
+    fallbackFromConsentToRule,
+    confirmAiAnalysis,
+    cancelAiAnalysis,
+    runRuleFallbackAfterAiError,
   };
 }

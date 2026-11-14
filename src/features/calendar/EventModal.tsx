@@ -17,6 +17,7 @@ import {
   MapPin,
   RefreshCw,
   ScanText,
+  Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
@@ -38,6 +39,7 @@ import {
   type TaskRecord,
 } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
+import { AiPrivacyConsentModal } from '../import/AiPrivacyConsentModal';
 import { ImportCandidatesSection } from '../import/ImportCandidatesSection';
 import { ImportImageOcrBox } from '../import/ImportImageOcrBox';
 import { useNoticeImport } from '../import/useNoticeImport';
@@ -384,6 +386,13 @@ export function EventModal({
     noticeImport.analyzeNoticeText(source, 'text');
   }
 
+  function handleAnalyzeNoticeAi() {
+    setFeedback(null);
+    const source =
+      noticeText.trim() || [title.trim(), description.trim()].filter(Boolean).join('\n');
+    noticeImport.requestAiAnalysis(source, 'text');
+  }
+
   return (
     <div
       className="fixed inset-0 z-40 bg-slate-900/40 flex items-center justify-center p-4 overflow-y-auto"
@@ -539,12 +548,24 @@ export function EventModal({
                     )}
                     <button
                       type="button"
+                      disabled={noticeImport.aiRunning}
                       onClick={handleAnalyzeNoticeText}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 whitespace-nowrap cursor-pointer"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap cursor-pointer"
                     >
-                      <ScanText className="w-3.5 h-3.5" aria-hidden="true" />
-                      <span>내용 분석</span>
+                      <ScanText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
+                      <span>기본 분석</span>
                     </button>
+                    {noticeImport.aiEnabled && (
+                      <button
+                        type="button"
+                        disabled={noticeImport.aiRunning}
+                        onClick={handleAnalyzeNoticeAi}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>{noticeImport.aiRunning ? 'AI 분석 중...' : 'AI로 분석'}</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               )}
@@ -569,6 +590,8 @@ export function EventModal({
                   ocrLowQuality={noticeImport.ocrLowQuality}
                   ocrError={noticeImport.ocrError}
                   ocrEditedText={noticeImport.ocrEditedText}
+                  aiEnabled={noticeImport.aiEnabled}
+                  aiRunning={noticeImport.aiRunning}
                   onChangeText={noticeImport.setOcrEditedText}
                   onReplaceImage={(file) => noticeImport.attachImageFile(file)}
                   onClearImage={noticeImport.clearImage}
@@ -576,6 +599,9 @@ export function EventModal({
                   onCancelOcr={noticeImport.cancelOcr}
                   onAnalyze={() =>
                     noticeImport.analyzeNoticeText(noticeImport.ocrEditedText, 'ocr')
+                  }
+                  onAnalyzeAi={() =>
+                    noticeImport.requestAiAnalysis(noticeImport.ocrEditedText, 'ocr')
                   }
                 />
               )}
@@ -587,6 +613,14 @@ export function EventModal({
                 saveStates={noticeImport.saveStates}
                 isSubmitting={noticeImport.isSubmitting}
                 batchSummary={noticeImport.batchSummary}
+                analysisMode={noticeImport.analysisMode}
+                aiRunning={noticeImport.aiRunning}
+                aiError={noticeImport.aiError}
+                aiModelUsed={noticeImport.aiModelUsed}
+                canFallbackToRule={noticeImport.canFallbackToRule}
+                onCancelAi={noticeImport.cancelAiAnalysis}
+                onFallbackToRule={noticeImport.runRuleFallbackAfterAiError}
+                onDismissAiError={() => noticeImport.setAiError(null)}
                 onChangeCandidate={noticeImport.updateCandidate}
                 onDeleteCandidate={noticeImport.deleteCandidate}
                 onSelectAllPending={noticeImport.selectAllPending}
@@ -745,19 +779,38 @@ export function EventModal({
                 상세 내용 (선택)
               </label>
               {!isEditMode && description.trim().length > 0 && !showNoticeBox && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    noticeImport.analyzeNoticeText(
-                      [title.trim(), description.trim()].filter(Boolean).join('\n'),
-                      'text',
-                    )
-                  }
-                  className="inline-flex items-center gap-1 text-xs font-semibold text-teal-800 hover:text-teal-950 cursor-pointer"
-                >
-                  <ScanText className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>이 내용으로 일정·업무 분석</span>
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={noticeImport.aiRunning}
+                    onClick={() =>
+                      noticeImport.analyzeNoticeText(
+                        [title.trim(), description.trim()].filter(Boolean).join('\n'),
+                        'text',
+                      )
+                    }
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-slate-700 hover:text-teal-800 cursor-pointer"
+                  >
+                    <ScanText className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>기본 분석</span>
+                  </button>
+                  {noticeImport.aiEnabled && (
+                    <button
+                      type="button"
+                      disabled={noticeImport.aiRunning}
+                      onClick={() =>
+                        noticeImport.requestAiAnalysis(
+                          [title.trim(), description.trim()].filter(Boolean).join('\n'),
+                          'text',
+                        )
+                      }
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-teal-800 hover:text-teal-950 cursor-pointer"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>AI로 분석</span>
+                    </button>
+                  )}
+                </div>
               )}
             </div>
             <textarea
@@ -893,6 +946,16 @@ export function EventModal({
           </div>
         </form>
       </div>
+
+      <AiPrivacyConsentModal
+        isOpen={Boolean(noticeImport.aiPendingConsent)}
+        inspection={noticeImport.aiPendingConsent?.inspection ?? null}
+        onCancel={noticeImport.dismissAiConsent}
+        onFallbackToRule={noticeImport.fallbackFromConsentToRule}
+        onConfirmSend={(applyMasking) =>
+          void noticeImport.confirmAiAnalysis(applyMasking)
+        }
+      />
     </div>
   );
 }

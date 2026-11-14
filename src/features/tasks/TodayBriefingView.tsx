@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Calendar,
   ChevronDown,
@@ -8,7 +8,15 @@ import {
   MapPin,
   Plus,
   RefreshCw,
+  Sparkles,
 } from 'lucide-react';
+import { buildMinimalBriefingPayload } from '../../lib/aiBriefing';
+import { normalizeAiBriefingResult } from '../../lib/aiImportValidator';
+import {
+  getStoredAiEnabled,
+  subscribeAiEnabledChange,
+} from '../../lib/aiPreferences';
+import type { AiBriefingResponse } from '../../lib/aiTypes';
 import { classifyTodayBriefing, timestampToDate } from '../../lib/briefing';
 import { classifyTodayEvents, getMinutesUntilEventStart } from '../../lib/calendar';
 import {
@@ -17,10 +25,12 @@ import {
   getKstGreeting,
 } from '../../lib/dateKst';
 import type { TaskFilterTab } from '../../repositories/taskRepo';
+import { AiClientError, requestAiTodayBriefing } from '../../services/aiClient';
 import type { CalendarEventRecord, TaskRecord } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
 import { EventModal } from '../calendar/EventModal';
+import { AiTodayBriefingCard } from './AiTodayBriefingCard';
 import { useTaskData } from './TaskDataContext';
 import { TaskDetailModal } from './TaskDetailModal';
 import { TaskQuickAddBar } from './TaskQuickAddBar';
@@ -145,7 +155,7 @@ export function TodayBriefingView({
   focusedTaskId,
   onClearFocusedTask,
 }: TodayBriefingViewProps) {
-  const { workspace } = useAuth();
+  const { firebaseUser, workspace } = useAuth();
   const {
     briefingTasks,
     briefingLoading,
@@ -167,8 +177,67 @@ export function TodayBriefingView({
   const [undatedOpen, setUndatedOpen] = useState(false);
   const [unremindedOpen, setUnremindedOpen] = useState(false);
 
+  const [aiEnabled, setAiEnabled] = useState(() =>
+    getStoredAiEnabled(firebaseUser?.uid),
+  );
+  const [aiBriefingLoading, setAiBriefingLoading] = useState(false);
+  const [aiBriefingError, setAiBriefingError] = useState<string | null>(null);
+  const [aiBriefingData, setAiBriefingData] =
+    useState<AiBriefingResponse | null>(null);
+  const aiBriefingAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    setAiEnabled(getStoredAiEnabled(firebaseUser?.uid));
+    return subscribeAiEnabledChange(firebaseUser?.uid, setAiEnabled);
+  }, [firebaseUser?.uid]);
+
+  useEffect(() => {
+    return () => {
+      aiBriefingAbortRef.current?.abort();
+    };
+  }, []);
+
   const imminentDays = workspace?.preferences.imminentDays ?? 3;
   const displayName = workspace?.profile.displayName ?? '선생님';
+
+  async function handleRunAiBriefing() {
+    if (!aiEnabled || aiBriefingLoading) return;
+    aiBriefingAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiBriefingAbortRef.current = controller;
+
+    setAiBriefingError(null);
+    setAiBriefingLoading(true);
+
+    try {
+      const payload = buildMinimalBriefingPayload(briefingTasks, events, {
+        now,
+        imminentDays,
+      });
+      const validIds = new Set(payload.tasks.map((t) => t.id));
+      const res = await requestAiTodayBriefing(payload, controller.signal);
+      if (controller.signal.aborted) return;
+      setAiBriefingData({
+        model: res.model,
+        generatedAtIso: res.generatedAtIso,
+        briefing: normalizeAiBriefingResult(res.briefing, validIds),
+      });
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      setAiBriefingError(
+        err instanceof AiClientError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : 'AI 브리핑 요청에 실패했습니다.',
+      );
+    } finally {
+      if (aiBriefingAbortRef.current === controller) {
+        aiBriefingAbortRef.current = null;
+        setAiBriefingLoading(false);
+      }
+    }
+  }
 
   useEffect(() => {
     if (!focusedTaskId) return;
@@ -237,7 +306,19 @@ export function TodayBriefingView({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {aiEnabled && (
+            <button
+              type="button"
+              disabled={aiBriefingLoading}
+              onClick={() => void handleRunAiBriefing()}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg hover:bg-teal-100 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>{aiBriefingLoading ? 'AI 브리핑 생성 중...' : 'AI 브리핑'}</span>
+            </button>
+          )}
+
           <button
             type="button"
             disabled={briefingLoading || eventsLoading}
@@ -280,6 +361,32 @@ export function TodayBriefingView({
         onOpenEvent={(eventId) => onOpenCalendar(eventId)}
         onGoToTasksView={() => onOpenTasksView('active')}
         onGoToCalendarView={() => onOpenCalendar()}
+      />
+
+      <AiTodayBriefingCard
+        loading={aiBriefingLoading}
+        error={aiBriefingError}
+        data={aiBriefingData}
+        onCancel={() => {
+          aiBriefingAbortRef.current?.abort();
+          aiBriefingAbortRef.current = null;
+          setAiBriefingLoading(false);
+        }}
+        onClose={() => {
+          setAiBriefingError(null);
+          setAiBriefingData(null);
+        }}
+        onRetry={() => void handleRunAiBriefing()}
+        onOpenTask={(taskId) => {
+          const matched = briefingTasks.find((t) => t.id === taskId);
+          if (matched) {
+            setSelectedTask(matched);
+          } else {
+            void refreshSingleTask(taskId).then((fetched) => {
+              if (fetched) setSelectedTask(fetched);
+            });
+          }
+        }}
       />
 
       {usedIndexFallback && (

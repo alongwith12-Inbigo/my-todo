@@ -136,6 +136,12 @@ export function ImportCandidateCard({
               원문 날짜·시각: {candidate.matchedDateHint}
             </span>
           )}
+
+          {candidate.origin === 'ai' && (
+            <span className="text-[11px] font-semibold text-teal-800 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded-md">
+              AI 추출
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
@@ -166,6 +172,12 @@ export function ImportCandidateCard({
           </button>
         </div>
       </div>
+
+      {candidate.aiRationale && (
+        <p className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+          <strong className="text-slate-800">AI 판단 근거:</strong> {candidate.aiRationale}
+        </p>
+      )}
 
       {/* Confirmation & Duplicate Warnings */}
       {!isSaved &&

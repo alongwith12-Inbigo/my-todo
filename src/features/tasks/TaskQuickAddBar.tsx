@@ -15,6 +15,7 @@ import {
   ImagePlus,
   Plus,
   ScanText,
+  Sparkles,
 } from 'lucide-react';
 import {
   addKstDaysToDateKey,
@@ -26,6 +27,7 @@ import {
   type TaskPriority,
   type TaskRecord,
 } from '../../types/domain';
+import { AiPrivacyConsentModal } from '../import/AiPrivacyConsentModal';
 import { ImportCandidatesSection } from '../import/ImportCandidatesSection';
 import { ImportImageOcrBox } from '../import/ImportImageOcrBox';
 import { useNoticeImport } from '../import/useNoticeImport';
@@ -170,6 +172,11 @@ export function TaskQuickAddBar({
     noticeImport.analyzeNoticeText(combinedTextSource, 'text');
   }
 
+  function handleAnalyzeAi() {
+    setFeedback(null);
+    noticeImport.requestAiAnalysis(combinedTextSource, 'text');
+  }
+
   function handleClearText() {
     setTitle('');
     setDescription('');
@@ -268,18 +275,33 @@ export function TaskQuickAddBar({
             </button>
 
             {hasTextInput && (
-              <button
-                type="button"
-                onClick={handleAnalyzeText}
-                className={`inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  isMultilineOrLong
-                    ? 'bg-teal-50 text-teal-800 border border-teal-300 hover:bg-teal-100'
-                    : 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50'
-                }`}
-              >
-                <ScanText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
-                <span>내용 분석</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  disabled={noticeImport.aiRunning}
+                  onClick={handleAnalyzeText}
+                  className={`inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 ${
+                    isMultilineOrLong
+                      ? 'bg-teal-50 text-teal-800 border border-teal-300 hover:bg-teal-100'
+                      : 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-50'
+                  }`}
+                >
+                  <ScanText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
+                  <span>기본 분석</span>
+                </button>
+
+                {noticeImport.aiEnabled && (
+                  <button
+                    type="button"
+                    disabled={noticeImport.aiRunning}
+                    onClick={handleAnalyzeAi}
+                    className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>{noticeImport.aiRunning ? 'AI 분석 중...' : 'AI로 분석'}</span>
+                  </button>
+                )}
+              </>
             )}
 
             {!hasNewlines && (
@@ -299,9 +321,10 @@ export function TaskQuickAddBar({
         {isMultilineOrLong && (
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600">
             <span>
-              긴 문장이나 여러 줄 공지가 입력되었습니다. <strong>내용 분석</strong>을 누르면 업무와 일정을 자동으로 나누어 검토할 수 있습니다. (원문은 저장되지 않습니다)
+              긴 문장이나 여러 줄 공지가 입력되었습니다. <strong>기본 분석</strong> 또는{' '}
+              <strong>AI로 분석</strong>을 선택해 업무와 일정을 나누어 검토할 수 있습니다. (원문은 저장되지 않습니다)
             </span>
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={handleClearText}
@@ -312,12 +335,24 @@ export function TaskQuickAddBar({
               </button>
               <button
                 type="button"
+                disabled={noticeImport.aiRunning}
                 onClick={handleAnalyzeText}
-                className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold bg-teal-700 text-white rounded-md hover:bg-teal-800 whitespace-nowrap cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold bg-white border border-slate-300 text-slate-800 rounded-md hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap cursor-pointer"
               >
-                <ScanText className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>내용 분석 실행</span>
+                <ScanText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
+                <span>기본 분석</span>
               </button>
+              {noticeImport.aiEnabled && (
+                <button
+                  type="button"
+                  disabled={noticeImport.aiRunning}
+                  onClick={handleAnalyzeAi}
+                  className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold bg-teal-700 text-white rounded-md hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>{noticeImport.aiRunning ? 'AI 분석 중...' : 'AI로 분석'}</span>
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -512,6 +547,8 @@ export function TaskQuickAddBar({
           ocrLowQuality={noticeImport.ocrLowQuality}
           ocrError={noticeImport.ocrError}
           ocrEditedText={noticeImport.ocrEditedText}
+          aiEnabled={noticeImport.aiEnabled}
+          aiRunning={noticeImport.aiRunning}
           onChangeText={noticeImport.setOcrEditedText}
           onReplaceImage={(file) => noticeImport.attachImageFile(file)}
           onClearImage={noticeImport.clearImage}
@@ -519,6 +556,9 @@ export function TaskQuickAddBar({
           onCancelOcr={noticeImport.cancelOcr}
           onAnalyze={() =>
             noticeImport.analyzeNoticeText(noticeImport.ocrEditedText, 'ocr')
+          }
+          onAnalyzeAi={() =>
+            noticeImport.requestAiAnalysis(noticeImport.ocrEditedText, 'ocr')
           }
         />
       )}
@@ -531,6 +571,14 @@ export function TaskQuickAddBar({
         saveStates={noticeImport.saveStates}
         isSubmitting={noticeImport.isSubmitting}
         batchSummary={noticeImport.batchSummary}
+        analysisMode={noticeImport.analysisMode}
+        aiRunning={noticeImport.aiRunning}
+        aiError={noticeImport.aiError}
+        aiModelUsed={noticeImport.aiModelUsed}
+        canFallbackToRule={noticeImport.canFallbackToRule}
+        onCancelAi={noticeImport.cancelAiAnalysis}
+        onFallbackToRule={noticeImport.runRuleFallbackAfterAiError}
+        onDismissAiError={() => noticeImport.setAiError(null)}
         onChangeCandidate={noticeImport.updateCandidate}
         onDeleteCandidate={noticeImport.deleteCandidate}
         onSelectAllPending={noticeImport.selectAllPending}
@@ -554,6 +602,16 @@ export function TaskQuickAddBar({
           {feedback.message}
         </div>
       )}
+
+      <AiPrivacyConsentModal
+        isOpen={Boolean(noticeImport.aiPendingConsent)}
+        inspection={noticeImport.aiPendingConsent?.inspection ?? null}
+        onCancel={noticeImport.dismissAiConsent}
+        onFallbackToRule={noticeImport.fallbackFromConsentToRule}
+        onConfirmSend={(applyMasking) =>
+          void noticeImport.confirmAiAnalysis(applyMasking)
+        }
+      />
     </section>
   );
 }

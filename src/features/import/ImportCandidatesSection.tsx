@@ -4,9 +4,11 @@ import {
   Calendar,
   CheckCircle2,
   CheckSquare,
+  Loader2,
   RotateCcw,
+  Sparkles,
 } from 'lucide-react';
-import type { ImportCandidate } from '../../lib/importParser';
+import type { ImportCandidate, ImportSourceMode } from '../../lib/importParser';
 import {
   ImportCandidateCard,
   type CandidateSaveState,
@@ -20,6 +22,14 @@ interface ImportCandidatesSectionProps {
   saveStates: Record<string, CandidateSaveState>;
   isSubmitting: boolean;
   batchSummary: BatchSaveSummary | null;
+  analysisMode?: ImportSourceMode | null;
+  aiRunning?: boolean;
+  aiError?: string | null;
+  aiModelUsed?: string | null;
+  canFallbackToRule?: boolean;
+  onCancelAi?: () => void;
+  onFallbackToRule?: () => void;
+  onDismissAiError?: () => void;
   onChangeCandidate: (
     id: string,
     updater: (prev: ImportCandidate) => ImportCandidate,
@@ -41,6 +51,14 @@ export function ImportCandidatesSection({
   saveStates,
   isSubmitting,
   batchSummary,
+  analysisMode,
+  aiRunning = false,
+  aiError = null,
+  aiModelUsed = null,
+  canFallbackToRule = false,
+  onCancelAi,
+  onFallbackToRule,
+  onDismissAiError,
   onChangeCandidate,
   onDeleteCandidate,
   onSelectAllPending,
@@ -77,7 +95,7 @@ export function ImportCandidatesSection({
     [pendingCandidates],
   );
 
-  if (!parseError && candidates.length === 0) {
+  if (!aiRunning && !aiError && !parseError && candidates.length === 0) {
     return null;
   }
 
@@ -86,6 +104,62 @@ export function ImportCandidatesSection({
       aria-label="내용 분석 결과 검토"
       className="pt-4 border-t border-slate-200 space-y-4"
     >
+      {aiRunning && (
+        <div
+          role="status"
+          className="p-3.5 rounded-lg border border-teal-200 bg-teal-50/70 text-xs text-teal-950 flex items-center justify-between gap-3"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <Loader2 className="w-4 h-4 text-teal-700 animate-spin shrink-0" aria-hidden="true" />
+            <span>Gemini AI가 학교 쪽지·공지를 분석해 업무와 일정 후보를 정리하는 중입니다...</span>
+          </div>
+          {onCancelAi && (
+            <button
+              type="button"
+              onClick={onCancelAi}
+              className="px-2.5 py-1 text-xs font-semibold bg-white border border-teal-300 text-teal-900 rounded-md hover:bg-teal-100 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              요청 취소
+            </button>
+          )}
+        </div>
+      )}
+
+      {aiError && (
+        <div
+          role="alert"
+          className="p-3.5 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-2 min-w-0 flex-1">
+            <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" aria-hidden="true" />
+            <div className="space-y-0.5">
+              <p className="font-semibold text-amber-900">AI 분석을 완료하지 못했습니다</p>
+              <p>{aiError}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {canFallbackToRule && onFallbackToRule && (
+              <button
+                type="button"
+                onClick={onFallbackToRule}
+                className="px-3 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-md hover:bg-teal-800 whitespace-nowrap cursor-pointer"
+              >
+                대신 기본 분석 실행
+              </button>
+            )}
+            {onDismissAiError && (
+              <button
+                type="button"
+                onClick={onDismissAiError}
+                className="px-2.5 py-1.5 text-xs font-medium bg-white border border-amber-300 rounded-md hover:bg-amber-100 whitespace-nowrap cursor-pointer"
+              >
+                닫기
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {parseError && (
         <div
           role="alert"
@@ -110,9 +184,17 @@ export function ImportCandidatesSection({
           {/* Review Toolbar */}
           <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5 flex flex-wrap items-center justify-between gap-3">
             <div className="space-y-0.5">
-              <h3 className="text-sm font-bold text-slate-900">
-                분석된 업무·일정 후보 검토 및 선택 등록
-              </h3>
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-sm font-bold text-slate-900">
+                  분석된 업무·일정 후보 검토 및 선택 등록
+                </h3>
+                {analysisMode === 'ai' && (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-800 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded-md">
+                    <Sparkles className="w-3 h-3" aria-hidden="true" />
+                    <span>Gemini AI 분석{aiModelUsed ? ` (${aiModelUsed})` : ''}</span>
+                  </span>
+                )}
+              </div>
               <p className="text-xs text-slate-600 tabular-nums">
                 업무 후보 {taskCandidates.length}건 · 일정 후보{' '}
                 {eventCandidates.length}건 · 선택됨{' '}
