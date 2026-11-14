@@ -146,9 +146,9 @@ export function TimetableSlotEditorModal({
               maxLength={VALIDATION_LIMITS.TIMETABLE_SUBJECT_MAX_LEN}
               placeholder={
                 kind === 'class'
-                  ? '예: 국어, 수학, 통합사회'
+                  ? '예: 국어, 수학 (비워두고 학급만 입력 가능)'
                   : kind === 'free'
-                    ? '비워두면 공강으로 표시'
+                    ? '예: 공강 (비워두면 수업 없음)'
                     : '예: 동아리 지도, 학년 협의'
               }
               className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
@@ -244,7 +244,7 @@ export function TimetableSlotEditorModal({
               }}
               className="px-3 py-2 text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
             >
-              공강으로 비우기
+              빈 시간으로 비우기
             </button>
 
             <div className="flex items-center gap-2">

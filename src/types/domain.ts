@@ -131,7 +131,7 @@ export interface StickyNoteRecord {
 
 export type TimetableWeekday = 1 | 2 | 3 | 4 | 5;
 export type TimetableSlotKind = 'class' | 'free' | 'fixed_duty' | 'other';
-export type TimetableSourceType = 'manual' | 'excel' | 'ocr';
+export type TimetableSourceType = 'manual' | 'excel' | 'hwpx' | 'pdf' | 'ocr';
 
 export interface TimetablePeriodTime {
   period: number;

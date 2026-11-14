@@ -500,7 +500,7 @@
         },
         "sourceType": {
           "type": "string",
-          "enum": ["manual", "excel", "ocr"]
+          "enum": ["manual", "excel", "hwpx", "pdf", "ocr"]
         },
         "version": {
           "type": "integer"

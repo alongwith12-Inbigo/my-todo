@@ -7,7 +7,7 @@ import {
   parseTimetableCellText,
   type TimetableImportCellMeta,
   type TimetableImportPreview,
-} from './timetableExcelParser';
+} from './timetableGridParser';
 import {
   VALIDATION_LIMITS,
   type TimetableSlot,
@@ -37,8 +37,10 @@ function centerY(word: BrowserOcrWordBox): number {
 
 /**
  * Reconstructs weekly timetable grid from OCR word bounding boxes (rows = periods, cols = 월~금).
- * Explicitly flags uncertain alignment, low-confidence text, or wide multi-column spans
- * instead of silently guessing unclear cells.
+ * Strictly honors Section 4 rules:
+ * - Never fabricates weekday/period mappings when headers are unreadable.
+ * - Marks unmapped/failed cells as recognition_failed (distinct from genuine empty cells).
+ * - Never auto-inserts '공강' on blank cells and never enables workAvailable automatically.
  */
 export function parseTimetableFromOcrData(input: {
   words: BrowserOcrWordBox[];
@@ -52,6 +54,8 @@ export function parseTimetableFromOcrData(input: {
     const periodTimes = createDefaultPeriodTimes(7);
     const slots: Record<string, TimetableSlot> = {};
     const cellMeta: Record<string, TimetableImportCellMeta> = {};
+    let failedCount = 0;
+
     for (const w of TIMETABLE_WEEKDAYS) {
       for (let p = 1; p <= 7; p++) {
         const key = makeSlotKey(w.day, p);
@@ -66,23 +70,28 @@ export function parseTimetableFromOcrData(input: {
           workAvailable: false,
         };
         cellMeta[key] = {
-          needsConfirmation: false,
-          reasons: [],
+          status: 'recognition_failed',
+          needsConfirmation: true,
+          reasons: ['이미지에서 표 좌표를 추출하지 못했습니다.'],
           rawText: '',
         };
+        failedCount += 1;
       }
     }
     warnings.push(
-      '이미지에서 표 좌표 정보를 추출하지 못했습니다. 직접 입력하거나 더 선명한 캡처 이미지를 사용해 주세요.',
+      '이미지에서 표 좌표 정보를 추출하지 못했습니다. 엑셀·한글(HWPX)·PDF 파일을 사용하거나 선명한 표 이미지를 업로드해 주세요.',
     );
     return {
       sourceType: 'ocr',
+      extractionMode: 'image_ocr',
+      rawSourceText: input.text,
       periodCount: 7,
       periodTimes,
       slots,
       cellMeta,
       warnings,
-      needsConfirmationCount: 0,
+      needsConfirmationCount: failedCount,
+      recognitionFailedCount: failedCount,
     };
   }
 
@@ -99,7 +108,6 @@ export function parseTimetableFromOcrData(input: {
     }
   }
 
-  // Group header candidates that lie along a roughly horizontal header band
   headerCandidates.sort((a, b) => a.centerY - b.centerY);
   let bestBand: HeaderAnchor[] = [];
   for (let i = 0; i < headerCandidates.length; i++) {
@@ -121,25 +129,25 @@ export function parseTimetableFromOcrData(input: {
   const orderedColumns = Array.from(dayColumns.values()).sort(
     (a, b) => a.centerX - b.centerX,
   );
+  const headerMissingAll = orderedColumns.length < 2;
   const headerBottomY =
     orderedColumns.length > 0
       ? Math.max(...orderedColumns.map((c) => c.centerY)) + 12
       : 0;
 
-  if (orderedColumns.length < 2) {
+  if (headerMissingAll) {
     warnings.push(
-      '이미지에서 요일(월~금) 열 머리글을 충분히 인식하지 못했습니다. 각 칸의 요일 배치를 확인해 주세요.',
+      '이미지에서 요일(월~금) 열 머리글을 충분히 인식하지 못해 임의로 요일을 확정하지 않았습니다. 직접 확인하거나 문서 파일(엑셀·HWPX·PDF)을 업로드해 주세요.',
     );
   } else if (orderedColumns.length < 5) {
     const missing = TIMETABLE_WEEKDAYS.filter((w) => !dayColumns.has(w.day))
       .map((w) => w.short)
       .join(', ');
     warnings.push(
-      `일부 요일 열(${missing})을 찾지 못했습니다. 누락된 요일은 직접 확인해 주세요.`,
+      `일부 요일 열(${missing})이 인식되지 않아 해당 요일은 '인식 실패'로 표시했습니다.`,
     );
   }
 
-  // Compute column boundaries
   const colLeftX =
     orderedColumns.length > 0 ? orderedColumns[0].centerX - 70 : 0;
   const colBounds: { day: TimetableWeekday; minX: number; maxX: number; centerX: number }[] = [];
@@ -157,7 +165,7 @@ export function parseTimetableFromOcrData(input: {
     colBounds.push({ day: curr.day, minX, maxX, centerX: curr.centerX });
   }
 
-  // 2. Detect period rows (1교시..12교시 or numbers on left side)
+  // 2. Detect period rows (1교시..12교시)
   const leftAreaMaxX = colBounds.length > 0 ? colBounds[0].minX + 15 : colLeftX + 120;
   const rowAnchors: RowAnchor[] = [];
   const seenPeriods = new Set<number>();
@@ -180,7 +188,6 @@ export function parseTimetableFromOcrData(input: {
     }
   }
 
-  // Look for time ranges near left column row bands
   for (const row of rowAnchors) {
     const rowWords = sortedBodyWords.filter(
       (w) => w.bbox.x0 <= leftAreaMaxX + 40 && Math.abs(centerY(w) - row.centerY) <= 28,
@@ -193,27 +200,11 @@ export function parseTimetableFromOcrData(input: {
   }
 
   rowAnchors.sort((a, b) => a.centerY - b.centerY);
-  if (rowAnchors.length === 0) {
+  const rowMissingAll = rowAnchors.length === 0;
+  if (rowMissingAll) {
     warnings.push(
-      '교시 행(1교시, 2교시 등)을 찾지 못해 텍스트 줄 순서 기준으로 임시 배치했습니다.',
+      '이미지에서 교시 행(1교시, 2교시 등)을 찾지 못해 교시를 임의로 확정하지 않았습니다. 직접 확인해 주세요.',
     );
-    // Fallback cluster distinct y bands for words inside day columns
-    const yClusters: number[] = [];
-    for (const w of sortedBodyWords) {
-      if (colBounds.length > 0 && centerX(w) < colBounds[0].minX) continue;
-      const cy = centerY(w);
-      if (!yClusters.some((existingY) => Math.abs(existingY - cy) < 28)) {
-        yClusters.push(cy);
-      }
-    }
-    yClusters.sort((a, b) => a - b);
-    yClusters.slice(0, 8).forEach((cy, idx) => {
-      rowAnchors.push({
-        period: idx + 1,
-        centerY: cy,
-        x1: leftAreaMaxX,
-      });
-    });
   }
 
   const rowBounds: { period: number; minY: number; maxY: number; centerY: number }[] = [];
@@ -249,11 +240,9 @@ export function parseTimetableFromOcrData(input: {
     }
   }
 
-  // 3. Bucket OCR words into (day, period) cells
   const cellWords = new Map<string, { words: BrowserOcrWordBox[]; spanAlert: boolean }>();
-
   for (const word of sortedBodyWords) {
-    if (orderedColumns.length === 0 || rowBounds.length === 0) continue;
+    if (headerMissingAll || rowMissingAll) continue;
     const cx = centerX(word);
     const cy = centerY(word);
 
@@ -261,7 +250,6 @@ export function parseTimetableFromOcrData(input: {
     const row = rowBounds.find((r) => cy >= r.minY && cy < r.maxY);
     if (!col || !row) continue;
 
-    // Skip if this word itself is the weekday header or period number
     if (detectWeekdayFromHeader(word.text) && cy <= headerBottomY + 10) continue;
 
     const key = makeSlotKey(col.day, row.period);
@@ -278,6 +266,7 @@ export function parseTimetableFromOcrData(input: {
   const slots: Record<string, TimetableSlot> = {};
   const cellMeta: Record<string, TimetableImportCellMeta> = {};
   let needsConfirmationCount = 0;
+  let recognitionFailedCount = 0;
 
   if ((input.confidence ?? 100) < 60) {
     warnings.push(
@@ -286,9 +275,38 @@ export function parseTimetableFromOcrData(input: {
   }
 
   for (const w of TIMETABLE_WEEKDAYS) {
+    const hasCol = dayColumns.has(w.day);
     for (let p = 1; p <= periodCount; p++) {
       const key = makeSlotKey(w.day, p);
       const bucket = cellWords.get(key);
+
+      if (headerMissingAll || !hasCol || rowMissingAll) {
+        slots[key] = {
+          day: w.day,
+          period: p,
+          kind: 'free',
+          subject: '',
+          className: '',
+          classroom: '',
+          note: '',
+          workAvailable: false,
+        };
+        cellMeta[key] = {
+          status: 'recognition_failed',
+          needsConfirmation: true,
+          reasons: [
+            headerMissingAll
+              ? '요일 열 머리글을 찾지 못해 인식에 실패했습니다.'
+              : !hasCol
+                ? `${w.short}요일 열을 이미지에서 찾지 못했습니다.`
+                : '교시 행 위치를 찾지 못해 인식에 실패했습니다.',
+          ],
+          rawText: '',
+        };
+        needsConfirmationCount += 1;
+        recognitionFailedCount += 1;
+        continue;
+      }
 
       if (!bucket || bucket.words.length === 0) {
         slots[key] = {
@@ -301,29 +319,20 @@ export function parseTimetableFromOcrData(input: {
           note: '',
           workAvailable: false,
         };
-        const missingCol = !dayColumns.has(w.day);
-        const reasons: string[] = [];
-        if (missingCol) {
-          reasons.push(`${w.short}요일 열을 이미지에서 찾지 못해 확인이 필요합니다.`);
-        }
         cellMeta[key] = {
-          needsConfirmation: missingCol,
-          reasons,
+          status: 'empty',
+          needsConfirmation: false,
+          reasons: [],
           rawText: '',
         };
-        if (missingCol) needsConfirmationCount += 1;
         continue;
       }
 
-      // Group bucket words into lines by y proximity, then sort left-to-right
       const sorted = [...bucket.words].sort((a, b) => centerY(a) - centerY(b));
       const lines: BrowserOcrWordBox[][] = [];
       for (const word of sorted) {
         const lastLine = lines[lines.length - 1];
-        if (
-          lastLine &&
-          Math.abs(centerY(lastLine[0]) - centerY(word)) <= 14
-        ) {
+        if (lastLine && Math.abs(centerY(lastLine[0]) - centerY(word)) <= 14) {
           lastLine.push(word);
         } else {
           lines.push([word]);
@@ -344,21 +353,18 @@ export function parseTimetableFromOcrData(input: {
         bucket.words.length;
 
       const reasons = [...parsed.reasons];
+      let status = parsed.status;
       let needsConfirm = parsed.needsConfirmation;
 
       if (bucket.spanAlert) {
+        status = 'needs_confirmation';
         needsConfirm = true;
         reasons.push('셀이 옆 열까지 걸쳐 있어 병합 셀 또는 열 경계 오인식 여부를 확인해 주세요.');
       }
       if (avgConf < 65) {
+        status = avgConf < 40 ? 'recognition_failed' : 'needs_confirmation';
         needsConfirm = true;
         reasons.push(`OCR 인식 신뢰도가 낮아(${Math.round(avgConf)}%) 글자 확인이 필요합니다.`);
-      }
-      if (orderedColumns.length < 5) {
-        needsConfirm = true;
-        if (!reasons.includes('요일 열 매핑을 확인해 주세요.')) {
-          reasons.push('요일 열 경계가 일부 불확실하므로 배치를 확인해 주세요.');
-        }
       }
 
       slots[key] = {
@@ -372,21 +378,26 @@ export function parseTimetableFromOcrData(input: {
         workAvailable: false,
       };
       cellMeta[key] = {
+        status,
         needsConfirmation: needsConfirm,
         reasons,
         rawText,
       };
       if (needsConfirm) needsConfirmationCount += 1;
+      if (status === 'recognition_failed') recognitionFailedCount += 1;
     }
   }
 
   return {
     sourceType: 'ocr',
+    extractionMode: 'image_ocr',
+    rawSourceText: input.text,
     periodCount,
     periodTimes,
     slots,
     cellMeta,
     warnings,
     needsConfirmationCount,
+    recognitionFailedCount,
   };
 }

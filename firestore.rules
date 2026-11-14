@@ -286,7 +286,7 @@ service cloud.firestore {
         data.periodTimes is map && data.periodTimes.keys().size() >= 1 && data.periodTimes.keys().size() <= 12 &&
         data.slots is map && data.slots.keys().size() <= 60 &&
         data.isActive is bool &&
-        data.sourceType in ['manual', 'excel', 'ocr'] &&
+        data.sourceType in ['manual', 'excel', 'hwpx', 'pdf', 'ocr'] &&
         data.version is int && data.version >= 1 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp &&

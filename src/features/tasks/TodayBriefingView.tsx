@@ -763,7 +763,7 @@ export function TodayBriefingView({
                 <div className="space-y-2 py-1">
                   <p className="text-xs text-slate-500 leading-relaxed">
                     {todaySchedule.isWeekday
-                      ? '오늘 적용되는 주간 시간표가 없습니다. 엑셀·이미지 또는 직접 입력으로 시간표를 등록하면 수업과 업무 가능 시간이 함께 정리됩니다.'
+                      ? '오늘 적용되는 주간 시간표가 없습니다. 엑셀·한글(HWPX)·PDF·이미지 또는 직접 입력으로 시간표를 등록하면 수업과 업무 가능 시간이 함께 정리됩니다.'
                       : '주말에는 주간 수업 시간표가 표시되지 않습니다.'}
                   </p>
                   {onOpenTimetable && (
@@ -800,15 +800,24 @@ export function TodayBriefingView({
                             }
                           >
                             {slot.subject ||
-                              (slot.kind === 'free'
-                                ? slot.workAvailable
-                                  ? '공강(업무 가능)'
-                                  : '공강'
-                                : SLOT_KIND_LABELS[slot.kind])}
+                              (slot.kind === 'class' && slot.className
+                                ? slot.className
+                                : slot.kind === 'free'
+                                  ? slot.workAvailable
+                                    ? '업무 가능 시간'
+                                    : '수업 없음'
+                                  : SLOT_KIND_LABELS[slot.kind])}
                           </span>
-                          {slot.className && (
+                          {((slot.subject && slot.className) || slot.classroom) && (
                             <span className="text-[11px] text-slate-500 ml-1">
-                              ({slot.className})
+                              (
+                              {[
+                                slot.subject ? slot.className : '',
+                                slot.classroom,
+                              ]
+                                .filter(Boolean)
+                                .join(' · ')}
+                              )
                             </span>
                           )}
                         </div>

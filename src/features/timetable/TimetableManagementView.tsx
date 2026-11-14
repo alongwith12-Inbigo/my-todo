@@ -372,10 +372,11 @@ export function TimetableManagementView({
           <button
             type="button"
             onClick={() => setImportModalOpen(true)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg hover:bg-teal-100 cursor-pointer"
+            title="지원 형식: 엑셀 · 한글(HWPX) · PDF · 이미지"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg hover:bg-teal-100 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <FileUp className="w-3.5 h-3.5" />
-            <span>엑셀 · 이미지 가져오기</span>
+            <span>시간표 파일 가져오기</span>
           </button>
 
           <button
@@ -385,7 +386,7 @@ export function TimetableManagementView({
               setOverrideDateKey(todayKey);
               setOverrideModalOpen(true);
             }}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <CalendarClock className="w-3.5 h-3.5 text-slate-500" />
             <span>특정 날짜 임시 변경</span>
@@ -395,7 +396,7 @@ export function TimetableManagementView({
             type="button"
             disabled={saving}
             onClick={() => void handleSave(false)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-60 cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Save className="w-3.5 h-3.5" />
             <span>
@@ -408,6 +409,10 @@ export function TimetableManagementView({
           </button>
         </div>
       </div>
+
+      <p className="text-[11px] text-slate-500 -mt-2 px-1">
+        지원 형식: 엑셀 · 한글(HWPX) · PDF · 이미지 (구형 .hwp 파일은 HWPX 또는 PDF로 저장 후 업로드)
+      </p>
 
       {(timetablesError || feedback) && (
         <div
@@ -838,16 +843,23 @@ export function TimetableManagementView({
                                     }`}
                                   >
                                     {slot.subject ||
-                                      (isFree ? '공강' : SLOT_KIND_LABELS[slot.kind])}
+                                      (slot.kind === 'class' && slot.className
+                                        ? slot.className
+                                        : isFree
+                                          ? '수업 없음'
+                                          : SLOT_KIND_LABELS[slot.kind])}
                                   </span>
                                   <span className="text-[10px] font-medium text-slate-500 shrink-0">
                                     {SLOT_KIND_LABELS[slot.kind]}
                                   </span>
                                 </div>
 
-                                {(slot.className || slot.classroom) && (
+                                {((slot.subject && slot.className) || slot.classroom) && (
                                   <p className="text-[11px] text-slate-600 truncate">
-                                    {[slot.className, slot.classroom]
+                                    {[
+                                      slot.subject ? slot.className : '',
+                                      slot.classroom,
+                                    ]
                                       .filter(Boolean)
                                       .join(' · ')}
                                   </p>

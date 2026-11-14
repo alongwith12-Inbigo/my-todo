@@ -81,7 +81,13 @@ const VALID_KINDS = new Set<TimetableSlotKind>([
   'other',
 ]);
 
-const VALID_SOURCES = new Set<TimetableSourceType>(['manual', 'excel', 'ocr']);
+const VALID_SOURCES = new Set<TimetableSourceType>([
+  'manual',
+  'excel',
+  'hwpx',
+  'pdf',
+  'ocr',
+]);
 
 function assertValidVersion(version: number): void {
   if (!Number.isInteger(version) || version < 1) {

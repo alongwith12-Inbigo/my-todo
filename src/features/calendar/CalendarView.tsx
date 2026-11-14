@@ -808,11 +808,23 @@ export function CalendarView({
                               : 'font-medium text-slate-900'
                           }
                         >
-                          {slot.subject || SLOT_KIND_LABELS[slot.kind]}
+                          {slot.subject ||
+                            (slot.kind === 'class' && slot.className
+                              ? slot.className
+                              : slot.kind === 'free'
+                                ? '수업 없음'
+                                : SLOT_KIND_LABELS[slot.kind])}
                         </span>
-                        {(slot.className || slot.classroom) && (
+                        {((slot.subject && slot.className) || slot.classroom) && (
                           <span className="text-[11px] text-slate-500 ml-1">
-                            ({[slot.className, slot.classroom].filter(Boolean).join(' · ')})
+                            (
+                            {[
+                              slot.subject ? slot.className : '',
+                              slot.classroom,
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
+                            )
                           </span>
                         )}
                       </div>
