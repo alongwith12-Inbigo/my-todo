@@ -696,6 +696,22 @@ export function CalendarView({
           setModalOpen(false);
           onOpenTask?.(taskId);
         }}
+        onOpenEvent={(eventId) => {
+          const found = events.find((item) => item.id === eventId);
+          if (found) {
+            const startDate = timestampToDate(found.startsAt);
+            if (startDate) {
+              const parts = getKstDateParts(startDate);
+              setSelectedDateKey(parts.dateKey);
+              setActiveMonth({ year: parts.year, month: parts.month });
+            }
+            setEditingEvent(found);
+            setModalOpen(true);
+          } else {
+            setModalOpen(false);
+            setEditingEvent(null);
+          }
+        }}
       />
     </div>
   );

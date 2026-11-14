@@ -266,7 +266,21 @@ export function TodayBriefingView({
       </div>
 
       {/* Quick Add */}
-      <TaskQuickAddBar />
+      <TaskQuickAddBar
+        onOpenTask={(taskId) => {
+          const matched = briefingTasks.find((t) => t.id === taskId);
+          if (matched) {
+            setSelectedTask(matched);
+          } else {
+            void refreshSingleTask(taskId).then((fetched) => {
+              if (fetched) setSelectedTask(fetched);
+            });
+          }
+        }}
+        onOpenEvent={(eventId) => onOpenCalendar(eventId)}
+        onGoToTasksView={() => onOpenTasksView('active')}
+        onGoToCalendarView={() => onOpenCalendar()}
+      />
 
       {usedIndexFallback && (
         <div
@@ -732,6 +746,11 @@ export function TodayBriefingView({
               if (fetched) setSelectedTask(fetched);
             });
           }
+        }}
+        onOpenEvent={(eventId) => {
+          setEventModalOpen(false);
+          setSelectedEvent(null);
+          onOpenCalendar(eventId);
         }}
       />
     </div>

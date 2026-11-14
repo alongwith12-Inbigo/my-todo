@@ -7,7 +7,6 @@ import { LoginView } from './features/auth/LoginView';
 import { PendingApprovalView } from './features/auth/PendingApprovalView';
 import { CalendarView } from './features/calendar/CalendarView';
 import { EventDataProvider, useEventData } from './features/calendar/EventDataContext';
-import { ImportView } from './features/import/ImportView';
 import { NoteDataProvider } from './features/notes/NoteDataContext';
 import { NotesView } from './features/notes/NotesView';
 import { NotificationBell } from './features/notifications/NotificationBell';
@@ -22,7 +21,6 @@ const NAV_ITEMS: { id: NavSection; label: string }[] = [
   { id: 'tasks', label: '업무' },
   { id: 'calendar', label: '일정' },
   { id: 'notes', label: '메모' },
-  { id: 'import', label: '가져오기' },
   { id: 'settings', label: '설정' },
 ];
 
@@ -197,15 +195,6 @@ function AuthenticatedWorkspace({
             todayKey={todayKey}
             now={now}
             onOpenTask={handleOpenTaskInTasksView}
-          />
-        )}
-
-        {activeNav === 'import' && (
-          <ImportView
-            now={now}
-            todayKey={todayKey}
-            onOpenTask={handleOpenTaskInTasksView}
-            onOpenCalendar={handleOpenCalendar}
           />
         )}
 

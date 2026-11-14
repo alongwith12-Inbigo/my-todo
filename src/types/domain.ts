@@ -125,6 +125,5 @@ export type NavSection =
   | 'tasks'
   | 'calendar'
   | 'notes'
-  | 'import'
   | 'settings';
 

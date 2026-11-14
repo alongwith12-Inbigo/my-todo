@@ -1,10 +1,22 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type DragEvent,
+  type FormEvent,
+} from 'react';
 import { Timestamp } from 'firebase/firestore';
 import {
   Calendar,
+  Eraser,
   ExternalLink,
+  FileText,
+  ImagePlus,
   MapPin,
   RefreshCw,
+  ScanText,
   Trash2,
   X,
 } from 'lucide-react';
@@ -26,6 +38,9 @@ import {
   type TaskRecord,
 } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
+import { ImportCandidatesSection } from '../import/ImportCandidatesSection';
+import { ImportImageOcrBox } from '../import/ImportImageOcrBox';
+import { useNoticeImport } from '../import/useNoticeImport';
 import { useTaskData } from '../tasks/TaskDataContext';
 import { formatTaskErrorMessage } from '../tasks/taskErrors';
 import { useEventData } from './EventDataContext';
@@ -36,6 +51,7 @@ interface EventModalProps {
   initialDateKey?: string;
   onClose: () => void;
   onOpenTask?: (taskId: string) => void;
+  onOpenEvent?: (eventId: string) => void;
 }
 
 export function EventModal({
@@ -44,6 +60,7 @@ export function EventModal({
   initialDateKey,
   onClose,
   onOpenTask,
+  onOpenEvent,
 }: EventModalProps) {
   const { firebaseUser } = useAuth();
   const { briefingTasks, refreshSingleTask } = useTaskData();
@@ -54,6 +71,8 @@ export function EventModal({
     removeEvent,
     refreshSingleEvent,
   } = useEventData();
+  const noticeImport = useNoticeImport();
+  const { resetAll: resetNoticeImport } = noticeImport;
 
   const [currentEvent, setCurrentEvent] = useState<CalendarEventRecord | null>(event);
   const [title, setTitle] = useState('');
@@ -67,6 +86,12 @@ export function EventModal({
   const [relatedTaskId, setRelatedTaskId] = useState<string>('');
   const [linkedTaskLookup, setLinkedTaskLookup] = useState<TaskRecord | null>(null);
   const [linkedTaskMissing, setLinkedTaskMissing] = useState(false);
+
+  const [showNoticeBox, setShowNoticeBox] = useState(false);
+  const [noticeText, setNoticeText] = useState('');
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const imageInputId = useId();
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -105,15 +130,25 @@ export function EventModal({
   }
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      resetNoticeImport();
+      setShowNoticeBox(false);
+      setNoticeText('');
+      setIsDraggingFile(false);
+      return;
+    }
     const fallbackKey = initialDateKey || getKstDateParts().dateKey;
     setCurrentEvent(event);
     setFeedback(null);
     setConfirmDelete(false);
     setHasConcurrencyConflict(false);
     setSubmitting(false);
+    setShowNoticeBox(false);
+    setNoticeText('');
+    setIsDraggingFile(false);
+    resetNoticeImport();
     syncFromRecord(event, fallbackKey);
-  }, [isOpen, event, initialDateKey]);
+  }, [isOpen, event, initialDateKey, resetNoticeImport]);
 
   useEffect(() => {
     if (!isOpen || !relatedTaskId || !firebaseUser?.uid) {
@@ -284,6 +319,71 @@ export function EventModal({
     (t) => !t.isDeleted && t.status !== 'done',
   );
 
+  const hasExpandedImport =
+    !isEditMode &&
+    (Boolean(noticeImport.imageFile) ||
+      noticeImport.candidates.length > 0 ||
+      Boolean(noticeImport.parseError) ||
+      showNoticeBox);
+
+  function handleModalPaste(e: ClipboardEvent<HTMLElement>) {
+    if (isEditMode) return;
+    const pastedImage = noticeImport.extractClipboardImageFile(e);
+    if (pastedImage) {
+      e.preventDefault();
+      setFeedback(null);
+      noticeImport.attachImageFile(pastedImage);
+    }
+  }
+
+  function handleModalDragOver(e: DragEvent<HTMLElement>) {
+    if (isEditMode) return;
+    if (e.dataTransfer?.types?.includes('Files')) {
+      e.preventDefault();
+      setIsDraggingFile(true);
+    }
+  }
+
+  function handleModalDragLeave(e: DragEvent<HTMLElement>) {
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setIsDraggingFile(false);
+  }
+
+  function handleModalDrop(e: DragEvent<HTMLElement>) {
+    if (isEditMode) return;
+    setIsDraggingFile(false);
+    if (noticeImport.handleImageDrop(e)) {
+      setFeedback(null);
+    }
+  }
+
+  function handleTitlePaste(e: ClipboardEvent<HTMLInputElement>) {
+    if (isEditMode) return;
+    const pastedImage = noticeImport.extractClipboardImageFile(e);
+    if (pastedImage) {
+      e.preventDefault();
+      setFeedback(null);
+      noticeImport.attachImageFile(pastedImage);
+      return;
+    }
+    const pastedText = e.clipboardData?.getData('text/plain') ?? '';
+    if (pastedText.includes('\n') || pastedText.trim().length >= 60) {
+      e.preventDefault();
+      setNoticeText((prev) =>
+        prev.trim() ? `${prev.trim()}\n\n${pastedText.trim()}` : pastedText.trim(),
+      );
+      setShowNoticeBox(true);
+      noticeImport.setParseError(null);
+    }
+  }
+
+  function handleAnalyzeNoticeText() {
+    setFeedback(null);
+    const source =
+      noticeText.trim() || [title.trim(), description.trim()].filter(Boolean).join('\n');
+    noticeImport.analyzeNoticeText(source, 'text');
+  }
+
   return (
     <div
       className="fixed inset-0 z-40 bg-slate-900/40 flex items-center justify-center p-4 overflow-y-auto"
@@ -295,7 +395,13 @@ export function EventModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="event-modal-title"
-        className="w-full max-w-xl bg-white border border-slate-200 rounded-xl shadow-lg overflow-hidden my-auto"
+        onPaste={handleModalPaste}
+        onDragOver={handleModalDragOver}
+        onDragLeave={handleModalDragLeave}
+        onDrop={handleModalDrop}
+        className={`w-full bg-white border rounded-xl shadow-lg overflow-hidden my-auto transition-[max-width] duration-150 ${
+          hasExpandedImport ? 'max-w-3xl' : 'max-w-xl'
+        } ${isDraggingFile ? 'border-teal-600' : 'border-slate-200'}`}
       >
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
           <div className="min-w-0 flex items-center gap-2.5">
@@ -328,7 +434,7 @@ export function EventModal({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-5 max-h-[80vh] overflow-y-auto">
+        <form onSubmit={handleSubmit} className="p-6 space-y-5 max-h-[82vh] overflow-y-auto">
           {feedback && (
             <div
               role={feedback.type === 'error' ? 'alert' : 'status'}
@@ -352,6 +458,146 @@ export function EventModal({
             </div>
           )}
 
+          {/* Unified Notice Text / Image Input Strip (Create Mode Only) */}
+          {!isEditMode && (
+            <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-slate-700">
+                  <strong className="text-slate-900">쪽지·공지 자동 추출 (선택):</strong>{' '}
+                  긴 안내문이나 캡처 이미지(Ctrl+V · 드래그)를 첨부하면 일정과 업무를 함께 분석합니다.
+                </p>
+                <div className="flex items-center gap-2 shrink-0">
+                  <label
+                    htmlFor={imageInputId}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
+                  >
+                    <ImagePlus className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
+                    <span>이미지 첨부</span>
+                  </label>
+                  <input
+                    ref={imageInputRef}
+                    id={imageInputId}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/bmp"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0] ?? null;
+                      if (file) {
+                        setFeedback(null);
+                        noticeImport.attachImageFile(file);
+                      }
+                      if (imageInputRef.current) imageInputRef.current.value = '';
+                    }}
+                    className="sr-only"
+                  />
+
+                  <button
+                    type="button"
+                    onClick={() => setShowNoticeBox((prev) => !prev)}
+                    aria-expanded={showNoticeBox}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border whitespace-nowrap cursor-pointer ${
+                      showNoticeBox
+                        ? 'bg-teal-50 text-teal-800 border-teal-300'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    <FileText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
+                    <span>{showNoticeBox ? '텍스트 입력 접기' : '긴 글 붙여넣기'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {showNoticeBox && (
+                <div className="space-y-2 pt-1">
+                  <label htmlFor="event-notice-text" className="sr-only">
+                    안내문·쪽지 원문 붙여넣기
+                  </label>
+                  <textarea
+                    id="event-notice-text"
+                    rows={4}
+                    maxLength={10000}
+                    value={noticeText}
+                    onChange={(e) => {
+                      setNoticeText(e.target.value);
+                      if (noticeImport.parseError) noticeImport.setParseError(null);
+                    }}
+                    placeholder="여러 일정이나 업무가 담긴 공지·메신저 내용을 그대로 붙여넣으세요. (원문은 저장되지 않습니다)"
+                    className="w-full px-3 py-2 text-sm leading-relaxed border border-slate-300 rounded-lg bg-white focus:outline-none focus:border-teal-700"
+                  />
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    {noticeText && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNoticeText('');
+                          noticeImport.setParseError(null);
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
+                      >
+                        <Eraser className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>입력 지우기</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleAnalyzeNoticeText}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 whitespace-nowrap cursor-pointer"
+                    >
+                      <ScanText className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>내용 분석</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {noticeImport.ocrError && !noticeImport.imageFile && (
+                <div
+                  role="alert"
+                  className="p-2.5 rounded-lg border border-red-200 bg-red-50 text-xs text-red-800"
+                >
+                  {noticeImport.ocrError}
+                </div>
+              )}
+
+              {noticeImport.imageFile && noticeImport.imagePreviewUrl && (
+                <ImportImageOcrBox
+                  imageFile={noticeImport.imageFile}
+                  imagePreviewUrl={noticeImport.imagePreviewUrl}
+                  ocrSupported={noticeImport.ocrSupported}
+                  ocrRunning={noticeImport.ocrRunning}
+                  ocrProgress={noticeImport.ocrProgress}
+                  ocrConfidence={noticeImport.ocrConfidence}
+                  ocrLowQuality={noticeImport.ocrLowQuality}
+                  ocrError={noticeImport.ocrError}
+                  ocrEditedText={noticeImport.ocrEditedText}
+                  onChangeText={noticeImport.setOcrEditedText}
+                  onReplaceImage={(file) => noticeImport.attachImageFile(file)}
+                  onClearImage={noticeImport.clearImage}
+                  onRerunOcr={noticeImport.rerunOcr}
+                  onCancelOcr={noticeImport.cancelOcr}
+                  onAnalyze={() =>
+                    noticeImport.analyzeNoticeText(noticeImport.ocrEditedText, 'ocr')
+                  }
+                />
+              )}
+
+              <ImportCandidatesSection
+                candidates={noticeImport.candidates}
+                unparsedLines={noticeImport.unparsedLines}
+                parseError={noticeImport.parseError}
+                saveStates={noticeImport.saveStates}
+                isSubmitting={noticeImport.isSubmitting}
+                batchSummary={noticeImport.batchSummary}
+                onChangeCandidate={noticeImport.updateCandidate}
+                onDeleteCandidate={noticeImport.deleteCandidate}
+                onSelectAllPending={noticeImport.selectAllPending}
+                onCancelAnalysis={noticeImport.resetAnalysis}
+                onRegisterSelected={() => void noticeImport.registerSelected()}
+                onOpenTask={(taskId) => onOpenTask?.(taskId)}
+                onOpenEvent={(eventId) => onOpenEvent?.(eventId)}
+              />
+            </div>
+          )}
+
           <div>
             <label
               htmlFor="event-title"
@@ -366,6 +612,7 @@ export function EventModal({
               maxLength={VALIDATION_LIMITS.TITLE_MAX_LEN}
               value={title}
               onChange={(e) => setTitle(e.target.value)}
+              onPaste={handleTitlePaste}
               placeholder="예: 교직원 연수, 학부모 상담, 부장회의"
               className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:border-teal-700"
             />
@@ -490,12 +737,29 @@ export function EventModal({
           </div>
 
           <div>
-            <label
-              htmlFor="event-description"
-              className="block text-xs font-medium text-slate-700 mb-1.5"
-            >
-              상세 내용 (선택)
-            </label>
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <label
+                htmlFor="event-description"
+                className="block text-xs font-medium text-slate-700"
+              >
+                상세 내용 (선택)
+              </label>
+              {!isEditMode && description.trim().length > 0 && !showNoticeBox && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    noticeImport.analyzeNoticeText(
+                      [title.trim(), description.trim()].filter(Boolean).join('\n'),
+                      'text',
+                    )
+                  }
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-teal-800 hover:text-teal-950 cursor-pointer"
+                >
+                  <ScanText className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>이 내용으로 일정·업무 분석</span>
+                </button>
+              )}
+            </div>
             <textarea
               id="event-description"
               rows={3}

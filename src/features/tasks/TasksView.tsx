@@ -207,7 +207,22 @@ export function TasksView({
         </button>
       </div>
 
-      <TaskQuickAddBar />
+      <TaskQuickAddBar
+        onOpenTask={(taskId) => {
+          const cached =
+            tasksRef.current.find((item) => item.id === taskId) ??
+            briefingTasksRef.current.find((item) => item.id === taskId);
+          if (cached) {
+            setSelectedTask(cached);
+          } else {
+            void refreshSingleTask(taskId).then((fetched) => {
+              if (fetched) setSelectedTask(fetched);
+            });
+          }
+        }}
+        onOpenEvent={(eventId) => onOpenEvent?.(eventId)}
+        onGoToCalendarView={onOpenEvent ? () => onOpenEvent('') : undefined}
+      />
 
       {usedIndexFallback && (
         <div
