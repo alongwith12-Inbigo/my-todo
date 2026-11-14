@@ -21,7 +21,26 @@ import {
   Timestamp,
   updateDoc,
   where,
+  type Firestore,
 } from 'firebase/firestore';
+import {
+  createTask,
+  permanentlyDeleteTask,
+  postponeTask,
+  restoreTask,
+  softDeleteTask,
+  TaskConcurrencyError,
+  TaskValidationError,
+  transitionTaskStatus,
+  updateTaskDetails,
+} from './src/repositories/taskOperations';
+import {
+  fetchBriefingTaskSet,
+  fetchMoreUndatedTasks,
+  fetchSingleTask,
+  fetchTasksPage,
+} from './src/repositories/taskQueries';
+import { classifyTodayBriefing } from './src/lib/briefing';
 
 const PROJECT_ID = 'school-partner-rules-test';
 const RULES_PATH = process.env.RULES_FILE || 'firestore.rules';
@@ -68,19 +87,25 @@ function makeTaskDoc(overrides: Record<string, unknown> = {}) {
   };
 }
 
+const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST || '127.0.0.1:8088';
+const [host, portStr] = emulatorHost.split(':');
+const port = Number(portStr) || 8088;
+
 before(async () => {
   testEnv = await initializeTestEnvironment({
     projectId: PROJECT_ID,
     firestore: {
       rules: readFileSync(RULES_PATH, 'utf8'),
-      host: '127.0.0.1',
-      port: 8080,
+      host,
+      port,
     },
   });
 });
 
 after(async () => {
-  await testEnv.cleanup();
+  if (testEnv) {
+    await testEnv.cleanup();
+  }
 });
 
 beforeEach(async () => {
@@ -177,6 +202,73 @@ beforeEach(async () => {
       reviewedAt: now,
       reviewedBy: 'admin1',
       note: '퇴직 처리',
+      createdAt: now,
+      updatedAt: now,
+      schemaVersion: 1,
+    });
+
+    // Seed a rejected teacher
+    await setDoc(doc(db, 'access', 'teacherRejected'), {
+      uid: 'teacherRejected',
+      email: 'rejected@school.kr',
+      displayName: '반려교사',
+      status: 'rejected',
+      role: 'teacher',
+      requestedAt: now,
+      reviewedAt: now,
+      reviewedBy: 'admin1',
+      note: '소속 확인 불가',
+      createdAt: now,
+      updatedAt: now,
+      schemaVersion: 1,
+    });
+
+    // Seed a suspended admin (must lose all admin & workspace privileges)
+    await setDoc(doc(db, 'access', 'adminSuspended'), {
+      uid: 'adminSuspended',
+      email: 'admin-suspended@school.kr',
+      displayName: '정지관리자',
+      status: 'suspended',
+      role: 'admin',
+      requestedAt: now,
+      reviewedAt: now,
+      reviewedBy: 'admin1',
+      note: '권한 일시 중지',
+      createdAt: now,
+      updatedAt: now,
+      schemaVersion: 1,
+    });
+
+    // Seed a second active teacher for cross-teacher isolation tests
+    await setDoc(doc(db, 'access', 'teacherActive2'), {
+      uid: 'teacherActive2',
+      email: 'active2@school.kr',
+      displayName: '최교사',
+      status: 'active',
+      role: 'teacher',
+      requestedAt: now,
+      reviewedAt: now,
+      reviewedBy: 'admin1',
+      note: '',
+      createdAt: now,
+      updatedAt: now,
+      schemaVersion: 1,
+    });
+
+    await setDoc(doc(db, 'users', 'teacherActive2', 'tasks', 'taskSecret'), {
+      title: '다른 교사 비공개 업무',
+      description: '열람 차단 검증용',
+      status: 'todo',
+      priority: 'normal',
+      dueAt: null,
+      scheduledAt: null,
+      remindAt: null,
+      completedAt: null,
+      sourceType: 'manual',
+      relatedEventId: null,
+      isDeleted: false,
+      deletedAt: null,
+      version: 1,
       createdAt: now,
       updatedAt: now,
       schemaVersion: 1,
@@ -665,5 +757,373 @@ describe('Admin Privacy Isolation & Workspace Gates', () => {
       }),
     );
     await assertSucceeds(getDoc(doc(activeDb, 'system', 'config')));
+  });
+
+  it('blocks rejected users, suspended admins, immutable access tampering, and cross-teacher private data reads/writes', async () => {
+    const rejectedDb = testEnv
+      .authenticatedContext('teacherRejected', {
+        email: 'rejected@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+
+    await assertFails(
+      setDoc(doc(rejectedDb, 'users', 'teacherRejected', 'tasks', 't1'), makeTaskDoc()),
+    );
+    await assertFails(getDocs(collection(rejectedDb, 'users', 'teacherRejected', 'tasks')));
+
+    const suspendedAdminDb = testEnv
+      .authenticatedContext('adminSuspended', {
+        email: 'admin-suspended@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+
+    await assertFails(getDocs(collection(suspendedAdminDb, 'access')));
+    await assertFails(
+      updateDoc(doc(suspendedAdminDb, 'access', 'teacherPending'), {
+        status: 'active',
+        reviewedAt: serverTimestamp(),
+        reviewedBy: 'adminSuspended',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    const adminDb = testEnv
+      .authenticatedContext('admin1', {
+        email: 'admin1@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+
+    // Admin cannot tamper with immutable fields (uid/email) on access/{uid}
+    await assertFails(
+      updateDoc(doc(adminDb, 'access', 'teacherPending'), {
+        email: 'tampered@school.kr',
+        status: 'active',
+        reviewedAt: serverTimestamp(),
+        reviewedBy: 'admin1',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // Cross-teacher isolation: teacherActive cannot read/write teacherActive2's workspace
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+
+    await assertFails(
+      getDoc(doc(activeDb, 'users', 'teacherActive2', 'tasks', 'taskSecret')),
+    );
+    await assertFails(getDocs(collection(activeDb, 'users', 'teacherActive2', 'tasks')));
+    await assertFails(
+      setDoc(
+        doc(activeDb, 'users', 'teacherActive2', 'tasks', 'injected'),
+        makeTaskDoc(),
+      ),
+    );
+  });
+});
+
+describe('Step 2 Task Operations & Concurrency Compatibility', () => {
+  it('supports create, edit details, postpone dates, complete/reopen, soft-delete, restore, and permanent delete via taskOperations', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    // 1. Create
+    const created = await assertSucceeds(
+      createTask(activeDb, 'teacherActive', {
+        title: '기말고사 시험 감독표 작성',
+        description: '교무부 공지 확인 후 배정',
+        priority: 'high',
+      }),
+    );
+    assert.equal(created.version, 1);
+
+    const taskRef = doc(activeDb, 'users', 'teacherActive', 'tasks', created.id);
+    const snap1 = await getDoc(taskRef);
+    assert.equal(snap1.data()?.status, 'todo');
+    assert.equal(snap1.data()?.completedAt, null);
+
+    // 2. Edit details (Branch 1)
+    const edited = await assertSucceeds(
+      updateTaskDetails(activeDb, 'teacherActive', created.id, 1, {
+        title: '기말고사 시험 감독표 최종 확정',
+        priority: 'urgent',
+      }),
+    );
+    assert.equal(edited.version, 2);
+
+    // 3. Postpone / Reschedule dates (Branch 1)
+    const nextDue = Timestamp.fromMillis(Date.now() + 86_400_000 * 3);
+    const nextRemind = Timestamp.fromMillis(Date.now() + 86_400_000 * 2);
+    const postponed = await assertSucceeds(
+      postponeTask(activeDb, 'teacherActive', created.id, 2, {
+        dueAt: nextDue,
+        remindAt: nextRemind,
+      }),
+    );
+    assert.equal(postponed.version, 3);
+    const snap3 = await getDoc(taskRef);
+    assert.equal(snap3.data()?.status, 'todo');
+    assert.ok(snap3.data()?.dueAt instanceof Timestamp);
+
+    // 4. Transition to done (Branch 2) -> completedAt populated
+    const completed = await assertSucceeds(
+      transitionTaskStatus(activeDb, 'teacherActive', created.id, 3, 'done'),
+    );
+    assert.equal(completed.version, 4);
+    assert.equal(completed.status, 'done');
+    const snap4 = await getDoc(taskRef);
+    const completedAtBeforeTrash = snap4.data()?.completedAt;
+    assert.ok(completedAtBeforeTrash instanceof Timestamp);
+
+    // Idempotent same-status call does not increment version or overwrite completedAt
+    const sameStatus = await assertSucceeds(
+      transitionTaskStatus(activeDb, 'teacherActive', created.id, 4, 'done'),
+    );
+    assert.equal(sameStatus.version, 4);
+
+    // 5. Soft-delete (Branch 3) while done -> completedAt preserved
+    const trashed = await assertSucceeds(
+      softDeleteTask(activeDb, 'teacherActive', created.id, 4),
+    );
+    assert.equal(trashed.version, 5);
+
+    // Cannot edit or transition status while in trash
+    await assert.rejects(
+      updateTaskDetails(activeDb, 'teacherActive', created.id, 5, { title: '수정 불가' }),
+      TaskValidationError,
+    );
+    await assertFails(
+      updateDoc(taskRef, {
+        title: '규칙 직접 우회 시도',
+        version: 6,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // 6. Restore from trash (Branch 4) -> preserves status='done' and completedAt
+    const restored = await assertSucceeds(
+      restoreTask(activeDb, 'teacherActive', created.id, 5),
+    );
+    assert.equal(restored.version, 6);
+    const snap6 = await getDoc(taskRef);
+    assert.equal(snap6.data()?.isDeleted, false);
+    assert.equal(snap6.data()?.deletedAt, null);
+    assert.equal(snap6.data()?.status, 'done');
+    assert.ok(snap6.data()?.completedAt instanceof Timestamp);
+
+    // 7. Reopen done -> todo -> completedAt cleared to null
+    const reopened = await assertSucceeds(
+      transitionTaskStatus(activeDb, 'teacherActive', created.id, 6, 'todo'),
+    );
+    assert.equal(reopened.version, 7);
+    const snap7 = await getDoc(taskRef);
+    assert.equal(snap7.data()?.status, 'todo');
+    assert.equal(snap7.data()?.completedAt, null);
+
+    // 8. Cannot permanently delete before soft-delete, succeeds after soft-delete
+    await assert.rejects(
+      permanentlyDeleteTask(activeDb, 'teacherActive', created.id),
+      TaskValidationError,
+    );
+    await assertSucceeds(softDeleteTask(activeDb, 'teacherActive', created.id, 7));
+    await assertSucceeds(permanentlyDeleteTask(activeDb, 'teacherActive', created.id));
+  });
+
+  it('rejects concurrent stale-version updates and mixed Branch1+Branch2 updates', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    // First client updates version 1 -> 2
+    const first = await assertSucceeds(
+      updateTaskDetails(activeDb, 'teacherActive', 'task1', 1, {
+        title: '선행 수정 완료',
+      }),
+    );
+    assert.equal(first.version, 2);
+
+    // Stale client still holding expectedVersion=1 gets TaskConcurrencyError
+    await assert.rejects(
+      updateTaskDetails(activeDb, 'teacherActive', 'task1', 1, {
+        title: '뒤늦은 덮어쓰기 시도',
+      }),
+      (err: unknown) =>
+        err instanceof TaskConcurrencyError &&
+        err.expectedVersion === 1 &&
+        err.actualVersion === 2,
+    );
+
+    // Verify first client's title was preserved
+    const snap = await getDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1'));
+    assert.equal(snap.data()?.title, '선행 수정 완료');
+    assert.equal(snap.data()?.version, 2);
+
+    // Verify raw updateDoc mixing Branch 1 (title) + Branch 2 (status) is rejected by rules
+    await assertFails(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1'), {
+        title: '혼합 수정 시도',
+        status: 'on_hold',
+        version: 3,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+  });
+
+  it('fetches briefing tasks without missing overdue/remind items across undated pagination and supports filtered task pagination', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    const now = new Date('2026-05-15T01:00:00Z'); // 2026-05-15 10:00 KST
+    const overdueTs = Timestamp.fromDate(new Date('2026-05-13T14:59:59Z'));
+    const remindTodayTs = Timestamp.fromDate(new Date('2026-05-15T00:00:00Z'));
+
+    // Create 3 undated tasks, 1 overdue task, 1 remind-today task, 1 done task
+    await createTask(activeDb, 'teacherActive', { title: '날짜없음 1' }, 'u1');
+    await createTask(activeDb, 'teacherActive', { title: '날짜없음 2' }, 'u2');
+    await createTask(activeDb, 'teacherActive', { title: '날짜없음 3' }, 'u3');
+    const overdueRes = await createTask(
+      activeDb,
+      'teacherActive',
+      { title: '기한초과 업무', priority: 'urgent', dueAt: overdueTs },
+      'dueOverdue',
+    );
+    const remindRes = await createTask(
+      activeDb,
+      'teacherActive',
+      { title: '오늘 재확인 업무', remindAt: remindTodayTs },
+      'remindToday',
+    );
+    await createTask(
+      activeDb,
+      'teacherActive',
+      { title: '이미 완료된 업무', status: 'done' },
+      'doneTask',
+    );
+
+    // Fetch briefing with small undatedPageSize=2 -> must STILL include dueOverdue & remindToday!
+    const briefingRes = await assertSucceeds(
+      fetchBriefingTaskSet(activeDb, 'teacherActive', {
+        imminentDays: 3,
+        now,
+        undatedPageSize: 2,
+      }),
+    );
+
+    const fetchedIds = new Set(briefingRes.tasks.map((t) => t.id));
+    assert.ok(fetchedIds.has('dueOverdue'));
+    assert.ok(fetchedIds.has('remindToday'));
+    assert.equal(fetchedIds.has('doneTask'), false);
+    assert.equal(briefingRes.hasMoreUndated, true);
+    assert.ok(briefingRes.undatedCursor);
+
+    // Load next page of undated tasks
+    const moreUndated = await assertSucceeds(
+      fetchMoreUndatedTasks(
+        activeDb,
+        'teacherActive',
+        briefingRes.undatedCursor!,
+        2,
+      ),
+    );
+    assert.ok(moreUndated.tasks.length >= 1);
+
+    const summary = classifyTodayBriefing(
+      [...briefingRes.tasks, ...moreUndated.tasks],
+      { now, imminentDays: 3 },
+    );
+    assert.deepEqual(
+      summary.overdue.map((t) => t.id),
+      ['dueOverdue'],
+    );
+    assert.deepEqual(
+      summary.remindDue.map((t) => t.id),
+      ['remindToday'],
+    );
+
+    // Clear remindAt (해제) on remindToday and verify via fetchSingleTask
+    await assertSucceeds(
+      postponeTask(activeDb, 'teacherActive', 'remindToday', remindRes.version, {
+        remindAt: null,
+      }),
+    );
+    const updatedRemind = await assertSucceeds(
+      fetchSingleTask(activeDb, 'teacherActive', 'remindToday'),
+    );
+    assert.equal(updatedRemind?.remindAt, null);
+    assert.equal(updatedRemind?.version, 2);
+
+    // Filtered TasksPage pagination ('active', pageSize=2)
+    const page1 = await assertSucceeds(
+      fetchTasksPage(activeDb, 'teacherActive', {
+        filter: 'active',
+        sortField: 'updatedAt',
+        pageSize: 2,
+      }),
+    );
+    assert.equal(page1.tasks.length, 2);
+    assert.equal(page1.hasMore, true);
+    assert.ok(page1.nextCursor);
+
+    const page2 = await assertSucceeds(
+      fetchTasksPage(activeDb, 'teacherActive', {
+        filter: 'active',
+        sortField: 'updatedAt',
+        pageSize: 2,
+        cursor: page1.nextCursor,
+      }),
+    );
+    assert.ok(page2.tasks.length >= 1);
+    const page1Ids = new Set(page1.tasks.map((t) => t.id));
+    for (const item of page2.tasks) {
+      assert.equal(page1Ids.has(item.id), false);
+    }
+
+    // Done & Trash filters
+    const donePage = await assertSucceeds(
+      fetchTasksPage(activeDb, 'teacherActive', {
+        filter: 'done',
+        pageSize: 10,
+      }),
+    );
+    assert.deepEqual(
+      donePage.tasks.map((t) => t.id),
+      ['doneTask'],
+    );
+
+    await assertSucceeds(
+      softDeleteTask(activeDb, 'teacherActive', 'dueOverdue', overdueRes.version),
+    );
+    const trashPage = await assertSucceeds(
+      fetchTasksPage(activeDb, 'teacherActive', {
+        filter: 'trash',
+        pageSize: 10,
+      }),
+    );
+    assert.deepEqual(
+      trashPage.tasks.map((t) => t.id),
+      ['dueOverdue'],
+    );
+
+    // Cross-teacher isolation via query layer must fail
+    await assertFails(
+      fetchBriefingTaskSet(activeDb, 'teacherActive2', { now }),
+    );
   });
 });
