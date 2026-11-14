@@ -42,6 +42,18 @@ service cloud.firestore {
       return val == null || val is timestamp;
     }
 
+    function isValidDateKey(val) {
+      return val is string && val.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isValidTimeHhMm(val) {
+      return val is string && val.matches('^([01]\\d|2[0-3]):[0-5]\\d$');
+    }
+
+    function isNullableTimeHhMm(val) {
+      return val == null || isValidTimeHhMm(val);
+    }
+
     function isValidSchemaVersion(data) {
       return data.schemaVersion is int && data.schemaVersion == 1;
     }
@@ -242,6 +254,73 @@ service cloud.firestore {
         data.appName is string && data.appName.size() >= 1 && data.appName.size() <= 80 &&
         data.minSchemaVersion is int && data.minSchemaVersion >= 1 &&
         data.registrationOpen is bool &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidTimetable(data) {
+      return data.keys().hasAll([
+          'name', 'semesterLabel', 'effectiveFrom', 'effectiveTo',
+          'workStart', 'workEnd', 'lunchStart', 'lunchEnd',
+          'periodCount', 'periodTimes', 'slots', 'isActive',
+          'sourceType', 'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'name', 'semesterLabel', 'effectiveFrom', 'effectiveTo',
+          'workStart', 'workEnd', 'lunchStart', 'lunchEnd',
+          'periodCount', 'periodTimes', 'slots', 'isActive',
+          'sourceType', 'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+        data.semesterLabel is string && data.semesterLabel.size() <= 40 &&
+        isValidDateKey(data.effectiveFrom) &&
+        isValidDateKey(data.effectiveTo) &&
+        data.effectiveTo >= data.effectiveFrom &&
+        isValidTimeHhMm(data.workStart) &&
+        isValidTimeHhMm(data.workEnd) &&
+        data.workEnd > data.workStart &&
+        isValidTimeHhMm(data.lunchStart) &&
+        isValidTimeHhMm(data.lunchEnd) &&
+        data.lunchEnd > data.lunchStart &&
+        data.periodCount is int && data.periodCount >= 1 && data.periodCount <= 12 &&
+        data.periodTimes is map && data.periodTimes.keys().size() >= 1 && data.periodTimes.keys().size() <= 12 &&
+        data.slots is map && data.slots.keys().size() <= 60 &&
+        data.isActive is bool &&
+        data.sourceType in ['manual', 'excel', 'ocr'] &&
+        data.version is int && data.version >= 1 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidTimetableOverride(data) {
+      return data.keys().hasAll([
+          'dateKey', 'baseTimetableId', 'reason',
+          'workStart', 'workEnd', 'lunchStart', 'lunchEnd',
+          'periodTimes', 'slots', 'version',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'dateKey', 'baseTimetableId', 'reason',
+          'workStart', 'workEnd', 'lunchStart', 'lunchEnd',
+          'periodTimes', 'slots', 'version',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        isValidDateKey(data.dateKey) &&
+        isNullableId(data.baseTimetableId) &&
+        data.reason is string && data.reason.size() <= 120 &&
+        isNullableTimeHhMm(data.workStart) &&
+        isNullableTimeHhMm(data.workEnd) &&
+        ((data.workStart == null && data.workEnd == null) ||
+         (data.workStart is string && data.workEnd is string && data.workEnd > data.workStart)) &&
+        isNullableTimeHhMm(data.lunchStart) &&
+        isNullableTimeHhMm(data.lunchEnd) &&
+        ((data.lunchStart == null && data.lunchEnd == null) ||
+         (data.lunchStart is string && data.lunchEnd is string && data.lunchEnd > data.lunchStart)) &&
+        data.periodTimes is map && data.periodTimes.keys().size() <= 12 &&
+        data.slots is map && data.slots.keys().size() <= 12 &&
+        data.version is int && data.version >= 1 &&
+        data.createdAt is timestamp &&
         data.updatedAt is timestamp &&
         isValidSchemaVersion(data);
     }
@@ -483,6 +562,63 @@ service cloud.firestore {
         incoming().updatedAt == request.time;
 
       allow delete: if false;
+    }
+
+    match /users/{uid}/timetables/{timetableId} {
+      allow get: if isActiveOwner(uid) && isValidId(timetableId);
+      allow list: if isActiveOwner(uid);
+
+      allow create: if isActiveOwner(uid) &&
+        isValidId(timetableId) &&
+        isValidTimetable(incoming()) &&
+        incoming().version == 1 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        isValidId(timetableId) &&
+        isValidTimetable(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'semesterLabel', 'effectiveFrom', 'effectiveTo',
+          'workStart', 'workEnd', 'lunchStart', 'lunchEnd',
+          'periodCount', 'periodTimes', 'slots', 'isActive',
+          'sourceType', 'version', 'updatedAt'
+        ]) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().version == existing().version + 1 &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isActiveOwner(uid) && isValidId(timetableId);
+    }
+
+    match /users/{uid}/timetableOverrides/{dateKey} {
+      allow get: if isActiveOwner(uid) && isValidDateKey(dateKey);
+      allow list: if isActiveOwner(uid);
+
+      allow create: if isActiveOwner(uid) &&
+        isValidDateKey(dateKey) &&
+        isValidTimetableOverride(incoming()) &&
+        incoming().dateKey == dateKey &&
+        incoming().version == 1 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        isValidDateKey(dateKey) &&
+        isValidTimetableOverride(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'baseTimetableId', 'reason', 'workStart', 'workEnd',
+          'lunchStart', 'lunchEnd', 'periodTimes', 'slots',
+          'version', 'updatedAt'
+        ]) &&
+        incoming().dateKey == existing().dateKey &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().version == existing().version + 1 &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isActiveOwner(uid) && isValidDateKey(dateKey);
     }
 
     // -------------------------------------------------------------------------

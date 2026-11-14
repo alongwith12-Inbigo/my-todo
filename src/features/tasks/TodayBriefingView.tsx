@@ -24,12 +24,19 @@ import {
   formatKstTodayHeader,
   getKstGreeting,
 } from '../../lib/dateKst';
+import {
+  computeDayTimeAvailability,
+  formatMinutesKorean,
+  resolveTimetableForDate,
+  SLOT_KIND_LABELS,
+} from '../../lib/timetable';
 import type { TaskFilterTab } from '../../repositories/taskRepo';
 import { AiClientError, requestAiTodayBriefing } from '../../services/aiClient';
 import type { CalendarEventRecord, TaskRecord } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
 import { EventModal } from '../calendar/EventModal';
+import { useTimetableData } from '../timetable/TimetableDataContext';
 import { AiTodayBriefingCard } from './AiTodayBriefingCard';
 import { useTaskData } from './TaskDataContext';
 import { TaskDetailModal } from './TaskDetailModal';
@@ -41,6 +48,7 @@ interface TodayBriefingViewProps {
   todayKey: string;
   onOpenTasksView: (initialFilter?: TaskFilterTab) => void;
   onOpenCalendar: (eventId?: string) => void;
+  onOpenTimetable?: () => void;
   focusedTaskId?: string | null;
   onClearFocusedTask?: () => void;
 }
@@ -152,6 +160,7 @@ export function TodayBriefingView({
   todayKey,
   onOpenTasksView,
   onOpenCalendar,
+  onOpenTimetable,
   focusedTaskId,
   onClearFocusedTask,
 }: TodayBriefingViewProps) {
@@ -168,6 +177,7 @@ export function TodayBriefingView({
     loadMoreUndated,
   } = useTaskData();
   const { events, eventsLoading, refreshEvents } = useEventData();
+  const { timetables, overridesByDate } = useTimetableData();
 
   const [selectedTask, setSelectedTask] = useState<TaskRecord | null>(null);
   const [eventModalOpen, setEventModalOpen] = useState(false);
@@ -277,6 +287,25 @@ export function TodayBriefingView({
   const todayEventsSummary = useMemo(
     () => classifyTodayEvents(events, { now, soonMinutes: 120, upcomingDays: 7 }),
     [events, now],
+  );
+
+  const todaySchedule = useMemo(
+    () =>
+      resolveTimetableForDate(
+        todayKey,
+        timetables,
+        overridesByDate[todayKey] ?? null,
+      ),
+    [todayKey, timetables, overridesByDate],
+  );
+
+  const todayAvailability = useMemo(
+    () =>
+      computeDayTimeAvailability({
+        resolvedDay: todaySchedule,
+        events,
+      }),
+    [todaySchedule, events],
   );
 
   const hasAnyPriorityFocus =
@@ -695,6 +724,134 @@ export function TodayBriefingView({
                           );
                         })}
                       </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
+
+            {/* Today's Class Timetable & Workable Time */}
+            <section
+              aria-label="오늘의 수업 · 업무 가능 시간"
+              className="bg-white border border-slate-200 rounded-xl p-5 space-y-3"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-teal-700" aria-hidden="true" />
+                  <h2 className="text-sm font-bold text-slate-900">
+                    오늘의 수업 · 가용 시간
+                  </h2>
+                  {todaySchedule.hasOverride && (
+                    <span className="text-[11px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                      임시 변경
+                    </span>
+                  )}
+                </div>
+
+                {onOpenTimetable && (
+                  <button
+                    type="button"
+                    onClick={onOpenTimetable}
+                    className="text-xs font-medium text-teal-700 hover:text-teal-900 shrink-0 cursor-pointer"
+                  >
+                    시간표 관리
+                  </button>
+                )}
+              </div>
+
+              {todaySchedule.periods.length === 0 ? (
+                <div className="space-y-2 py-1">
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    {todaySchedule.isWeekday
+                      ? '오늘 적용되는 주간 시간표가 없습니다. 엑셀·이미지 또는 직접 입력으로 시간표를 등록하면 수업과 업무 가능 시간이 함께 정리됩니다.'
+                      : '주말에는 주간 수업 시간표가 표시되지 않습니다.'}
+                  </p>
+                  {onOpenTimetable && (
+                    <button
+                      type="button"
+                      onClick={onOpenTimetable}
+                      className="text-xs font-semibold text-teal-700 hover:text-teal-900 cursor-pointer"
+                    >
+                      주간 시간표 등록하기 →
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-2.5">
+                  <div className="divide-y divide-slate-100 border border-slate-100 rounded-lg">
+                    {todaySchedule.periods.map((slot) => (
+                      <div
+                        key={slot.period}
+                        className={`px-2.5 py-1.5 flex items-center justify-between gap-2 text-xs ${
+                          slot.isOverridden ? 'bg-amber-50/40' : ''
+                        }`}
+                      >
+                        <div className="min-w-0 truncate">
+                          <span className="font-bold text-slate-800 mr-1.5 tabular-nums">
+                            {slot.label}
+                          </span>
+                          <span
+                            className={
+                              slot.kind === 'free'
+                                ? slot.workAvailable
+                                  ? 'font-medium text-emerald-800'
+                                  : 'text-slate-500'
+                                : 'font-medium text-slate-900'
+                            }
+                          >
+                            {slot.subject ||
+                              (slot.kind === 'free'
+                                ? slot.workAvailable
+                                  ? '공강(업무 가능)'
+                                  : '공강'
+                                : SLOT_KIND_LABELS[slot.kind])}
+                          </span>
+                          {slot.className && (
+                            <span className="text-[11px] text-slate-500 ml-1">
+                              ({slot.className})
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-[11px] text-slate-500 tabular-nums shrink-0">
+                          {slot.startTime}~{slot.endTime}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {todayAvailability.hasTimetable && (
+                    <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-600">오늘 수업</span>
+                        <span className="font-semibold text-slate-900 tabular-nums">
+                          {formatMinutesKorean(todayAvailability.classMinutes)}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-600">
+                          실제 업무 가능 시간
+                        </span>
+                        <span className="font-bold text-teal-800 tabular-nums">
+                          {formatMinutesKorean(todayAvailability.netAvailableMinutes)}
+                        </span>
+                      </div>
+                      {todayAvailability.netAvailableIntervals.length > 0 && (
+                        <p className="text-[11px] text-slate-500 tabular-nums leading-relaxed">
+                          가용 시간대:{' '}
+                          {todayAvailability.netAvailableIntervals
+                            .map((seg) => `${seg.startTime}~${seg.endTime}`)
+                            .join(', ')}
+                        </p>
+                      )}
+                      {todayAvailability.conflicts.length > 0 && (
+                        <p className="text-[11px] text-amber-800 leading-relaxed">
+                          일정 겹침 {todayAvailability.conflicts.length}건 (
+                          {todayAvailability.conflicts
+                            .map((c) => c.eventTitle)
+                            .join(', ')}
+                          )
+                        </p>
+                      )}
                     </div>
                   )}
                 </div>

@@ -14,6 +14,7 @@ import { SettingsView } from './features/settings/SettingsView';
 import { TaskDataProvider, useTaskData } from './features/tasks/TaskDataContext';
 import { TasksView } from './features/tasks/TasksView';
 import { TodayBriefingView } from './features/tasks/TodayBriefingView';
+import { TimetableDataProvider } from './features/timetable/TimetableDataContext';
 import type { NavSection } from './types/domain';
 
 const NAV_ITEMS: { id: NavSection; label: string }[] = [
@@ -36,6 +37,9 @@ function AuthenticatedWorkspace({
   const { refreshEvents } = useEventData();
 
   const [activeNav, setActiveNav] = useState<NavSection>('today');
+  const [calendarSection, setCalendarSection] = useState<'calendar' | 'timetable'>(
+    'calendar',
+  );
   const [tasksInitialFilter, setTasksInitialFilter] =
     useState<TaskFilterTab>('active');
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
@@ -70,6 +74,12 @@ function AuthenticatedWorkspace({
     if (eventId) {
       setFocusedEventId(eventId);
     }
+    setCalendarSection('calendar');
+    setActiveNav('calendar');
+  }
+
+  function handleOpenTimetable() {
+    setCalendarSection('timetable');
     setActiveNav('calendar');
   }
 
@@ -166,6 +176,7 @@ function AuthenticatedWorkspace({
             todayKey={todayKey}
             onOpenTasksView={handleOpenTasksView}
             onOpenCalendar={handleOpenCalendar}
+            onOpenTimetable={handleOpenTimetable}
             focusedTaskId={focusedTaskId}
             onClearFocusedTask={() => setFocusedTaskId(null)}
           />
@@ -184,6 +195,8 @@ function AuthenticatedWorkspace({
           <CalendarView
             todayKey={todayKey}
             now={now}
+            initialSection={calendarSection}
+            onSectionChange={setCalendarSection}
             focusedEventId={focusedEventId}
             onClearFocusedEvent={() => setFocusedEventId(null)}
             onOpenTask={handleOpenTask}
@@ -251,10 +264,12 @@ function WorkspaceShell() {
     <TaskDataProvider>
       <EventDataProvider>
         <NoteDataProvider>
-          <AuthenticatedWorkspace
-            displayName={workspace.profile.displayName}
-            onSignOut={signOutUser}
-          />
+          <TimetableDataProvider>
+            <AuthenticatedWorkspace
+              displayName={workspace.profile.displayName}
+              onSignOut={signOutUser}
+            />
+          </TimetableDataProvider>
         </NoteDataProvider>
       </EventDataProvider>
     </TaskDataProvider>

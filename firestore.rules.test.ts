@@ -59,6 +59,16 @@ import {
   reorderNotes,
   updateNote,
 } from './src/repositories/noteOperations';
+import {
+  createTimetable,
+  deleteTimetable,
+  deleteTimetableOverride,
+  fetchAllTimetableOverrides,
+  fetchAllTimetables,
+  updateTimetable,
+  upsertTimetableOverride,
+} from './src/repositories/timetableOperations';
+import { createEmptyTimetableDraft, makeSlotKey } from './src/lib/timetable';
 import { classifyTodayBriefing } from './src/lib/briefing';
 
 const PROJECT_ID = 'school-partner-rules-test';
@@ -1441,4 +1451,121 @@ describe('Step 4 Import SourceType Rules Compatibility', () => {
     assert.equal(ocrRecord?.sourceType, 'import_ocr');
   });
 });
+
+describe('Step 5A Weekly Timetable & Date Override Rules', () => {
+  it('allows active owner to CRUD weekly timetables and single-date overrides while isolating other teachers and admins', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+    const otherDb = testEnv
+      .authenticatedContext('teacherActive2', {
+        email: 'active2@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+    const adminDb = testEnv
+      .authenticatedContext('admin1', {
+        email: 'admin1@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+    const suspendedDb = testEnv
+      .authenticatedContext('teacherSuspended', {
+        email: 'suspended@school.kr',
+        email_verified: true,
+      })
+      .firestore() as unknown as Firestore;
+
+    const draft = createEmptyTimetableDraft('2026-11-14');
+    draft.slots[makeSlotKey(1, 1)] = {
+      day: 1,
+      period: 1,
+      kind: 'class',
+      subject: '국어',
+      className: '3-1',
+      classroom: '301호',
+      note: '',
+      workAvailable: false,
+    };
+
+    const created = await assertSucceeds(
+      createTimetable(activeDb, 'teacherActive', draft),
+    );
+    assert.equal(created.version, 1);
+
+    const list = await assertSucceeds(
+      fetchAllTimetables(activeDb, 'teacherActive'),
+    );
+    assert.equal(list.length, 1);
+    assert.equal(list[0].name, draft.name);
+
+    const updated = await assertSucceeds(
+      updateTimetable(activeDb, 'teacherActive', created.id, 1, {
+        ...draft,
+        name: '2026학년도 2학기 수정본',
+      }),
+    );
+    assert.equal(updated.version, 2);
+
+    // Override create, update, read, delete
+    const ov = await assertSucceeds(
+      upsertTimetableOverride(activeDb, 'teacherActive', {
+        dateKey: '2026-11-18',
+        baseTimetableId: created.id,
+        reason: '보강 수업',
+        slots: {
+          '2': {
+            period: 2,
+            kind: 'class',
+            subject: '수학 보강',
+            className: '3-2',
+            classroom: '302호',
+            note: '',
+            workAvailable: false,
+          },
+        },
+      }),
+    );
+    assert.equal(ov.version, 1);
+
+    const ovList = await assertSucceeds(
+      fetchAllTimetableOverrides(activeDb, 'teacherActive'),
+    );
+    assert.equal(ovList.length, 1);
+
+    // Reject invalid dateKey doc ID
+    await assertFails(
+      setDoc(doc(activeDb, 'users', 'teacherActive', 'timetableOverrides', 'bad-id'), {
+        dateKey: 'bad-id',
+        baseTimetableId: null,
+        reason: '',
+        workStart: null,
+        workEnd: null,
+        lunchStart: null,
+        lunchEnd: null,
+        periodTimes: {},
+        slots: {},
+        version: 1,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        schemaVersion: 1,
+      }),
+    );
+
+    // Cross-teacher, admin, and suspended access denied
+    await assertFails(fetchAllTimetables(otherDb, 'teacherActive'));
+    await assertFails(fetchAllTimetables(adminDb, 'teacherActive'));
+    await assertFails(fetchAllTimetableOverrides(otherDb, 'teacherActive'));
+    await assertFails(createTimetable(suspendedDb, 'teacherSuspended', draft));
+
+    await assertSucceeds(
+      deleteTimetableOverride(activeDb, 'teacherActive', '2026-11-18'),
+    );
+    await assertSucceeds(deleteTimetable(activeDb, 'teacherActive', created.id));
+  });
+});
+
 

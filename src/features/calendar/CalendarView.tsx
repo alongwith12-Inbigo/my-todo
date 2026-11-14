@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Calendar as CalendarIcon,
+  CalendarClock,
   ChevronLeft,
   ChevronRight,
+  Clock,
   Link2,
   MapPin,
   Plus,
@@ -28,18 +30,30 @@ import {
   getKstMonthGridDays,
   getKstWeekDays,
 } from '../../lib/dateKst';
+import {
+  computeDayTimeAvailability,
+  formatMinutesKorean,
+  resolveTimetableForDate,
+  SLOT_KIND_LABELS,
+} from '../../lib/timetable';
 import type { CalendarEventRecord } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
+import { useTimetableData } from '../timetable/TimetableDataContext';
+import { TimetableManagementView } from '../timetable/TimetableManagementView';
+import { TimetableOverrideModal } from '../timetable/TimetableOverrideModal';
 import { useEventData } from './EventDataContext';
 import { EventModal } from './EventModal';
 
 type CalendarTabMode = 'month' | 'week' | 'day';
+type CalendarSection = 'calendar' | 'timetable';
 
 const WEEKDAY_LABELS = ['일', '월', '화', '수', '목', '금', '토'] as const;
 
 interface CalendarViewProps {
   todayKey: string;
   now: Date;
+  initialSection?: CalendarSection;
+  onSectionChange?: (section: CalendarSection) => void;
   focusedEventId?: string | null;
   onClearFocusedEvent?: () => void;
   onOpenTask?: (taskId: string) => void;
@@ -48,6 +62,8 @@ interface CalendarViewProps {
 export function CalendarView({
   todayKey,
   now,
+  initialSection = 'calendar',
+  onSectionChange,
   focusedEventId,
   onClearFocusedEvent,
   onOpenTask,
@@ -61,10 +77,17 @@ export function CalendarView({
     refreshEvents,
     refreshSingleEvent,
   } = useEventData();
+  const {
+    timetables,
+    overridesByDate,
+    timetablesLoading,
+    refreshTimetables,
+  } = useTimetableData();
 
   const defaultMode: CalendarTabMode =
     workspace?.preferences.defaultCalendarView === 'month' ? 'month' : 'week';
 
+  const [section, setSection] = useState<CalendarSection>(initialSection);
   const [viewMode, setViewMode] = useState<CalendarTabMode>(defaultMode);
   const [selectedDateKey, setSelectedDateKey] = useState<string>(todayKey);
   const [activeMonth, setActiveMonth] = useState<{ year: number; month: number }>(
@@ -77,6 +100,16 @@ export function CalendarView({
   const [modalOpen, setModalOpen] = useState(false);
   const [editingEvent, setEditingEvent] = useState<CalendarEventRecord | null>(null);
   const [draftDateKey, setDraftDateKey] = useState<string>(todayKey);
+  const [overrideModalOpen, setOverrideModalOpen] = useState(false);
+
+  useEffect(() => {
+    setSection(initialSection);
+  }, [initialSection]);
+
+  function switchSection(next: CalendarSection) {
+    setSection(next);
+    onSectionChange?.(next);
+  }
 
   // Open focused event if navigated from Notification or Today Briefing or Task
   useEffect(() => {
@@ -147,6 +180,25 @@ export function CalendarView({
   const todaySummary = useMemo(
     () => classifyTodayEvents(events, { now, soonMinutes: 120, upcomingDays: 7 }),
     [events, now],
+  );
+
+  const selectedDaySchedule = useMemo(
+    () =>
+      resolveTimetableForDate(
+        selectedDateKey,
+        timetables,
+        overridesByDate[selectedDateKey] ?? null,
+      ),
+    [selectedDateKey, timetables, overridesByDate],
+  );
+
+  const selectedDayAvailability = useMemo(
+    () =>
+      computeDayTimeAvailability({
+        resolvedDay: selectedDaySchedule,
+        events: selectedDayEvents,
+      }),
+    [selectedDaySchedule, selectedDayEvents],
   );
 
   function openCreateForDate(dateKey: string) {
@@ -225,30 +277,75 @@ export function CalendarView({
           </h1>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <div
+            role="tablist"
+            aria-label="일정과 주간 시간표 전환"
+            className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={section === 'calendar'}
+              onClick={() => switchSection('calendar')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                section === 'calendar'
+                  ? 'bg-white text-teal-800 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              달력 · 일정
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={section === 'timetable'}
+              onClick={() => switchSection('timetable')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                section === 'timetable'
+                  ? 'bg-white text-teal-800 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              주간 시간표
+            </button>
+          </div>
+
           <button
             type="button"
-            disabled={eventsLoading}
-            onClick={() => void refreshEvents()}
+            disabled={eventsLoading || timetablesLoading}
+            onClick={() => {
+              void refreshEvents();
+              void refreshTimetables();
+            }}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <RefreshCw
-              className={`w-3.5 h-3.5 ${eventsLoading ? 'animate-spin' : ''}`}
+              className={`w-3.5 h-3.5 ${
+                eventsLoading || timetablesLoading ? 'animate-spin' : ''
+              }`}
               aria-hidden="true"
             />
             <span>새로고침</span>
           </button>
 
-          <button
-            type="button"
-            onClick={() => openCreateForDate(selectedDateKey)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <Plus className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>새 일정</span>
-          </button>
+          {section === 'calendar' && (
+            <button
+              type="button"
+              onClick={() => openCreateForDate(selectedDateKey)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>새 일정</span>
+            </button>
+          )}
         </div>
       </div>
+
+      {section === 'timetable' ? (
+        <TimetableManagementView todayKey={todayKey} />
+      ) : (
+        <>
 
       {eventsError && (
         <div
@@ -632,6 +729,134 @@ export function CalendarView({
             )}
           </section>
 
+          {/* Selected Date Timetable & Deterministic Availability */}
+          <section
+            aria-label="선택한 날짜 수업 시간표"
+            className="bg-white border border-slate-200 rounded-xl p-5 space-y-3"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <div className="flex items-center gap-1.5">
+                  <Clock className="w-4 h-4 text-teal-700" aria-hidden="true" />
+                  <h2 className="text-sm font-bold text-slate-900">
+                    선택일 수업 시간표
+                  </h2>
+                  {selectedDaySchedule.hasOverride && (
+                    <span className="text-[11px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                      임시 변경
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  {selectedDaySchedule.timetableName ||
+                    (selectedDaySchedule.hasOverride
+                      ? '날짜별 임시 시간표'
+                      : '적용된 학기 시간표 없음')}
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setOverrideModalOpen(true)}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 shrink-0 cursor-pointer"
+              >
+                <CalendarClock className="w-3 h-3" aria-hidden="true" />
+                <span>이 날 임시 변경</span>
+              </button>
+            </div>
+
+            {selectedDaySchedule.periods.length === 0 ? (
+              <div className="py-1 space-y-2">
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  {selectedDaySchedule.isWeekday
+                    ? '이 날짜 기간에 해당하는 주간 시간표가 아직 등록되지 않았습니다.'
+                    : '주말에는 기본 주간 시간표가 표시되지 않습니다.'}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => switchSection('timetable')}
+                  className="text-xs font-semibold text-teal-700 hover:text-teal-900 cursor-pointer"
+                >
+                  주간 시간표 등록 · 관리하기 →
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {selectedDaySchedule.hasOverride &&
+                  selectedDaySchedule.overrideReason && (
+                    <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                      임시 변경 사유: {selectedDaySchedule.overrideReason}
+                    </p>
+                  )}
+
+                <div className="divide-y divide-slate-100 border border-slate-100 rounded-lg">
+                  {selectedDaySchedule.periods.map((slot) => (
+                    <div
+                      key={slot.period}
+                      className={`px-2.5 py-1.5 flex items-center justify-between gap-2 text-xs ${
+                        slot.isOverridden ? 'bg-amber-50/40' : ''
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <span className="font-bold text-slate-800 mr-1.5 tabular-nums">
+                          {slot.label}
+                        </span>
+                        <span
+                          className={
+                            slot.kind === 'free'
+                              ? 'text-slate-500'
+                              : 'font-medium text-slate-900'
+                          }
+                        >
+                          {slot.subject || SLOT_KIND_LABELS[slot.kind]}
+                        </span>
+                        {(slot.className || slot.classroom) && (
+                          <span className="text-[11px] text-slate-500 ml-1">
+                            ({[slot.className, slot.classroom].filter(Boolean).join(' · ')})
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[11px] text-slate-500 tabular-nums shrink-0">
+                        {slot.startTime}~{slot.endTime}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                {selectedDayAvailability.hasTimetable && (
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">수업 · 공강</span>
+                      <span className="font-semibold text-slate-900 tabular-nums">
+                        수업 {formatMinutesKorean(selectedDayAvailability.classMinutes)} · 공강{' '}
+                        {formatMinutesKorean(selectedDayAvailability.freeMinutes)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">실제 업무 가능 시간</span>
+                      <span className="font-bold text-teal-800 tabular-nums">
+                        {formatMinutesKorean(selectedDayAvailability.netAvailableMinutes)}
+                      </span>
+                    </div>
+                    {selectedDayAvailability.overlappingEventMinutes > 0 && (
+                      <p className="text-[11px] text-amber-800 tabular-nums">
+                        등록 일정과 {formatMinutesKorean(selectedDayAvailability.overlappingEventMinutes)} 겹침 제외
+                      </p>
+                    )}
+                    {selectedDayAvailability.netAvailableIntervals.length > 0 && (
+                      <p className="text-[11px] text-slate-500 tabular-nums">
+                        가용 시간대:{' '}
+                        {selectedDayAvailability.netAvailableIntervals
+                          .map((seg) => `${seg.startTime}~${seg.endTime}`)
+                          .join(', ')}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
           {/* Upcoming Events (Next 7 days, excluding today) */}
           <section
             aria-label="다가오는 일정"
@@ -713,6 +938,16 @@ export function CalendarView({
           }
         }}
       />
+
+      <TimetableOverrideModal
+        isOpen={overrideModalOpen}
+        initialDateKey={selectedDateKey}
+        timetables={timetables}
+        existingOverride={overridesByDate[selectedDateKey] ?? null}
+        onClose={() => setOverrideModalOpen(false)}
+      />
+        </>
+      )}
     </div>
   );
 }

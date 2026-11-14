@@ -19,6 +19,15 @@ export const VALIDATION_LIMITS = {
   NOTE_CONTENT_MAX_LEN: 2000,
   IMMINENT_DAYS_MIN: 1,
   IMMINENT_DAYS_MAX: 14,
+  TIMETABLE_NAME_MIN_LEN: 1,
+  TIMETABLE_NAME_MAX_LEN: 80,
+  TIMETABLE_SEMESTER_MAX_LEN: 40,
+  TIMETABLE_PERIOD_MAX: 12,
+  TIMETABLE_SUBJECT_MAX_LEN: 80,
+  TIMETABLE_CLASS_MAX_LEN: 40,
+  TIMETABLE_ROOM_MAX_LEN: 40,
+  TIMETABLE_NOTE_MAX_LEN: 160,
+  TIMETABLE_REASON_MAX_LEN: 120,
 } as const;
 
 export type AccountStatus = 'pending' | 'active' | 'suspended' | 'rejected';
@@ -120,10 +129,85 @@ export interface StickyNoteRecord {
   schemaVersion: number;
 }
 
+export type TimetableWeekday = 1 | 2 | 3 | 4 | 5;
+export type TimetableSlotKind = 'class' | 'free' | 'fixed_duty' | 'other';
+export type TimetableSourceType = 'manual' | 'excel' | 'ocr';
+
+export interface TimetablePeriodTime {
+  period: number;
+  label: string;
+  startTime: string; // HH:MM
+  endTime: string; // HH:MM
+}
+
+export interface TimetableSlot {
+  day: TimetableWeekday;
+  period: number;
+  kind: TimetableSlotKind;
+  subject: string;
+  className: string;
+  classroom: string;
+  note: string;
+  /**
+   * Explicitly records whether a free/other period may be used for task work.
+   * Free periods default to false and must never be assumed workable automatically.
+   */
+  workAvailable: boolean;
+}
+
+export interface TimetableRecord {
+  id: string;
+  name: string;
+  semesterLabel: string;
+  effectiveFrom: string; // YYYY-MM-DD
+  effectiveTo: string; // YYYY-MM-DD
+  workStart: string; // HH:MM
+  workEnd: string; // HH:MM
+  lunchStart: string; // HH:MM
+  lunchEnd: string; // HH:MM
+  periodCount: number;
+  periodTimes: Record<string, TimetablePeriodTime>;
+  slots: Record<string, TimetableSlot>; // key: `${day}_${period}`
+  isActive: boolean;
+  sourceType: TimetableSourceType;
+  version: number;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  schemaVersion: number;
+}
+
+export interface TimetableOverrideSlot {
+  period: number;
+  kind: TimetableSlotKind;
+  subject: string;
+  className: string;
+  classroom: string;
+  note: string;
+  workAvailable: boolean;
+}
+
+export interface TimetableOverrideRecord {
+  id: string; // dateKey YYYY-MM-DD
+  dateKey: string; // YYYY-MM-DD
+  baseTimetableId: string | null;
+  reason: string;
+  workStart: string | null;
+  workEnd: string | null;
+  lunchStart: string | null;
+  lunchEnd: string | null;
+  periodTimes: Record<string, TimetablePeriodTime>;
+  slots: Record<string, TimetableOverrideSlot>; // key: `${period}`
+  version: number;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  schemaVersion: number;
+}
+
 export type NavSection =
   | 'today'
   | 'tasks'
   | 'calendar'
   | 'notes'
   | 'settings';
+
 

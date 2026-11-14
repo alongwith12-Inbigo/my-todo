@@ -4,6 +4,23 @@ export interface BrowserOcrResult {
   lowConfidence: boolean;
 }
 
+export interface BrowserOcrBbox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export interface BrowserOcrWordBox {
+  text: string;
+  confidence: number;
+  bbox: BrowserOcrBbox;
+}
+
+export interface BrowserOcrStructuredResult extends BrowserOcrResult {
+  words: BrowserOcrWordBox[];
+}
+
 export interface BrowserOcrProgress {
   status: string;
   progress: number; // 0..100
@@ -57,14 +74,15 @@ function mapOcrStatusToKorean(status: string): string {
   }
 }
 
-export async function runInBrowserOcr(
+async function executeTesseractOcr(
   imageSource: File | Blob | string,
   options: {
     onProgress?: (progress: BrowserOcrProgress) => void;
     signal?: AbortSignal;
     timeoutMs?: number;
+    includeBlocks?: boolean;
   } = {},
-): Promise<BrowserOcrResult> {
+): Promise<BrowserOcrStructuredResult> {
   if (!isBrowserOcrSupported()) {
     throw new Error(
       '현재 브라우저는 로컬 WebAssembly OCR을 지원하지 않습니다. 오른쪽 입력 칸에 텍스트를 직접 입력해 주세요.',
@@ -124,12 +142,45 @@ export async function runInBrowserOcr(
       throw new Error('OCR 분석이 취소되었습니다.');
     }
 
-    const result = await worker.recognize(imageSource);
+    if (options.includeBlocks) {
+      await worker.setParameters({
+        preserve_interword_spaces: '1',
+      });
+    }
+
+    const result = options.includeBlocks
+      ? await worker.recognize(imageSource, {}, { text: true, blocks: true })
+      : await worker.recognize(imageSource);
+
     const cleanedText = (result.data?.text ?? '')
       .replace(/\r\n/g, '\n')
       .replace(/[ \t]+\n/g, '\n')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
+
+    const words: BrowserOcrWordBox[] = [];
+    if (options.includeBlocks && Array.isArray(result.data?.blocks)) {
+      for (const block of result.data.blocks) {
+        for (const para of block.paragraphs ?? []) {
+          for (const line of para.lines ?? []) {
+            for (const word of line.words ?? []) {
+              const text = (word.text ?? '').trim();
+              if (!text || !word.bbox) continue;
+              words.push({
+                text,
+                confidence: Number(word.confidence ?? 0),
+                bbox: {
+                  x0: Number(word.bbox.x0 ?? 0),
+                  y0: Number(word.bbox.y0 ?? 0),
+                  x1: Number(word.bbox.x1 ?? 0),
+                  y1: Number(word.bbox.y1 ?? 0),
+                },
+              });
+            }
+          }
+        }
+      }
+    }
 
     const confidence = Number(result.data?.confidence ?? 0);
     const lowConfidence = cleanedText.length < 4 || confidence < 55;
@@ -138,6 +189,7 @@ export async function runInBrowserOcr(
       text: cleanedText,
       confidence,
       lowConfidence,
+      words,
     };
   } catch (err) {
     if (aborted) {
@@ -158,3 +210,37 @@ export async function runInBrowserOcr(
     await terminateWorker();
   }
 }
+
+export async function runInBrowserOcr(
+  imageSource: File | Blob | string,
+  options: {
+    onProgress?: (progress: BrowserOcrProgress) => void;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+  } = {},
+): Promise<BrowserOcrResult> {
+  const res = await executeTesseractOcr(imageSource, {
+    ...options,
+    includeBlocks: false,
+  });
+  return {
+    text: res.text,
+    confidence: res.confidence,
+    lowConfidence: res.lowConfidence,
+  };
+}
+
+export async function runInBrowserStructuredOcr(
+  imageSource: File | Blob | string,
+  options: {
+    onProgress?: (progress: BrowserOcrProgress) => void;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+  } = {},
+): Promise<BrowserOcrStructuredResult> {
+  return executeTesseractOcr(imageSource, {
+    ...options,
+    includeBlocks: true,
+  });
+}
+
