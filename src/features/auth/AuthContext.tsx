@@ -47,6 +47,10 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function formatFirebaseErrorMessage(error: unknown): string {
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code || '')
+      : '';
   const raw = error instanceof Error ? error.message : String(error);
   if (raw.includes('Quota exceeded')) {
     if (raw.includes('Free daily read units')) {
@@ -54,13 +58,30 @@ export function formatFirebaseErrorMessage(error: unknown): string {
     }
     return 'Firestore 무료 사용 한도를 초과했습니다. 내일 한도가 초기화됩니다.';
   }
-  if (raw.includes('Missing or insufficient permissions')) {
+  if (
+    code === 'permission-denied' ||
+    raw.includes('Missing or insufficient permissions')
+  ) {
     return '접근 권한이 없거나 아직 계정이 승인되지 않았습니다.';
   }
-  if (raw.includes('auth/popup-closed-by-user')) {
+  if (
+    code === 'auth/unauthorized-domain' ||
+    raw.includes('auth/unauthorized-domain')
+  ) {
+    const host =
+      typeof window !== 'undefined' ? window.location.hostname : '(현재 도메인)';
+    return `현재 도메인(${host})이 Firebase Authentication의 승인된 도메인 목록에 등록되어 있지 않거나 캐시가 갱신되지 않았습니다. Firebase Console → Authentication → 설정(Settings) → 승인된 도메인에 "${host}"를 확인한 뒤 브라우저를 새로고침(Ctrl+Shift+R)하고 다시 시도해 주세요. (콘솔: https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/settings)`;
+  }
+  if (
+    code === 'auth/popup-closed-by-user' ||
+    raw.includes('auth/popup-closed-by-user')
+  ) {
     return 'Google 로그인 창이 닫혔습니다. 다시 시도해 주세요.';
   }
-  if (raw.includes('auth/popup-blocked')) {
+  if (
+    code === 'auth/popup-blocked' ||
+    raw.includes('auth/popup-blocked')
+  ) {
     return '브라우저에서 로그인 팝업이 차단되었습니다. 팝업 허용 후 다시 시도해 주세요.';
   }
   return raw;
