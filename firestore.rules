@@ -1,0 +1,503 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny everything by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Global Helpers
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string &&
+        id.size() >= 1 &&
+        id.size() <= 128 &&
+        id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isNullableId(val) {
+      return val == null || isValidId(val);
+    }
+
+    function isNullableTimestamp(val) {
+      return val == null || val is timestamp;
+    }
+
+    function isValidSchemaVersion(data) {
+      return data.schemaVersion is int && data.schemaVersion == 1;
+    }
+
+    // Trusted RBAC lookup from /access/{uid}. Zero hardcoded emails.
+    function isAdmin() {
+      return isEmailVerified() &&
+        exists(/databases/$(database)/documents/access/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/access/$(request.auth.uid)).data.role == 'admin' &&
+        get(/databases/$(database)/documents/access/$(request.auth.uid)).data.status == 'active';
+    }
+
+    // Strict owner gate: only the owner UID with status == 'active' may access /users/{uid}/**.
+    // Admins are intentionally NOT granted access to other users' private data.
+    function isActiveOwner(uid) {
+      return isEmailVerified() &&
+        request.auth.uid == uid &&
+        exists(/databases/$(database)/documents/access/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/access/$(request.auth.uid)).data.status == 'active';
+    }
+
+    // -------------------------------------------------------------------------
+    // Validation Blueprints
+    // -------------------------------------------------------------------------
+    function isValidAccess(data) {
+      return data.keys().hasAll([
+          'uid', 'email', 'displayName', 'status', 'role',
+          'requestedAt', 'reviewedAt', 'reviewedBy', 'note',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'status', 'role',
+          'requestedAt', 'reviewedAt', 'reviewedBy', 'note',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
+        data.status in ['pending', 'active', 'suspended', 'rejected'] &&
+        data.role in ['teacher', 'admin'] &&
+        data.requestedAt is timestamp &&
+        isNullableTimestamp(data.reviewedAt) &&
+        isNullableId(data.reviewedBy) &&
+        data.note is string && data.note.size() <= 300 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'displayName', 'email', 'schoolName', 'subject',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'displayName', 'email', 'schoolName', 'subject',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+        data.schoolName is string && data.schoolName.size() <= 80 &&
+        data.subject is string && data.subject.size() <= 60 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidUserPreferences(data) {
+      return data.keys().hasAll([
+          'timezone', 'imminentDays', 'defaultCalendarView',
+          'browserNotifyEnabled', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'timezone', 'imminentDays', 'defaultCalendarView',
+          'browserNotifyEnabled', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.timezone == 'Asia/Seoul' &&
+        data.imminentDays is int && data.imminentDays >= 1 && data.imminentDays <= 14 &&
+        data.defaultCalendarView in ['week', 'month'] &&
+        data.browserNotifyEnabled is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidTask(data) {
+      return data.keys().hasAll([
+          'title', 'description', 'status', 'priority',
+          'dueAt', 'scheduledAt', 'remindAt', 'completedAt',
+          'sourceType', 'relatedEventId', 'isDeleted', 'deletedAt',
+          'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'title', 'description', 'status', 'priority',
+          'dueAt', 'scheduledAt', 'remindAt', 'completedAt',
+          'sourceType', 'relatedEventId', 'isDeleted', 'deletedAt',
+          'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.description is string && data.description.size() <= 2000 &&
+        data.status in ['todo', 'doing', 'done', 'on_hold'] &&
+        data.priority in ['low', 'normal', 'high', 'urgent'] &&
+        isNullableTimestamp(data.dueAt) &&
+        isNullableTimestamp(data.scheduledAt) &&
+        isNullableTimestamp(data.remindAt) &&
+        isNullableTimestamp(data.completedAt) &&
+        ((data.status == 'done' && data.completedAt is timestamp) ||
+         (data.status != 'done' && data.completedAt == null)) &&
+        data.sourceType in ['manual', 'note', 'import_text', 'import_ocr', 'import_ai'] &&
+        isNullableId(data.relatedEventId) &&
+        data.isDeleted is bool &&
+        isNullableTimestamp(data.deletedAt) &&
+        ((data.isDeleted == true && data.deletedAt is timestamp) ||
+         (data.isDeleted == false && data.deletedAt == null)) &&
+        data.version is int && data.version >= 1 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidEvent(data) {
+      return data.keys().hasAll([
+          'title', 'startsAt', 'endsAt', 'allDay', 'location',
+          'description', 'relatedTaskId', 'version',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'title', 'startsAt', 'endsAt', 'allDay', 'location',
+          'description', 'relatedTaskId', 'version',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.startsAt is timestamp &&
+        data.endsAt is timestamp &&
+        data.endsAt >= data.startsAt &&
+        data.allDay is bool &&
+        data.location is string && data.location.size() <= 120 &&
+        data.description is string && data.description.size() <= 2000 &&
+        isNullableId(data.relatedTaskId) &&
+        data.version is int && data.version >= 1 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidNote(data) {
+      return data.keys().hasAll([
+          'content', 'color', 'isPinned', 'sortOrder',
+          'convertedTaskId', 'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'content', 'color', 'isPinned', 'sortOrder',
+          'convertedTaskId', 'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.content is string && data.content.size() <= 2000 &&
+        data.color in ['butter', 'mint', 'sky', 'peach', 'lavender'] &&
+        data.isPinned is bool &&
+        data.sortOrder is int && data.sortOrder >= 0 && data.sortOrder <= 100000 &&
+        isNullableId(data.convertedTaskId) &&
+        data.version is int && data.version >= 1 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidImport(data) {
+      return data.keys().hasAll([
+          'sourceType', 'status', 'extractedCount',
+          'createdTaskIds', 'createdEventIds',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'sourceType', 'status', 'extractedCount',
+          'createdTaskIds', 'createdEventIds',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.sourceType in ['text', 'ocr', 'ai'] &&
+        data.status in ['reviewed', 'imported', 'discarded'] &&
+        data.extractedCount is int && data.extractedCount >= 0 && data.extractedCount <= 50 &&
+        data.createdTaskIds is list && data.createdTaskIds.size() <= 20 &&
+        (data.createdTaskIds.size() == 0 || isValidId(data.createdTaskIds[0])) &&
+        data.createdEventIds is list && data.createdEventIds.size() <= 20 &&
+        (data.createdEventIds.size() == 0 || isValidId(data.createdEventIds[0])) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidSystemConfig(data) {
+      return data.keys().hasAll([
+          'appName', 'minSchemaVersion', 'registrationOpen',
+          'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'appName', 'minSchemaVersion', 'registrationOpen',
+          'updatedAt', 'schemaVersion'
+        ]) &&
+        data.appName is string && data.appName.size() >= 1 && data.appName.size() <= 80 &&
+        data.minSchemaVersion is int && data.minSchemaVersion >= 1 &&
+        data.registrationOpen is bool &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    // -------------------------------------------------------------------------
+    // /access/{uid}: Approval Queue & RBAC Source of Truth
+    // -------------------------------------------------------------------------
+    match /access/{uid} {
+      allow get: if isEmailVerified() &&
+        isValidId(uid) &&
+        (request.auth.uid == uid || isAdmin());
+
+      allow list: if isAdmin();
+
+      // New users can ONLY create their own pending teacher application once.
+      allow create: if isEmailVerified() &&
+        isValidId(uid) &&
+        request.auth.uid == uid &&
+        isValidAccess(incoming()) &&
+        incoming().uid == request.auth.uid &&
+        request.auth.token.email is string &&
+        incoming().email == request.auth.token.email &&
+        incoming().status == 'pending' &&
+        incoming().role == 'teacher' &&
+        incoming().reviewedAt == null &&
+        incoming().reviewedBy == null &&
+        incoming().note == '' &&
+        incoming().requestedAt == request.time &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      // Only active admins can approve, reject, suspend, or change roles.
+      allow update: if isAdmin() &&
+        isValidId(uid) &&
+        isValidAccess(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'role', 'reviewedAt', 'reviewedBy', 'note', 'updatedAt'
+        ]) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().requestedAt == existing().requestedAt &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().reviewedBy == request.auth.uid &&
+        incoming().reviewedAt == request.time &&
+        incoming().updatedAt == request.time &&
+        !(uid == request.auth.uid && (incoming().role != 'admin' || incoming().status != 'active'));
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // /users/{uid}/**: Strictly Private Personal Workspace (No Admin Access)
+    // -------------------------------------------------------------------------
+    match /users/{uid}/profile/{docId} {
+      allow get: if isActiveOwner(uid) && docId == 'main';
+      allow list: if false;
+
+      allow create: if isActiveOwner(uid) &&
+        docId == 'main' &&
+        isValidUserProfile(incoming()) &&
+        request.auth.token.email is string &&
+        incoming().email == request.auth.token.email &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        docId == 'main' &&
+        isValidUserProfile(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName', 'schoolName', 'subject', 'updatedAt'
+        ]) &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if false;
+    }
+
+    match /users/{uid}/settings/{docId} {
+      allow get: if isActiveOwner(uid) && docId == 'preferences';
+      allow list: if false;
+
+      allow create: if isActiveOwner(uid) &&
+        docId == 'preferences' &&
+        isValidUserPreferences(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        docId == 'preferences' &&
+        isValidUserPreferences(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'timezone', 'imminentDays', 'defaultCalendarView',
+          'browserNotifyEnabled', 'updatedAt'
+        ]) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if false;
+    }
+
+    match /users/{uid}/tasks/{taskId} {
+      allow get: if isActiveOwner(uid) && isValidId(taskId);
+      allow list: if isActiveOwner(uid);
+
+      allow create: if isActiveOwner(uid) &&
+        isValidId(taskId) &&
+        isValidTask(incoming()) &&
+        incoming().version == 1 &&
+        incoming().isDeleted == false &&
+        incoming().deletedAt == null &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        isValidId(taskId) &&
+        isValidTask(incoming()) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().sourceType == existing().sourceType &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().version == existing().version + 1 &&
+        incoming().updatedAt == request.time && (
+          // Action: Edit task details / dates / priority
+          (existing().isDeleted == false &&
+            incoming().isDeleted == false &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'title', 'description', 'priority', 'dueAt', 'scheduledAt',
+              'remindAt', 'relatedEventId', 'version', 'updatedAt'
+            ])) ||
+          // Action: Transition status (todo/doing/done/on_hold)
+          (existing().isDeleted == false &&
+            incoming().isDeleted == false &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'completedAt', 'version', 'updatedAt'
+            ])) ||
+          // Action: Soft-delete to trash
+          (existing().isDeleted == false &&
+            incoming().isDeleted == true &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'isDeleted', 'deletedAt', 'version', 'updatedAt'
+            ])) ||
+          // Action: Restore from trash
+          (existing().isDeleted == true &&
+            incoming().isDeleted == false &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'isDeleted', 'deletedAt', 'version', 'updatedAt'
+            ]))
+        );
+
+      // Permanent deletion only allowed after soft-deletion.
+      allow delete: if isActiveOwner(uid) &&
+        isValidId(taskId) &&
+        existing().isDeleted == true;
+    }
+
+    match /users/{uid}/events/{eventId} {
+      allow get: if isActiveOwner(uid) && isValidId(eventId);
+      allow list: if isActiveOwner(uid);
+
+      allow create: if isActiveOwner(uid) &&
+        isValidId(eventId) &&
+        isValidEvent(incoming()) &&
+        incoming().version == 1 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        isValidId(eventId) &&
+        isValidEvent(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'startsAt', 'endsAt', 'allDay', 'location',
+          'description', 'relatedTaskId', 'version', 'updatedAt'
+        ]) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().version == existing().version + 1 &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isActiveOwner(uid) && isValidId(eventId);
+    }
+
+    match /users/{uid}/notes/{noteId} {
+      allow get: if isActiveOwner(uid) && isValidId(noteId);
+      allow list: if isActiveOwner(uid);
+
+      allow create: if isActiveOwner(uid) &&
+        isValidId(noteId) &&
+        isValidNote(incoming()) &&
+        incoming().version == 1 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        isValidId(noteId) &&
+        isValidNote(incoming()) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().version == existing().version + 1 &&
+        incoming().updatedAt == request.time && (
+          // Action: Edit note content, color, pin, or sortOrder
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'content', 'color', 'isPinned', 'sortOrder', 'version', 'updatedAt'
+          ]) ||
+          // Action: Link converted task once
+          (existing().convertedTaskId == null &&
+            incoming().convertedTaskId != null &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'convertedTaskId', 'version', 'updatedAt'
+            ]))
+        );
+
+      allow delete: if isActiveOwner(uid) && isValidId(noteId);
+    }
+
+    match /users/{uid}/imports/{importId} {
+      allow get: if isActiveOwner(uid) && isValidId(importId);
+      allow list: if isActiveOwner(uid);
+
+      allow create: if isActiveOwner(uid) &&
+        isValidId(importId) &&
+        isValidImport(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        isValidId(importId) &&
+        isValidImport(incoming()) &&
+        existing().status == 'reviewed' &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'status', 'createdTaskIds', 'createdEventIds', 'updatedAt'
+        ]) &&
+        incoming().sourceType == existing().sourceType &&
+        incoming().extractedCount == existing().extractedCount &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // /system/config: App-wide Non-Sensitive Settings
+    // -------------------------------------------------------------------------
+    match /system/{docId} {
+      allow get: if isEmailVerified() && docId == 'config';
+      allow list: if false;
+
+      allow create, update: if isAdmin() &&
+        docId == 'config' &&
+        isValidSystemConfig(incoming()) &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if false;
+    }
+  }
+}

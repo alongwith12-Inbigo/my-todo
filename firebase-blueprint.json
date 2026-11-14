@@ -1,0 +1,486 @@
+{
+  "entities": {
+    "AccessRecord": {
+      "title": "AccessRecord",
+      "description": "User approval status and role metadata managed via admin workflow.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the user."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Verified Google account email."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Display name shown in admin approval queue."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "active", "suspended", "rejected"],
+          "description": "Account approval lifecycle state."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["teacher", "admin"],
+          "description": "Authorization role."
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the user submitted the signup request."
+        },
+        "reviewedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when an admin last updated status/role (nullable)."
+        },
+        "reviewedBy": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Admin UID who reviewed the request (nullable)."
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Optional admin review or suspension memo."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        },
+        "schemaVersion": {
+          "type": "integer",
+          "description": "Schema version number (1)."
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "status",
+        "role",
+        "requestedAt",
+        "reviewedAt",
+        "reviewedBy",
+        "note",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private teacher profile stored strictly under users/{uid}.",
+      "type": "object",
+      "properties": {
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "schoolName": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "subject": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schemaVersion": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "displayName",
+        "email",
+        "schoolName",
+        "subject",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "UserPreferences": {
+      "title": "UserPreferences",
+      "description": "Private user preferences stored under users/{uid}/settings/preferences.",
+      "type": "object",
+      "properties": {
+        "timezone": {
+          "type": "string",
+          "enum": ["Asia/Seoul"]
+        },
+        "imminentDays": {
+          "type": "integer"
+        },
+        "defaultCalendarView": {
+          "type": "string",
+          "enum": ["week", "month"]
+        },
+        "browserNotifyEnabled": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schemaVersion": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "timezone",
+        "imminentDays",
+        "defaultCalendarView",
+        "browserNotifyEnabled",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "Teacher personal task document stored under users/{uid}/tasks/{taskId}.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "status": {
+          "type": "string",
+          "enum": ["todo", "doing", "done", "on_hold"]
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "urgent"]
+        },
+        "dueAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "scheduledAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "remindAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sourceType": {
+          "type": "string",
+          "enum": ["manual", "note", "import_text", "import_ocr", "import_ai"]
+        },
+        "relatedEventId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "isDeleted": {
+          "type": "boolean"
+        },
+        "deletedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schemaVersion": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "title",
+        "description",
+        "status",
+        "priority",
+        "dueAt",
+        "scheduledAt",
+        "remindAt",
+        "completedAt",
+        "sourceType",
+        "relatedEventId",
+        "isDeleted",
+        "deletedAt",
+        "version",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "CalendarEvent": {
+      "title": "CalendarEvent",
+      "description": "Teacher personal schedule event stored under users/{uid}/events/{eventId}.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "startsAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "endsAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "allDay": {
+          "type": "boolean"
+        },
+        "location": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "relatedTaskId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "version": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schemaVersion": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "title",
+        "startsAt",
+        "endsAt",
+        "allDay",
+        "location",
+        "description",
+        "relatedTaskId",
+        "version",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "StickyNote": {
+      "title": "StickyNote",
+      "description": "Sticky note memo stored under users/{uid}/notes/{noteId}.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "color": {
+          "type": "string",
+          "enum": ["butter", "mint", "sky", "peach", "lavender"]
+        },
+        "isPinned": {
+          "type": "boolean"
+        },
+        "sortOrder": {
+          "type": "integer"
+        },
+        "convertedTaskId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "version": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schemaVersion": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "content",
+        "color",
+        "isPinned",
+        "sortOrder",
+        "convertedTaskId",
+        "version",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "ImportLog": {
+      "title": "ImportLog",
+      "description": "Metadata-only record for text/OCR/AI import review results.",
+      "type": "object",
+      "properties": {
+        "sourceType": {
+          "type": "string",
+          "enum": ["text", "ocr", "ai"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["reviewed", "imported", "discarded"]
+        },
+        "extractedCount": {
+          "type": "integer"
+        },
+        "createdTaskIds": {
+          "type": "array"
+        },
+        "createdEventIds": {
+          "type": "array"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schemaVersion": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sourceType",
+        "status",
+        "extractedCount",
+        "createdTaskIds",
+        "createdEventIds",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "SystemConfig": {
+      "title": "SystemConfig",
+      "description": "Global application configuration stored at system/config.",
+      "type": "object",
+      "properties": {
+        "appName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "minSchemaVersion": {
+          "type": "integer"
+        },
+        "registrationOpen": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "schemaVersion": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "appName",
+        "minSchemaVersion",
+        "registrationOpen",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    }
+  },
+  "firestore": {
+    "/access/{uid}": {
+      "schema": { "$ref": "#/entities/AccessRecord" },
+      "description": "Approval status and role metadata per user UID."
+    },
+    "/users/{uid}/profile/{docId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private teacher profile (docId must be 'main')."
+    },
+    "/users/{uid}/settings/{docId}": {
+      "schema": { "$ref": "#/entities/UserPreferences" },
+      "description": "Private teacher preferences (docId must be 'preferences')."
+    },
+    "/users/{uid}/tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/Task" },
+      "description": "Teacher personal tasks."
+    },
+    "/users/{uid}/events/{eventId}": {
+      "schema": { "$ref": "#/entities/CalendarEvent" },
+      "description": "Teacher personal calendar events."
+    },
+    "/users/{uid}/notes/{noteId}": {
+      "schema": { "$ref": "#/entities/StickyNote" },
+      "description": "Teacher sticky notes."
+    },
+    "/users/{uid}/imports/{importId}": {
+      "schema": { "$ref": "#/entities/ImportLog" },
+      "description": "Import processing references without raw document/image storage."
+    },
+    "/system/{docId}": {
+      "schema": { "$ref": "#/entities/SystemConfig" },
+      "description": "Global configuration document (docId must be 'config')."
+    }
+  }
+}
