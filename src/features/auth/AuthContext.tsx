@@ -65,6 +65,12 @@ export function formatFirebaseErrorMessage(error: unknown): string {
     return '접근 권한이 없거나 아직 계정이 승인되지 않았습니다.';
   }
   if (
+    code === 'failed-precondition' ||
+    raw.includes('requires an index')
+  ) {
+    return '이 조회에 필요한 Firestore 복합 인덱스가 아직 생성되지 않았습니다. 콘솔 오류 링크 또는 firestore.indexes.json 기준으로 인덱스를 생성해 주세요.';
+  }
+  if (
     code === 'auth/unauthorized-domain' ||
     raw.includes('auth/unauthorized-domain')
   ) {
@@ -136,8 +142,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [firebaseUser]);
 
+  const accessStatus = accessRecord?.status;
+  const accessEmail = accessRecord?.email;
+  const accessDisplayName = accessRecord?.displayName;
+
   useEffect(() => {
-    if (!firebaseUser || accessRecord?.status !== 'active') {
+    if (!firebaseUser || accessStatus !== 'active') {
       setWorkspace(null);
       setWorkspaceLoading(false);
       return;
@@ -148,9 +158,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     loadOrInitializeWorkspace({
       uid: firebaseUser.uid,
-      email: firebaseUser.email || accessRecord.email,
+      email: firebaseUser.email || accessEmail || '',
       displayName:
-        accessRecord.displayName || firebaseUser.displayName || '교사',
+        accessDisplayName || firebaseUser.displayName || '교사',
     })
       .then((entry) => {
         if (!cancelled) {
@@ -171,7 +181,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [firebaseUser, accessRecord]);
+  }, [firebaseUser, accessStatus, accessEmail, accessDisplayName]);
 
   const signInWithGoogle = useCallback(async () => {
     setAccessError(null);

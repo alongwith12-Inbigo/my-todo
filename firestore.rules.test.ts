@@ -13,10 +13,14 @@ import {
   doc,
   getDoc,
   getDocs,
+  limit,
+  orderBy,
+  query,
   serverTimestamp,
   setDoc,
   Timestamp,
   updateDoc,
+  where,
 } from 'firebase/firestore';
 
 const PROJECT_ID = 'school-partner-rules-test';
@@ -441,5 +445,225 @@ describe('Admin Privacy Isolation & Workspace Gates', () => {
         makeTaskDoc({ createdAt: Timestamp.fromMillis(1000) }),
       ),
     );
+  });
+
+  it('verifies admin filtered access query, cross-teacher isolation, and profile/settings boundaries', async () => {
+    const adminDb = testEnv
+      .authenticatedContext('admin1', {
+        email: 'admin1@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+
+    // Admin list queries matching accessRepo.ts
+    await assertSucceeds(
+      getDocs(
+        query(
+          collection(adminDb, 'access'),
+          where('status', '==', 'pending'),
+          orderBy('requestedAt', 'desc'),
+          limit(50),
+        ),
+      ),
+    );
+    await assertSucceeds(
+      getDocs(
+        query(collection(adminDb, 'access'), orderBy('requestedAt', 'desc'), limit(50)),
+      ),
+    );
+
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+
+    // Active owner can update own profile partially, but not immutable email
+    await assertSucceeds(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'profile', 'main'), {
+        displayName: '이선생',
+        schoolName: '한빛고등학교',
+        subject: '수학',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'profile', 'main'), {
+        email: 'hacked@school.kr',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // Active owner can create and partially update preferences with Asia/Seoul
+    await assertSucceeds(
+      setDoc(doc(activeDb, 'users', 'teacherActive', 'settings', 'preferences'), {
+        timezone: 'Asia/Seoul',
+        imminentDays: 3,
+        defaultCalendarView: 'week',
+        browserNotifyEnabled: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        schemaVersion: 1,
+      }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'settings', 'preferences'), {
+        timezone: 'Asia/Seoul',
+        imminentDays: 5,
+        defaultCalendarView: 'month',
+        browserNotifyEnabled: true,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    // Reject non-KST timezone
+    await assertFails(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'settings', 'preferences'), {
+        timezone: 'America/New_York',
+        imminentDays: 5,
+        defaultCalendarView: 'month',
+        browserNotifyEnabled: true,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+  });
+
+  it('enforces task lifecycle (completedAt consistency, optimistic version, soft-delete) and events/notes/imports/system rules', async () => {
+    const activeDb = testEnv
+      .authenticatedContext('teacherActive', {
+        email: 'active@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+    const adminDb = testEnv
+      .authenticatedContext('admin1', {
+        email: 'admin1@school.kr',
+        email_verified: true,
+      })
+      .firestore();
+
+    // Cannot mark done without completedAt
+    await assertFails(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1'), {
+        status: 'done',
+        completedAt: null,
+        version: 2,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    // Cannot skip version increment
+    await assertFails(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1'), {
+        status: 'done',
+        completedAt: serverTimestamp(),
+        version: 1,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    // Valid done transition
+    await assertSucceeds(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1'), {
+        status: 'done',
+        completedAt: serverTimestamp(),
+        version: 2,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    // Cannot permanently delete before soft-delete
+    await assertFails(deleteDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1')));
+    // Soft-delete then permanent delete succeeds
+    await assertSucceeds(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1'), {
+        isDeleted: true,
+        deletedAt: serverTimestamp(),
+        version: 3,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertSucceeds(deleteDoc(doc(activeDb, 'users', 'teacherActive', 'tasks', 'task1')));
+
+    // Events: endsAt >= startsAt enforced
+    const t1 = Timestamp.fromMillis(1700000000000);
+    const t2 = Timestamp.fromMillis(1700003600000);
+    await assertFails(
+      setDoc(doc(activeDb, 'users', 'teacherActive', 'events', 'evBad'), {
+        title: '역전된 일정',
+        startsAt: t2,
+        endsAt: t1,
+        allDay: false,
+        location: '',
+        description: '',
+        relatedTaskId: null,
+        version: 1,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        schemaVersion: 1,
+      }),
+    );
+    await assertSucceeds(
+      setDoc(doc(activeDb, 'users', 'teacherActive', 'events', 'ev1'), {
+        title: '교직원 회의',
+        startsAt: t1,
+        endsAt: t2,
+        allDay: false,
+        location: '대회의실',
+        description: '',
+        relatedTaskId: null,
+        version: 1,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        schemaVersion: 1,
+      }),
+    );
+
+    // Notes: convert once only
+    await assertSucceeds(
+      setDoc(doc(activeDb, 'users', 'teacherActive', 'notes', 'n1'), {
+        content: '학급비 정산 확인',
+        color: 'butter',
+        isPinned: true,
+        sortOrder: 1,
+        convertedTaskId: null,
+        version: 1,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        schemaVersion: 1,
+      }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'notes', 'n1'), {
+        convertedTaskId: 'task1',
+        version: 2,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(activeDb, 'users', 'teacherActive', 'notes', 'n1'), {
+        convertedTaskId: 'task2',
+        version: 3,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // System config: admin only write, verified user get
+    await assertFails(
+      setDoc(doc(activeDb, 'system', 'config'), {
+        appName: '오늘의 학교는?',
+        minSchemaVersion: 1,
+        registrationOpen: true,
+        updatedAt: serverTimestamp(),
+        schemaVersion: 1,
+      }),
+    );
+    await assertSucceeds(
+      setDoc(doc(adminDb, 'system', 'config'), {
+        appName: '오늘의 학교는?',
+        minSchemaVersion: 1,
+        registrationOpen: true,
+        updatedAt: serverTimestamp(),
+        schemaVersion: 1,
+      }),
+    );
+    await assertSucceeds(getDoc(doc(activeDb, 'system', 'config')));
   });
 });

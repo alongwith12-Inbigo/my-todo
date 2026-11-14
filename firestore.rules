@@ -492,9 +492,18 @@ service cloud.firestore {
       allow get: if isEmailVerified() && docId == 'config';
       allow list: if false;
 
-      allow create, update: if isAdmin() &&
+      allow create: if isAdmin() &&
         docId == 'config' &&
         isValidSystemConfig(incoming()) &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isAdmin() &&
+        docId == 'config' &&
+        isValidSystemConfig(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'appName', 'minSchemaVersion', 'registrationOpen', 'updatedAt'
+        ]) &&
+        incoming().schemaVersion == existing().schemaVersion &&
         incoming().updatedAt == request.time;
 
       allow delete: if false;

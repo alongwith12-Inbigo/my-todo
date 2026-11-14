@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import {
   updateUserPreferences,
   updateUserProfile,
@@ -36,6 +36,16 @@ export function SettingsView() {
     type: 'success' | 'error';
     message: string;
   } | null>(null);
+
+  useEffect(() => {
+    if (!workspace) return;
+    setDisplayName(workspace.profile.displayName);
+    setSchoolName(workspace.profile.schoolName);
+    setSubject(workspace.profile.subject);
+    setImminentDays(workspace.preferences.imminentDays);
+    setDefaultCalendarView(workspace.preferences.defaultCalendarView);
+    setBrowserNotifyEnabled(workspace.preferences.browserNotifyEnabled);
+  }, [workspace]);
 
   if (!firebaseUser || !accessRecord || !workspace) {
     return null;
