@@ -5,11 +5,19 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  GraduationCap,
   Link2,
   MapPin,
   Plus,
   RefreshCw,
 } from 'lucide-react';
+import {
+  ACADEMIC_CATEGORY_META,
+  formatAcademicTimeRange,
+  getAcademicEventsForDateKey,
+  getKoreanSchoolYearForDateKey,
+  TIMETABLE_IMPACT_SHORT_LABELS,
+} from '../../lib/academicCalendar';
 import { timestampToDate } from '../../lib/briefing';
 import {
   classifyTodayEvents,
@@ -36,7 +44,13 @@ import {
   resolveTimetableForDate,
   SLOT_KIND_LABELS,
 } from '../../lib/timetable';
-import type { CalendarEventRecord } from '../../types/domain';
+import type {
+  AcademicEventRecord,
+  CalendarEventRecord,
+} from '../../types/domain';
+import { AcademicCalendarView } from '../academic/AcademicCalendarView';
+import { AcademicEventModal } from '../academic/AcademicEventModal';
+import { useAcademicEventData } from '../academic/AcademicEventDataContext';
 import { useAuth } from '../auth/AuthContext';
 import { useTimetableData } from '../timetable/TimetableDataContext';
 import { TimetableManagementView } from '../timetable/TimetableManagementView';
@@ -45,7 +59,7 @@ import { useEventData } from './EventDataContext';
 import { EventModal } from './EventModal';
 
 type CalendarTabMode = 'month' | 'week' | 'day';
-type CalendarSection = 'calendar' | 'timetable';
+type CalendarSection = 'calendar' | 'timetable' | 'academic';
 
 const WEEKDAY_LABELS = ['일', '월', '화', '수', '목', '금', '토'] as const;
 
@@ -83,12 +97,20 @@ export function CalendarView({
     timetablesLoading,
     refreshTimetables,
   } = useTimetableData();
+  const {
+    academicEvents,
+    academicLoading,
+    ensureSchoolYearLoaded,
+    refreshSchoolYear,
+    markOverrideApplied,
+  } = useAcademicEventData();
 
   const defaultMode: CalendarTabMode =
     workspace?.preferences.defaultCalendarView === 'month' ? 'month' : 'week';
 
   const [section, setSection] = useState<CalendarSection>(initialSection);
   const [viewMode, setViewMode] = useState<CalendarTabMode>(defaultMode);
+  const [showAcademicOverlay, setShowAcademicOverlay] = useState(true);
   const [selectedDateKey, setSelectedDateKey] = useState<string>(todayKey);
   const [activeMonth, setActiveMonth] = useState<{ year: number; month: number }>(
     () => {
@@ -100,7 +122,15 @@ export function CalendarView({
   const [modalOpen, setModalOpen] = useState(false);
   const [editingEvent, setEditingEvent] = useState<CalendarEventRecord | null>(null);
   const [draftDateKey, setDraftDateKey] = useState<string>(todayKey);
+  const [academicModalOpen, setAcademicModalOpen] = useState(false);
+  const [editingAcademicEvent, setEditingAcademicEvent] =
+    useState<AcademicEventRecord | null>(null);
   const [overrideModalOpen, setOverrideModalOpen] = useState(false);
+  const [overrideTarget, setOverrideTarget] = useState<{
+    dateKey: string;
+    reason?: string;
+    academicEventId?: string;
+  } | null>(null);
 
   useEffect(() => {
     setSection(initialSection);
@@ -153,14 +183,25 @@ export function CalendarView({
     if (viewMode === 'month') {
       const range = getCalendarRangeForMonth(activeMonth.year, activeMonth.month);
       void ensureRangeLoaded(range.startMs, range.endMs);
+      const monthFirstKey = `${String(activeMonth.year).padStart(4, '0')}-${String(activeMonth.month).padStart(2, '0')}-01`;
+      void ensureSchoolYearLoaded(getKoreanSchoolYearForDateKey(monthFirstKey));
     } else if (viewMode === 'week') {
       const range = getCalendarRangeForWeek(selectedDateKey);
       void ensureRangeLoaded(range.startMs, range.endMs);
+      void ensureSchoolYearLoaded(getKoreanSchoolYearForDateKey(selectedDateKey));
     } else {
       const range = getKstDayRangeMs(selectedDateKey);
       void ensureRangeLoaded(range.startMs, range.endMs);
+      void ensureSchoolYearLoaded(getKoreanSchoolYearForDateKey(selectedDateKey));
     }
-  }, [viewMode, activeMonth.year, activeMonth.month, selectedDateKey, ensureRangeLoaded]);
+  }, [
+    viewMode,
+    activeMonth.year,
+    activeMonth.month,
+    selectedDateKey,
+    ensureRangeLoaded,
+    ensureSchoolYearLoaded,
+  ]);
 
   const monthGridCells = useMemo(
     () => getKstMonthGridDays(activeMonth.year, activeMonth.month),
@@ -175,6 +216,14 @@ export function CalendarView({
   const selectedDayEvents = useMemo(
     () => getEventsForDateKey(events, selectedDateKey),
     [events, selectedDateKey],
+  );
+
+  const selectedDayAcademicEvents = useMemo(
+    () =>
+      showAcademicOverlay
+        ? getAcademicEventsForDateKey(academicEvents, selectedDateKey)
+        : [],
+    [academicEvents, selectedDateKey, showAcademicOverlay],
   );
 
   const todaySummary = useMemo(
@@ -210,6 +259,20 @@ export function CalendarView({
   function openEditEvent(event: CalendarEventRecord) {
     setEditingEvent(event);
     setModalOpen(true);
+  }
+
+  function openEditAcademicEvent(acadEvent: AcademicEventRecord) {
+    setEditingAcademicEvent(acadEvent);
+    setAcademicModalOpen(true);
+  }
+
+  function openTimetableOverrideFor(params: {
+    dateKey: string;
+    reason?: string;
+    academicEventId?: string;
+  }) {
+    setOverrideTarget(params);
+    setOverrideModalOpen(true);
   }
 
   function handleNavigate(delta: -1 | 1) {
@@ -280,7 +343,7 @@ export function CalendarView({
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           <div
             role="tablist"
-            aria-label="일정과 주간 시간표 전환"
+            aria-label="일정, 주간 시간표 및 학교 학사일정 전환"
             className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg"
           >
             <button
@@ -309,20 +372,36 @@ export function CalendarView({
             >
               주간 시간표
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={section === 'academic'}
+              onClick={() => switchSection('academic')}
+              className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                section === 'academic'
+                  ? 'bg-white text-indigo-800 shadow-sm'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              학교 학사일정
+            </button>
           </div>
 
           <button
             type="button"
-            disabled={eventsLoading || timetablesLoading}
+            disabled={eventsLoading || timetablesLoading || academicLoading}
             onClick={() => {
               void refreshEvents();
               void refreshTimetables();
+              void refreshSchoolYear(getKoreanSchoolYearForDateKey(selectedDateKey));
             }}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <RefreshCw
               className={`w-3.5 h-3.5 ${
-                eventsLoading || timetablesLoading ? 'animate-spin' : ''
+                eventsLoading || timetablesLoading || academicLoading
+                  ? 'animate-spin'
+                  : ''
               }`}
               aria-hidden="true"
             />
@@ -344,6 +423,11 @@ export function CalendarView({
 
       {section === 'timetable' ? (
         <TimetableManagementView todayKey={todayKey} />
+      ) : section === 'academic' ? (
+        <AcademicCalendarView
+          todayKey={todayKey}
+          onRequestTimetableOverride={openTimetableOverrideFor}
+        />
       ) : (
         <>
 
@@ -397,36 +481,49 @@ export function CalendarView({
           </button>
         </div>
 
-        <div
-          role="tablist"
-          aria-label="달력 보기 형식"
-          className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg"
-        >
-          {(
-            [
-              ['month', '월간'],
-              ['week', '주간'],
-              ['day', '일간'],
-            ] as [CalendarTabMode, string][]
-          ).map(([mode, label]) => {
-            const active = viewMode === mode;
-            return (
-              <button
-                key={mode}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                onClick={() => setViewMode(mode)}
-                className={`px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  active
-                    ? 'bg-white text-teal-800 shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                {label}
-              </button>
-            );
-          })}
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-700 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showAcademicOverlay}
+              onChange={(e) => setShowAcademicOverlay(e.target.checked)}
+              className="rounded border-slate-300 text-indigo-700"
+            />
+            <GraduationCap className="w-3.5 h-3.5 text-indigo-700" aria-hidden="true" />
+            <span>학교 학사일정 함께 보기</span>
+          </label>
+
+          <div
+            role="tablist"
+            aria-label="달력 보기 형식"
+            className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg"
+          >
+            {(
+              [
+                ['month', '월간'],
+                ['week', '주간'],
+                ['day', '일간'],
+              ] as [CalendarTabMode, string][]
+            ).map(([mode, label]) => {
+              const active = viewMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setViewMode(mode)}
+                  className={`px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    active
+                      ? 'bg-white text-teal-800 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
@@ -458,9 +555,13 @@ export function CalendarView({
               <div className="grid grid-cols-7 divide-x divide-y divide-slate-100">
                 {monthGridCells.map((cell, idx) => {
                   const cellEvents = getEventsForDateKey(events, cell.dateKey);
+                  const cellAcademicEvents = showAcademicOverlay
+                    ? getAcademicEventsForDateKey(academicEvents, cell.dateKey)
+                    : [];
                   const isToday = cell.dateKey === todayKey;
                   const isSelected = cell.dateKey === selectedDateKey;
                   const colIdx = idx % 7;
+                  const totalCellItems = cellAcademicEvents.length + cellEvents.length;
 
                   return (
                     <div
@@ -512,45 +613,71 @@ export function CalendarView({
                       </div>
 
                       <div className="space-y-1 flex-1 min-w-0">
-                        {cellEvents.slice(0, 3).map((ev) => {
-                          const startDate = timestampToDate(ev.startsAt);
+                        {cellAcademicEvents.slice(0, 2).map((aev) => {
+                          const meta = ACADEMIC_CATEGORY_META[aev.category];
                           return (
                             <button
-                              key={ev.id}
+                              key={`acad-${aev.id}`}
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation();
                                 setSelectedDateKey(cell.dateKey);
-                                openEditEvent(ev);
+                                openEditAcademicEvent(aev);
                               }}
-                              className={`w-full text-left px-1.5 py-0.5 rounded text-[11px] leading-tight truncate cursor-pointer ${
-                                ev.allDay
-                                  ? 'bg-teal-700 text-white font-medium'
-                                  : 'bg-teal-50 text-teal-900 border border-teal-200/80 hover:bg-teal-100'
-                              }`}
+                              className={`w-full text-left px-1.5 py-0.5 rounded border text-[10px] leading-tight truncate flex items-center gap-1 cursor-pointer ${meta.cellClass}`}
                             >
-                              {!ev.allDay && startDate && (
-                                <span className="font-mono text-[10px] mr-1 opacity-80">
-                                  {getKstDateParts(startDate).dateKey === cell.dateKey
-                                    ? `${String(
-                                        (new Date(
-                                          startDate.getTime() + 9 * 60 * 60 * 1000,
-                                        )).getUTCHours(),
-                                      ).padStart(2, '0')}:${String(
-                                        (new Date(
-                                          startDate.getTime() + 9 * 60 * 60 * 1000,
-                                        )).getUTCMinutes(),
-                                      ).padStart(2, '0')}`
-                                    : '계속'}
-                                </span>
-                              )}
-                              <span>{ev.title}</span>
+                              <GraduationCap
+                                className="w-2.5 h-2.5 shrink-0"
+                                aria-hidden="true"
+                              />
+                              <span className="truncate font-semibold">
+                                {aev.title}
+                              </span>
                             </button>
                           );
                         })}
-                        {cellEvents.length > 3 && (
+
+                        {cellEvents
+                          .slice(0, Math.max(1, 3 - Math.min(2, cellAcademicEvents.length)))
+                          .map((ev) => {
+                            const startDate = timestampToDate(ev.startsAt);
+                            return (
+                              <button
+                                key={ev.id}
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedDateKey(cell.dateKey);
+                                  openEditEvent(ev);
+                                }}
+                                className={`w-full text-left px-1.5 py-0.5 rounded text-[11px] leading-tight truncate cursor-pointer ${
+                                  ev.allDay
+                                    ? 'bg-teal-700 text-white font-medium'
+                                    : 'bg-teal-50 text-teal-900 border border-teal-200/80 hover:bg-teal-100'
+                                }`}
+                              >
+                                {!ev.allDay && startDate && (
+                                  <span className="font-mono text-[10px] mr-1 opacity-80">
+                                    {getKstDateParts(startDate).dateKey === cell.dateKey
+                                      ? `${String(
+                                          new Date(
+                                            startDate.getTime() + 9 * 60 * 60 * 1000,
+                                          ).getUTCHours(),
+                                        ).padStart(2, '0')}:${String(
+                                          new Date(
+                                            startDate.getTime() + 9 * 60 * 60 * 1000,
+                                          ).getUTCMinutes(),
+                                        ).padStart(2, '0')}`
+                                      : '계속'}
+                                  </span>
+                                )}
+                                <span>{ev.title}</span>
+                              </button>
+                            );
+                          })}
+                        {totalCellItems > 3 && (
                           <p className="text-[10px] font-medium text-slate-500 px-1 tabular-nums">
-                            +{cellEvents.length - 3}건 더
+                            +{totalCellItems - 3}건 더
                           </p>
                         )}
                       </div>
@@ -565,6 +692,9 @@ export function CalendarView({
             <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200">
               {weekDays.map((dayKey, idx) => {
                 const dayEvents = getEventsForDateKey(events, dayKey);
+                const dayAcademicEvents = showAcademicOverlay
+                  ? getAcademicEventsForDateKey(academicEvents, dayKey)
+                  : [];
                 const isToday = dayKey === todayKey;
                 const isSelected = dayKey === selectedDateKey;
                 const dayDate = new Date(getKstDayRangeMs(dayKey).startMs);
@@ -613,7 +743,16 @@ export function CalendarView({
                     </div>
 
                     <div className="flex-1 min-w-0 space-y-2">
-                      {dayEvents.length === 0 ? (
+                      {dayAcademicEvents.map((aev) => (
+                        <AcademicEventCardRow
+                          key={`acad-${aev.id}`}
+                          event={aev}
+                          hasTimetableOverride={Boolean(overridesByDate[dayKey])}
+                          onSelect={() => openEditAcademicEvent(aev)}
+                        />
+                      ))}
+
+                      {dayEvents.length === 0 && dayAcademicEvents.length === 0 ? (
                         <p className="text-xs text-slate-400 py-1">
                           등록된 일정이 없습니다.
                         </p>
@@ -641,7 +780,8 @@ export function CalendarView({
                     {formatKstDateKeyLabel(selectedDateKey)}
                   </h3>
                   <p className="text-xs text-slate-500 mt-0.5 tabular-nums">
-                    일정 {selectedDayEvents.length}건
+                    개인 일정 {selectedDayEvents.length}건 · 학교 학사일정{' '}
+                    {selectedDayAcademicEvents.length}건
                   </p>
                 </div>
                 <button
@@ -654,19 +794,38 @@ export function CalendarView({
                 </button>
               </div>
 
-              {selectedDayEvents.length === 0 ? (
-                <div className="py-10 text-center space-y-2">
-                  <CalendarIcon
-                    className="w-7 h-7 text-slate-300 mx-auto"
-                    aria-hidden="true"
-                  />
-                  <p className="text-sm font-semibold text-slate-800">
-                    선택한 날짜에 일정이 없습니다
+              {selectedDayAcademicEvents.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                    <GraduationCap className="w-3.5 h-3.5 text-indigo-700" />
+                    <span>학교 학사일정</span>
                   </p>
-                  <p className="text-xs text-slate-500">
-                    회의, 연수, 상담 등 시간 지정 일정이나 종일 일정을 등록해 보세요.
-                  </p>
+                  {selectedDayAcademicEvents.map((aev) => (
+                    <AcademicEventCardRow
+                      key={`acad-day-${aev.id}`}
+                      event={aev}
+                      hasTimetableOverride={Boolean(overridesByDate[selectedDateKey])}
+                      onSelect={() => openEditAcademicEvent(aev)}
+                    />
+                  ))}
                 </div>
+              )}
+
+              {selectedDayEvents.length === 0 ? (
+                selectedDayAcademicEvents.length === 0 && (
+                  <div className="py-10 text-center space-y-2">
+                    <CalendarIcon
+                      className="w-7 h-7 text-slate-300 mx-auto"
+                      aria-hidden="true"
+                    />
+                    <p className="text-sm font-semibold text-slate-800">
+                      선택한 날짜에 일정이 없습니다
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      회의, 연수, 상담 등 시간 지정 일정이나 종일 일정을 등록해 보세요.
+                    </p>
+                  </div>
+                )
               ) : (
                 <div className="space-y-2.5">
                   {selectedDayEvents.map((ev) => (
@@ -685,6 +844,62 @@ export function CalendarView({
 
         {/* Right Column: Selected Date Agenda + Upcoming Events */}
         <aside className="lg:col-span-4 space-y-5">
+          {/* Selected Date School Academic Events */}
+          {selectedDayAcademicEvents.length > 0 && (
+            <section
+              aria-label="선택한 날짜 학교 학사일정"
+              className="bg-white border border-indigo-200 rounded-xl p-4 space-y-2.5"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5">
+                  <GraduationCap className="w-4 h-4 text-indigo-700" aria-hidden="true" />
+                  <h2 className="text-sm font-bold text-indigo-950">
+                    학교 학사일정
+                  </h2>
+                  <span className="text-xs font-semibold text-indigo-700 tabular-nums">
+                    {selectedDayAcademicEvents.length}건
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => switchSection('academic')}
+                  className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 cursor-pointer"
+                >
+                  학사일정 관리 →
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                {selectedDayAcademicEvents.map((aev) => (
+                  <div key={`aside-acad-${aev.id}`} className="space-y-1.5">
+                    <AcademicEventCardRow
+                      event={aev}
+                      compact
+                      hasTimetableOverride={Boolean(overridesByDate[selectedDateKey])}
+                      onSelect={() => openEditAcademicEvent(aev)}
+                    />
+                    {aev.timetableImpact === 'needs_check' &&
+                      !overridesByDate[selectedDateKey] && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            openTimetableOverrideFor({
+                              academicEventId: aev.id,
+                              dateKey: selectedDateKey,
+                              reason: aev.title,
+                            })
+                          }
+                          className="w-full py-1.5 text-[11px] font-semibold text-amber-900 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 cursor-pointer"
+                        >
+                          이 날짜 수업 시간표 임시 변경 설정하기 →
+                        </button>
+                      )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
           {/* Selected Date Agenda */}
           <section
             aria-label="선택한 날짜 일정"
@@ -694,8 +909,8 @@ export function CalendarView({
               <div>
                 <h2 className="text-sm font-bold text-slate-900">
                   {selectedDateKey === todayKey
-                    ? '오늘의 일정'
-                    : `${formatKstShortDate(new Date(getKstDayRangeMs(selectedDateKey).startMs), now)} 일정`}
+                    ? '오늘의 개인 일정'
+                    : `${formatKstShortDate(new Date(getKstDayRangeMs(selectedDateKey).startMs), now)} 개인 일정`}
                 </h2>
                 <p className="text-xs text-slate-500 tabular-nums mt-0.5">
                   {selectedDayEvents.length}건
@@ -713,7 +928,7 @@ export function CalendarView({
 
             {selectedDayEvents.length === 0 ? (
               <p className="text-xs text-slate-500 py-2">
-                이 날짜에 예정된 일정이 없습니다.
+                이 날짜에 예정된 개인 일정이 없습니다.
               </p>
             ) : (
               <div className="space-y-2">
@@ -953,14 +1168,133 @@ export function CalendarView({
 
       <TimetableOverrideModal
         isOpen={overrideModalOpen}
-        initialDateKey={selectedDateKey}
+        initialDateKey={overrideTarget?.dateKey ?? selectedDateKey}
+        initialReason={overrideTarget?.reason}
         timetables={timetables}
-        existingOverride={overridesByDate[selectedDateKey] ?? null}
-        onClose={() => setOverrideModalOpen(false)}
+        existingOverride={
+          overridesByDate[overrideTarget?.dateKey ?? selectedDateKey] ?? null
+        }
+        onClose={() => {
+          setOverrideModalOpen(false);
+          setOverrideTarget(null);
+        }}
+        onSaved={async (savedDateKey) => {
+          if (overrideTarget?.academicEventId) {
+            await markOverrideApplied(
+              overrideTarget.academicEventId,
+              savedDateKey,
+            );
+          }
+        }}
+      />
+
+      <AcademicEventModal
+        isOpen={academicModalOpen}
+        event={editingAcademicEvent}
+        initialDateKey={selectedDateKey}
+        onClose={() => {
+          setAcademicModalOpen(false);
+          setEditingAcademicEvent(null);
+        }}
+        onOpenTimetableOverride={(params) => {
+          setAcademicModalOpen(false);
+          setEditingAcademicEvent(null);
+          openTimetableOverrideFor(params);
+        }}
       />
         </>
       )}
+
+      {/* Allow opening TimetableOverrideModal directly from Academic tab as well */}
+      {section === 'academic' && (
+        <TimetableOverrideModal
+          isOpen={overrideModalOpen}
+          initialDateKey={overrideTarget?.dateKey ?? todayKey}
+          initialReason={overrideTarget?.reason}
+          timetables={timetables}
+          existingOverride={
+            overridesByDate[overrideTarget?.dateKey ?? todayKey] ?? null
+          }
+          onClose={() => {
+            setOverrideModalOpen(false);
+            setOverrideTarget(null);
+          }}
+          onSaved={async (savedDateKey) => {
+            if (overrideTarget?.academicEventId) {
+              await markOverrideApplied(
+                overrideTarget.academicEventId,
+                savedDateKey,
+              );
+            }
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function AcademicEventCardRow({
+  event,
+  onSelect,
+  hasTimetableOverride = false,
+  compact = false,
+}: {
+  event: AcademicEventRecord;
+  onSelect: () => void;
+  hasTimetableOverride?: boolean;
+  compact?: boolean;
+}) {
+  const meta = ACADEMIC_CATEGORY_META[event.category];
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`w-full text-left rounded-lg border transition-colors cursor-pointer ${
+        compact ? 'p-2.5' : 'p-3'
+      } border-indigo-200 bg-indigo-50/35 hover:bg-indigo-50/75`}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <GraduationCap className="w-3.5 h-3.5 text-indigo-700 shrink-0" />
+          <span className="text-xs font-bold text-slate-900 truncate">
+            {event.title}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span
+            className={`px-1.5 py-0.5 text-[10px] font-semibold rounded border ${meta.badgeClass}`}
+          >
+            {meta.label}
+          </span>
+          <span className="text-[11px] font-medium text-indigo-900 tabular-nums">
+            {formatAcademicTimeRange(event.startTime, event.endTime)}
+          </span>
+        </div>
+      </div>
+
+      {(event.location ||
+        hasTimetableOverride ||
+        event.timetableImpact !== 'none') && (
+        <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[11px] text-slate-600">
+          {event.location && (
+            <span className="inline-flex items-center gap-1">
+              <MapPin className="w-3 h-3 text-slate-400" aria-hidden="true" />
+              <span>{event.location}</span>
+            </span>
+          )}
+          {hasTimetableOverride || event.timetableImpact === 'override_applied' ? (
+            <span className="font-semibold text-teal-800">
+              {TIMETABLE_IMPACT_SHORT_LABELS.override_applied}
+            </span>
+          ) : event.timetableImpact === 'needs_check' ? (
+            <span className="font-semibold text-amber-800">
+              시간표 확인 필요
+            </span>
+          ) : null}
+        </div>
+      )}
+    </button>
   );
 }
 

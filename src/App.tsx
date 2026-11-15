@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { LogOut } from 'lucide-react';
 import { useKstClock } from './hooks/useKstClock';
 import type { TaskFilterTab } from './repositories/taskRepo';
+import { AcademicEventDataProvider } from './features/academic/AcademicEventDataContext';
 import { AuthProvider, useAuth } from './features/auth/AuthContext';
 import { LoginView } from './features/auth/LoginView';
 import { PendingApprovalView } from './features/auth/PendingApprovalView';
@@ -37,9 +38,9 @@ function AuthenticatedWorkspace({
   const { refreshEvents } = useEventData();
 
   const [activeNav, setActiveNav] = useState<NavSection>('today');
-  const [calendarSection, setCalendarSection] = useState<'calendar' | 'timetable'>(
-    'calendar',
-  );
+  const [calendarSection, setCalendarSection] = useState<
+    'calendar' | 'timetable' | 'academic'
+  >('calendar');
   const [tasksInitialFilter, setTasksInitialFilter] =
     useState<TaskFilterTab>('active');
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
@@ -80,6 +81,11 @@ function AuthenticatedWorkspace({
 
   function handleOpenTimetable() {
     setCalendarSection('timetable');
+    setActiveNav('calendar');
+  }
+
+  function handleOpenAcademicCalendar() {
+    setCalendarSection('academic');
     setActiveNav('calendar');
   }
 
@@ -177,6 +183,7 @@ function AuthenticatedWorkspace({
             onOpenTasksView={handleOpenTasksView}
             onOpenCalendar={handleOpenCalendar}
             onOpenTimetable={handleOpenTimetable}
+            onOpenAcademicCalendar={handleOpenAcademicCalendar}
             focusedTaskId={focusedTaskId}
             onClearFocusedTask={() => setFocusedTaskId(null)}
           />
@@ -265,10 +272,12 @@ function WorkspaceShell() {
       <EventDataProvider>
         <NoteDataProvider>
           <TimetableDataProvider>
-            <AuthenticatedWorkspace
-              displayName={workspace.profile.displayName}
-              onSignOut={signOutUser}
-            />
+            <AcademicEventDataProvider>
+              <AuthenticatedWorkspace
+                displayName={workspace.profile.displayName}
+                onSignOut={signOutUser}
+              />
+            </AcademicEventDataProvider>
           </TimetableDataProvider>
         </NoteDataProvider>
       </EventDataProvider>

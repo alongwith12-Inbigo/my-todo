@@ -4,12 +4,17 @@ import {
   ChevronDown,
   ChevronUp,
   Clock,
+  GraduationCap,
   Link2,
   MapPin,
   Plus,
   RefreshCw,
   Sparkles,
 } from 'lucide-react';
+import {
+  ACADEMIC_CATEGORY_META,
+  getAcademicEventsForDateKey,
+} from '../../lib/academicCalendar';
 import { buildMinimalBriefingPayload } from '../../lib/aiBriefing';
 import { normalizeAiBriefingResult } from '../../lib/aiImportValidator';
 import {
@@ -36,6 +41,7 @@ import type { CalendarEventRecord, TaskRecord } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
 import { EventModal } from '../calendar/EventModal';
+import { useAcademicEventData } from '../academic/AcademicEventDataContext';
 import { useTimetableData } from '../timetable/TimetableDataContext';
 import { AiTodayBriefingCard } from './AiTodayBriefingCard';
 import { useTaskData } from './TaskDataContext';
@@ -49,6 +55,7 @@ interface TodayBriefingViewProps {
   onOpenTasksView: (initialFilter?: TaskFilterTab) => void;
   onOpenCalendar: (eventId?: string) => void;
   onOpenTimetable?: () => void;
+  onOpenAcademicCalendar?: () => void;
   focusedTaskId?: string | null;
   onClearFocusedTask?: () => void;
 }
@@ -161,6 +168,7 @@ export function TodayBriefingView({
   onOpenTasksView,
   onOpenCalendar,
   onOpenTimetable,
+  onOpenAcademicCalendar,
   focusedTaskId,
   onClearFocusedTask,
 }: TodayBriefingViewProps) {
@@ -178,6 +186,7 @@ export function TodayBriefingView({
   } = useTaskData();
   const { events, eventsLoading, refreshEvents } = useEventData();
   const { timetables, overridesByDate } = useTimetableData();
+  const { academicEvents } = useAcademicEventData();
 
   const [selectedTask, setSelectedTask] = useState<TaskRecord | null>(null);
   const [eventModalOpen, setEventModalOpen] = useState(false);
@@ -306,6 +315,11 @@ export function TodayBriefingView({
         events,
       }),
     [todaySchedule, events],
+  );
+
+  const todayAcademicEvents = useMemo(
+    () => getAcademicEventsForDateKey(academicEvents, todayKey),
+    [academicEvents, todayKey],
   );
 
   const hasAnyPriorityFocus =
@@ -729,6 +743,64 @@ export function TodayBriefingView({
                 </div>
               )}
             </section>
+
+            {/* Today's School Academic Schedule (Separate from Personal Events) */}
+            {todayAcademicEvents.length > 0 && (
+              <section
+                aria-label="오늘의 학교 학사일정"
+                className="bg-white border border-indigo-200 rounded-xl p-4 space-y-2.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <GraduationCap
+                      className="w-4 h-4 text-indigo-700"
+                      aria-hidden="true"
+                    />
+                    <h2 className="text-sm font-bold text-indigo-950">
+                      오늘의 학교 학사일정
+                    </h2>
+                  </div>
+                  {onOpenAcademicCalendar && (
+                    <button
+                      type="button"
+                      onClick={onOpenAcademicCalendar}
+                      className="text-xs font-medium text-indigo-700 hover:text-indigo-900 shrink-0 cursor-pointer"
+                    >
+                      학사일정 관리
+                    </button>
+                  )}
+                </div>
+
+                <div className="space-y-1.5">
+                  {todayAcademicEvents.map((aev) => {
+                    const meta = ACADEMIC_CATEGORY_META[aev.category];
+                    return (
+                      <div
+                        key={`today-acad-${aev.id}`}
+                        className="p-2.5 rounded-lg border border-indigo-100 bg-indigo-50/40 flex items-center justify-between gap-2"
+                      >
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-slate-900 truncate">
+                            {aev.title}
+                          </p>
+                          {aev.timetableImpact === 'needs_check' &&
+                            !overridesByDate[todayKey] && (
+                              <p className="text-[11px] text-amber-800 mt-0.5">
+                                수업 시간표 임시 변경이 필요한지 확인해 주세요.
+                              </p>
+                            )}
+                        </div>
+                        <span
+                          className={`px-1.5 py-0.5 text-[10px] font-semibold rounded border shrink-0 ${meta.badgeClass}`}
+                        >
+                          {meta.label}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
 
             {/* Today's Class Timetable & Workable Time */}
             <section

@@ -325,6 +325,46 @@ service cloud.firestore {
         isValidSchemaVersion(data);
     }
 
+    function isValidAcademicEvent(data) {
+      return data.keys().hasAll([
+          'title', 'category', 'startDate', 'endDate', 'startTime', 'endTime',
+          'location', 'schoolYear', 'sourceType', 'sourceLabel', 'sourceText',
+          'timetableImpact', 'overrideDateKey', 'dedupeKey',
+          'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'title', 'category', 'startDate', 'endDate', 'startTime', 'endTime',
+          'location', 'schoolYear', 'sourceType', 'sourceLabel', 'sourceText',
+          'timetableImpact', 'overrideDateKey', 'dedupeKey',
+          'version', 'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.category in [
+          'exam', 'school_event', 'vacation',
+          'discretionary_holiday', 'shortened_schedule', 'other'
+        ] &&
+        isValidDateKey(data.startDate) &&
+        isValidDateKey(data.endDate) &&
+        data.endDate >= data.startDate &&
+        isNullableTimeHhMm(data.startTime) &&
+        isNullableTimeHhMm(data.endTime) &&
+        ((data.startTime == null && data.endTime == null) ||
+         (data.startTime is string && data.endTime == null) ||
+         (data.startTime is string && data.endTime is string && data.endTime > data.startTime)) &&
+        data.location is string && data.location.size() <= 120 &&
+        data.schoolYear is int && data.schoolYear >= 2000 && data.schoolYear <= 2100 &&
+        data.sourceType in ['manual', 'excel', 'hwpx', 'pdf', 'ocr'] &&
+        data.sourceLabel is string && data.sourceLabel.size() <= 120 &&
+        data.sourceText is string && data.sourceText.size() <= 300 &&
+        data.timetableImpact in ['none', 'needs_check', 'override_applied'] &&
+        (data.overrideDateKey == null || isValidDateKey(data.overrideDateKey)) &&
+        data.dedupeKey is string && data.dedupeKey.size() >= 1 && data.dedupeKey.size() <= 160 &&
+        data.version is int && data.version >= 1 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
     // -------------------------------------------------------------------------
     // /access/{uid}: Approval Queue & RBAC Source of Truth
     // -------------------------------------------------------------------------
@@ -619,6 +659,36 @@ service cloud.firestore {
         incoming().updatedAt == request.time;
 
       allow delete: if isActiveOwner(uid) && isValidDateKey(dateKey);
+    }
+
+    match /users/{uid}/academicEvents/{academicEventId} {
+      allow get: if isActiveOwner(uid) && isValidId(academicEventId);
+      allow list: if isActiveOwner(uid);
+
+      allow create: if isActiveOwner(uid) &&
+        isValidId(academicEventId) &&
+        isValidAcademicEvent(incoming()) &&
+        incoming().version == 1 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isActiveOwner(uid) &&
+        isValidId(academicEventId) &&
+        isValidAcademicEvent(incoming()) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'title', 'category', 'startDate', 'endDate', 'startTime', 'endTime',
+          'location', 'schoolYear', 'timetableImpact', 'overrideDateKey',
+          'dedupeKey', 'version', 'updatedAt'
+        ]) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().sourceType == existing().sourceType &&
+        incoming().sourceLabel == existing().sourceLabel &&
+        incoming().sourceText == existing().sourceText &&
+        incoming().schemaVersion == existing().schemaVersion &&
+        incoming().version == existing().version + 1 &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isActiveOwner(uid) && isValidId(academicEventId);
     }
 
     // -------------------------------------------------------------------------

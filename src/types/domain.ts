@@ -28,6 +28,10 @@ export const VALIDATION_LIMITS = {
   TIMETABLE_ROOM_MAX_LEN: 40,
   TIMETABLE_NOTE_MAX_LEN: 160,
   TIMETABLE_REASON_MAX_LEN: 120,
+  ACADEMIC_SOURCE_LABEL_MAX_LEN: 120,
+  ACADEMIC_SOURCE_TEXT_MAX_LEN: 300,
+  ACADEMIC_DEDUPE_KEY_MAX_LEN: 160,
+  ACADEMIC_MAX_IMPORT_BATCH: 200,
 } as const;
 
 export type AccountStatus = 'pending' | 'active' | 'suspended' | 'rejected';
@@ -197,6 +201,48 @@ export interface TimetableOverrideRecord {
   lunchEnd: string | null;
   periodTimes: Record<string, TimetablePeriodTime>;
   slots: Record<string, TimetableOverrideSlot>; // key: `${period}`
+  version: number;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  schemaVersion: number;
+}
+
+export type AcademicEventCategory =
+  | 'exam'
+  | 'school_event'
+  | 'vacation'
+  | 'discretionary_holiday'
+  | 'shortened_schedule'
+  | 'other';
+
+export type AcademicEventSourceType =
+  | 'manual'
+  | 'excel'
+  | 'hwpx'
+  | 'pdf'
+  | 'ocr';
+
+export type AcademicTimetableImpact =
+  | 'none'
+  | 'needs_check'
+  | 'override_applied';
+
+export interface AcademicEventRecord {
+  id: string;
+  title: string;
+  category: AcademicEventCategory;
+  startDate: string; // YYYY-MM-DD
+  endDate: string; // YYYY-MM-DD
+  startTime: string | null; // HH:MM
+  endTime: string | null; // HH:MM
+  location: string;
+  schoolYear: number;
+  sourceType: AcademicEventSourceType;
+  sourceLabel: string;
+  sourceText: string;
+  timetableImpact: AcademicTimetableImpact;
+  overrideDateKey: string | null; // YYYY-MM-DD
+  dedupeKey: string;
   version: number;
   createdAt: Timestamp;
   updatedAt: Timestamp;

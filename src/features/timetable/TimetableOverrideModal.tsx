@@ -17,9 +17,11 @@ import { useTimetableData } from './TimetableDataContext';
 interface TimetableOverrideModalProps {
   isOpen: boolean;
   initialDateKey: string;
+  initialReason?: string;
   timetables: TimetableRecord[];
   existingOverride: TimetableOverrideRecord | null;
   onClose: () => void;
+  onSaved?: (dateKey: string) => void | Promise<void>;
 }
 
 const KIND_OPTIONS: TimetableSlotKind[] = [
@@ -32,9 +34,11 @@ const KIND_OPTIONS: TimetableSlotKind[] = [
 export function TimetableOverrideModal({
   isOpen,
   initialDateKey,
+  initialReason,
   timetables,
   existingOverride,
   onClose,
+  onSaved,
 }: TimetableOverrideModalProps) {
   const { saveDateOverride, removeDateOverride, overridesByDate } =
     useTimetableData();
@@ -64,7 +68,7 @@ export function TimetableOverrideModal({
     const ov = overridesByDate[dateKey] ?? null;
     const resolvedBase = resolveTimetableForDate(dateKey, timetables, null);
     setBaseTimetableId(resolvedBase.timetableId);
-    setReason(ov?.reason ?? '');
+    setReason(ov?.reason || initialReason || '');
 
     const nextSlots: Record<string, TimetableOverrideSlot> = {};
     const changed = new Set<number>();
@@ -109,7 +113,7 @@ export function TimetableOverrideModal({
 
     setSlots(nextSlots);
     setChangedPeriods(changed);
-  }, [isOpen, dateKey, timetables, overridesByDate]);
+  }, [isOpen, dateKey, timetables, overridesByDate, initialReason]);
 
   if (!isOpen) return null;
 
@@ -207,6 +211,7 @@ export function TimetableOverrideModal({
         },
         activeOverrideForDate?.version,
       );
+      await onSaved?.(dateKey);
       onClose();
     } catch (err) {
       setError(
