@@ -719,7 +719,24 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                           }`}
                     </dd>
                   </div>
+
+                  {testResult.requestEndpoint && (
+                    <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <dt className="text-slate-500">요청 엔드포인트</dt>
+                      <dd className="font-mono text-slate-700 break-all">
+                        {testResult.requestApiVersion ?? 'v1'} · {testResult.requestEndpoint}
+                        {testResult.modelListCached ? ' (목록 캐시)' : ''}
+                      </dd>
+                    </div>
+                  )}
                 </dl>
+
+                {!testResult.ok && testResult.upstreamErrorMessage && (
+                  <p className="text-[11px] text-red-900 bg-white/90 border border-red-200 rounded px-2.5 py-1.5 leading-relaxed break-words">
+                    <strong className="font-semibold">Google API 응답 상세:</strong>{' '}
+                    <span className="font-mono">{testResult.upstreamErrorMessage}</span>
+                  </p>
+                )}
 
                 {!testResult.ok &&
                   testResult.availableGenerateModels &&

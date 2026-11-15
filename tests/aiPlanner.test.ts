@@ -38,13 +38,18 @@ import {
   handleSaveByokKeyRequest,
   handleTestByokKeyRequest,
 } from '../server/aiRoutes.ts';
-import { mapGeminiError } from '../server/aiConfig.ts';
+import {
+  mapGeminiError,
+  sanitizeUpstreamErrorMessage,
+} from '../server/aiConfig.ts';
 import { ServerAuthError } from '../server/firebaseServerAuth.ts';
 import {
   buildThinkingConfigForModel,
+  clearGeminiModelCacheForTesting,
   createGeminiClient,
   GeminiServiceError,
   generateDayPlanWithGemini,
+  getEffectiveGeminiApiVersion,
   inspectListedGeminiModels,
   testGeminiPersonalKey,
 } from '../server/geminiService.ts';
@@ -960,6 +965,7 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, redacted 
   assert.equal(maskGeminiApiKey(dummyAqKey), REDACTED_VAULT_KEY_HINT);
 
   // 3. Connection test passes ONLY when both models.list and generateContent succeed
+  clearGeminiModelCacheForTesting();
   const okRes = await testGeminiPersonalKey(dummyAqKey, undefined, {
     models: {
       list: async () => ({
@@ -982,6 +988,7 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, redacted 
   assert.equal(okRes.warning, undefined);
 
   // 4. Invalid API key or incompatible auth header on models.list throws distinct GeminiServiceError
+  clearGeminiModelCacheForTesting();
   await assert.rejects(
     () =>
       testGeminiPersonalKey(dummyAqKey, undefined, {
@@ -995,6 +1002,7 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, redacted 
     (err: unknown) => err instanceof GeminiServiceError && err.code === 'invalid_api_key',
   );
 
+  clearGeminiModelCacheForTesting();
   await assert.rejects(
     () =>
       testGeminiPersonalKey(dummyAqKey, undefined, {
@@ -1014,6 +1022,7 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, redacted 
 
   // 5. CRITICAL: When models.list succeeds but configured model generateContent fails (404),
   //    test must report ok=false, apiKeyAuthOk=true, generateContentOk=false (never mask as pass!)
+  clearGeminiModelCacheForTesting();
   const prevModel = process.env.GEMINI_MODEL;
   let modelMismatchRes;
   try {
@@ -1131,6 +1140,7 @@ test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on 
   const prevModel = process.env.GEMINI_MODEL;
   try {
     // 3. With GEMINI_MODEL=gemini-2.5-flash, generateDayPlanWithGemini must omit thinkingConfig
+    clearGeminiModelCacheForTesting();
     process.env.GEMINI_MODEL = 'gemini-2.5-flash';
     const capturedConfigs: Array<Record<string, unknown> | undefined> = [];
     const planOk = await generateDayPlanWithGemini(
@@ -1170,6 +1180,7 @@ test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on 
     assert.equal(planOk.rawPlan.recommendations[0].taskId, 't1');
 
     // 4. When configured model returns 404 NOT_FOUND, planner looks up models.list and falls back to supported active model
+    clearGeminiModelCacheForTesting();
     process.env.GEMINI_MODEL = 'gemini-unavailable-alias';
     const attemptedModels: string[] = [];
     const planFallback = await generateDayPlanWithGemini(
@@ -1207,6 +1218,7 @@ test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on 
     assert.equal(planFallback.model, 'gemini-2.5-flash');
 
     // 5. Permission denied (403) must NOT be hidden or retried as model_not_found
+    clearGeminiModelCacheForTesting();
     process.env.GEMINI_MODEL = 'gemini-2.5-flash';
     await assert.rejects(
       () =>
@@ -1292,3 +1304,260 @@ test('verifyAuthBeforeSave avoids generateContent on save, and no route ever exp
     assert.ok(!serialized.includes(aqDummyKey));
   }
 });
+
+test('SDK wire inspection, upstream 404 redaction/classification, single-probe test, models.list caching, and max-1 fallback retry', async () => {
+  // 1. Inspect actual @google/genai SDK fetch calls for models.list and generateContent
+  const dummyAqKey = 'AQ.Ab8RN6WireInspectDummyKey_0123456789ABCD';
+  const traceRequests: Array<{ url: string; method: string; apiKeyHeader: string | null; authHeader: string | null }> = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const reqUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    traceRequests.push({
+      url: reqUrl,
+      method: (init?.method ?? 'GET').toUpperCase(),
+      apiKeyHeader: headers.get('x-goog-api-key'),
+      authHeader: headers.get('authorization'),
+    });
+    if (reqUrl.includes(':generateContent')) {
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'OK' }], role: 'model' } }],
+          usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 1, totalTokenCount: 5 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        models: [{ name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] }],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const sdkClient = createGeminiClient(dummyAqKey);
+    await sdkClient.models.list({ config: { pageSize: 100 } });
+    await sdkClient.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: 'Reply with OK.',
+      config: { maxOutputTokens: 16 },
+    });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+
+  assert.equal(traceRequests.length, 2);
+  assert.equal(traceRequests[0].method, 'GET');
+  assert.equal(
+    traceRequests[0].url,
+    'https://generativelanguage.googleapis.com/v1/models?pageSize=100',
+  );
+  assert.equal(traceRequests[1].method, 'POST');
+  assert.equal(
+    traceRequests[1].url,
+    'https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent',
+  );
+  assert.ok(!traceRequests[1].url.includes('models/models/'));
+  assert.ok(!traceRequests[1].url.includes('key='));
+  assert.equal(traceRequests[0].apiKeyHeader, dummyAqKey);
+  assert.equal(traceRequests[1].apiKeyHeader, dummyAqKey);
+  assert.equal(traceRequests[0].authHeader, null);
+  assert.equal(traceRequests[1].authHeader, null);
+
+  // 2. Sanitize & classify Google 404 messages without exposing key fragments
+  const sanitized = sanitizeUpstreamErrorMessage(
+    '404 NOT_FOUND for key=AIzaSyDummyLeak1234567890ABCDEF and AQ.Ab8SecretPart1234567890 and Bearer secret.jwt.token',
+  );
+  assert.ok(sanitized);
+  assert.ok(!sanitized.includes('AIzaSy'));
+  assert.ok(!sanitized.includes('AQ.Ab8'));
+  assert.ok(!sanitized.includes('secret.jwt.token'));
+  assert.ok(sanitized.includes('[REDACTED_KEY]'));
+
+  const newUsers404 = mapGeminiError(
+    new Error(
+      '{"error":{"code":404,"message":"This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use a newer model for the latest features and improvements.","status":"NOT_FOUND"}}',
+    ),
+    'gemini-2.5-flash',
+  );
+  assert.equal(newUsers404.code, 'model_not_found');
+  assert.equal(newUsers404.upstreamHttpStatus, 404);
+  assert.equal(newUsers404.upstreamApiStatus, 'NOT_FOUND');
+  assert.ok(newUsers404.upstreamErrorMessage?.includes('no longer available to new users'));
+  assert.ok(newUsers404.message.includes('신규 키·계정'));
+
+  const versionMismatch404 = mapGeminiError(
+    new Error(
+      '404 NOT_FOUND: models/gemini-3-flash-preview is not found for API version v1, or is not supported for generateContent.',
+    ),
+    'gemini-3-flash-preview',
+  );
+  assert.equal(versionMismatch404.code, 'model_not_found');
+  assert.ok(versionMismatch404.message.includes('API 버전(v1)'));
+
+  // 3. testGeminiPersonalKey runs strictly ONE generateContent call (no 2nd probe on 404) & caches models.list
+  clearGeminiModelCacheForTesting();
+  const prevModel = process.env.GEMINI_MODEL;
+  try {
+    process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+    let listCalls = 0;
+    let generateCalls = 0;
+    const mock404Client = {
+      models: {
+        list: async () => {
+          listCalls += 1;
+          return {
+            page: [
+              { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-2.5-pro', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-3.5-flash', supportedActions: ['generateContent'] },
+            ],
+          };
+        },
+        generateContent: async () => {
+          generateCalls += 1;
+          throw new Error(
+            '404 NOT_FOUND: This model models/gemini-2.5-flash is no longer available to new users.',
+          );
+        },
+      },
+    };
+
+    const firstDiag = await testGeminiPersonalKey(dummyAqKey, undefined, mock404Client);
+    assert.equal(firstDiag.ok, false);
+    assert.equal(firstDiag.apiKeyAuthOk, true);
+    assert.equal(firstDiag.modelAccessible, false);
+    assert.equal(firstDiag.generateContentOk, false);
+    assert.equal(firstDiag.requestApiVersion, getEffectiveGeminiApiVersion());
+    assert.equal(firstDiag.requestEndpoint, 'models/gemini-2.5-flash:generateContent');
+    assert.equal(firstDiag.modelListCached, false);
+    assert.equal(firstDiag.recommendedModel, 'gemini-3.5-flash');
+    assert.ok(firstDiag.upstreamErrorMessage?.includes('no longer available to new users'));
+    assert.equal(listCalls, 1);
+    assert.equal(generateCalls, 1); // Strictly 1 generateContent call!
+
+    // Second test reuses models.list cache (0 additional list calls, 1 generateContent probe)
+    const secondDiag = await testGeminiPersonalKey(dummyAqKey, undefined, mock404Client);
+    assert.equal(secondDiag.modelListCached, true);
+    assert.equal(listCalls, 1);
+    assert.equal(generateCalls, 2);
+
+    // Route forwards requestEndpoint, requestApiVersion, modelListCached, upstreamErrorMessage cleanly
+    const routeDiagRes = await handleTestByokKeyRequest(
+      {
+        authorizationHeader: 'Bearer test-token',
+        body: { apiKey: dummyAqKey },
+      },
+      {
+        verifyAuth: async () => ({
+          uid: 'teacher-diag-1',
+          email: 'diag@icedu.kr',
+          emailVerified: true,
+          accessStatus: 'active' as const,
+          role: 'teacher',
+        }),
+        testApiKey: async () => firstDiag,
+      },
+    );
+    assert.equal(routeDiagRes.status, 200);
+    const routeBody = routeDiagRes.body as Record<string, unknown>;
+    assert.equal(routeBody.requestApiVersion, 'v1');
+    assert.equal(routeBody.requestEndpoint, 'models/gemini-2.5-flash:generateContent');
+    assert.equal(routeBody.modelListCached, false);
+    assert.ok(
+      typeof routeBody.upstreamErrorMessage === 'string' &&
+        routeBody.upstreamErrorMessage.includes('no longer available to new users'),
+    );
+    assert.ok(!JSON.stringify(routeBody).includes(dummyAqKey));
+
+    // 4. Planner fallback performs MAX 1 retry and caches resolved model so subsequent calls make 1 generate + 0 list calls
+    clearGeminiModelCacheForTesting();
+    let plannerListCalls = 0;
+    let plannerGenerateCalls = 0;
+    const samplePlannerInput = {
+      todayKey: '2026-11-16',
+      currentTimeHhMm: '09:00',
+      totalIncompleteCount: 1,
+      overdueCount: 0,
+      dueTodayCount: 1,
+      timetableConfigured: true,
+      remainingWorkableMinutes: 50,
+      workableSlots: [{ st: '10:00', et: '10:50', min: 50, lb: '2교시 공강' }],
+      blockedEventsSummary: [],
+      academicAlertsSummary: [],
+      tasks: [
+        { id: 't1', t: '문서 정리', d: '2026-11-16', ov: false, dd: 0, p: 'n' as const, s: 'td' as const, m: 20, tdy: true },
+      ],
+    };
+    const fallbackClient = {
+      models: {
+        list: async () => {
+          plannerListCalls += 1;
+          return {
+            page: [
+              { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-3.5-flash', supportedActions: ['generateContent'] },
+            ],
+          };
+        },
+        generateContent: async (params: { model: string }) => {
+          plannerGenerateCalls += 1;
+          if (params.model === 'gemini-2.5-flash') {
+            throw new Error(
+              '404 NOT_FOUND: This model models/gemini-2.5-flash is no longer available to new users.',
+            );
+          }
+          return {
+            text: JSON.stringify({
+              coreAdvice: '활성 모델로 계획을 생성했습니다.',
+              recommendations: [],
+              attentionTasks: [],
+              deferredTasks: [],
+            }),
+            usageMetadata: { promptTokenCount: 50, candidatesTokenCount: 20, totalTokenCount: 70 },
+          };
+        },
+      },
+    };
+
+    const plan1 = await generateDayPlanWithGemini(dummyAqKey, samplePlannerInput, undefined, fallbackClient);
+    assert.equal(plan1.model, 'gemini-3.5-flash');
+    assert.equal(plannerListCalls, 1);
+    assert.equal(plannerGenerateCalls, 2); // 1 configured + max 1 fallback retry
+
+    const plan2 = await generateDayPlanWithGemini(dummyAqKey, samplePlannerInput, undefined, fallbackClient);
+    assert.equal(plan2.model, 'gemini-3.5-flash');
+    assert.equal(plannerListCalls, 1); // 0 extra models.list calls
+    assert.equal(plannerGenerateCalls, 3); // Strictly 1 direct call using cached resolved model
+
+    // When fallback model ALSO returns 404, fail after max 1 retry (no 3rd attempt)
+    clearGeminiModelCacheForTesting();
+    let doubleFailGenerateCalls = 0;
+    await assert.rejects(
+      () =>
+        generateDayPlanWithGemini(dummyAqKey, samplePlannerInput, undefined, {
+          models: {
+            list: async () => ({
+              page: [
+                { name: 'models/gemini-3.5-flash', supportedActions: ['generateContent'] },
+                { name: 'models/gemini-4-hydrogen', supportedActions: ['generateContent'] },
+              ],
+            }),
+            generateContent: async () => {
+              doubleFailGenerateCalls += 1;
+              throw new Error('404 NOT_FOUND: model not found');
+            },
+          },
+        }),
+      (err: unknown) => err instanceof GeminiServiceError && err.code === 'model_not_found',
+    );
+    assert.equal(doubleFailGenerateCalls, 2);
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+

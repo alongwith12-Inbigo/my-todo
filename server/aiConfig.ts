@@ -33,14 +33,28 @@ export interface MappedGeminiError {
   diagnosticCategory: GeminiDiagnosticErrorCategory;
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
+  upstreamErrorMessage?: string;
   message: string;
 }
 
 interface ParsedUpstreamErrorInfo {
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
+  upstreamErrorMessage?: string;
   reasons: string[];
   textLower: string;
+}
+
+export function sanitizeUpstreamErrorMessage(raw: string): string | undefined {
+  const cleaned = raw
+    .replace(/\bAIza[0-9A-Za-z_-]{8,}\b/g, '[REDACTED_KEY]')
+    .replace(/\bAQ\.[0-9A-Za-z._-]{8,}\b/g, '[REDACTED_KEY]')
+    .replace(/\bBearer\s+[0-9A-Za-z._-]+\b/gi, 'Bearer [REDACTED]')
+    .replace(/([?&]key=)[^&\s"']+/gi, '$1[REDACTED]')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return undefined;
+  return cleaned.length > 220 ? `${cleaned.slice(0, 217)}...` : cleaned;
 }
 
 function parseUpstreamGeminiError(error: unknown): ParsedUpstreamErrorInfo {
@@ -98,6 +112,7 @@ function parseUpstreamGeminiError(error: unknown): ParsedUpstreamErrorInfo {
   return {
     upstreamHttpStatus,
     upstreamApiStatus,
+    upstreamErrorMessage: sanitizeUpstreamErrorMessage(apiMessage),
     reasons,
     textLower: `${rawMessage} ${apiMessage} ${reasons.join(' ')} ${upstreamApiStatus ?? ''}`.toLowerCase(),
   };
@@ -171,6 +186,7 @@ export function mapGeminiError(
       diagnosticCategory: 'auth_header_error',
       upstreamHttpStatus: httpStatus ?? 401,
       upstreamApiStatus: apiStatus,
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
       message:
         'Gemini API 인증 헤더 방식이 호환되지 않습니다. AQ. 인증 키와 AIza 키 모두 Bearer 토큰이 아닌 x-goog-api-key 헤더로 전송되어야 합니다.',
     };
@@ -189,6 +205,7 @@ export function mapGeminiError(
       diagnosticCategory: 'auth_failed',
       upstreamHttpStatus: httpStatus ?? 400,
       upstreamApiStatus: apiStatus,
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
       message:
         'Google Gemini API가 해당 키를 유효하지 않다고 응답했습니다. Google AI Studio에서 키가 삭제·만료되지 않았는지 확인해 주세요.',
     };
@@ -207,6 +224,7 @@ export function mapGeminiError(
       diagnosticCategory: 'quota_exceeded',
       upstreamHttpStatus: httpStatus ?? 429,
       upstreamApiStatus: apiStatus ?? 'RESOURCE_EXHAUSTED',
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
       message:
         '등록한 개인 Gemini API 키의 일일 또는 분당 호출 한도에 도달했습니다. Google AI Studio 무료 할당량은 태평양 표준시 자정(한국시간 오후 4~5시경)에 초기화됩니다.',
     };
@@ -219,6 +237,7 @@ export function mapGeminiError(
       diagnosticCategory: 'auth_failed',
       upstreamHttpStatus: httpStatus ?? 401,
       upstreamApiStatus: apiStatus ?? 'UNAUTHENTICATED',
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
       message:
         'Gemini API 인증에 실패했습니다. 개인 API 키가 유효한지 또는 Generative Language API 사용 권한이 있는지 확인해 주세요.',
     };
@@ -236,13 +255,24 @@ export function mapGeminiError(
       diagnosticCategory: 'model_permission_denied',
       upstreamHttpStatus: httpStatus ?? 403,
       upstreamApiStatus: apiStatus ?? 'PERMISSION_DENIED',
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
       message: `API 키 또는 Google Cloud 프로젝트에서 모델(${modelName}) 호출 권한이 거부되었습니다. Generative Language API 활성화 여부, 결제 등급(무료/유료 모델), IP/리퍼러 제한을 확인해 주세요.`,
     };
   }
 
+  const isExplicitNotFound =
+    httpStatus === 404 ||
+    apiStatus === 'NOT_FOUND' ||
+    lower.includes('is not found') ||
+    lower.includes('not_found') ||
+    lower.includes('no longer available') ||
+    lower.includes('deprecated') ||
+    lower.includes('retired');
+
   if (
-    lower.includes('not supported for generatecontent') ||
-    lower.includes('does not support generatecontent')
+    !isExplicitNotFound &&
+    (lower.includes('not supported for generatecontent') ||
+      lower.includes('does not support generatecontent'))
   ) {
     return {
       status: 502,
@@ -250,6 +280,7 @@ export function mapGeminiError(
       diagnosticCategory: 'model_generate_unsupported',
       upstreamHttpStatus: httpStatus ?? 400,
       upstreamApiStatus: apiStatus,
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
       message: `선택된 모델(${modelName})이 텍스트 생성(generateContent) 메서드를 지원하지 않습니다.`,
     };
   }
@@ -273,27 +304,30 @@ export function mapGeminiError(
       diagnosticCategory: 'invalid_request_format',
       upstreamHttpStatus: httpStatus ?? 400,
       upstreamApiStatus: apiStatus ?? 'INVALID_ARGUMENT',
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
       message: `Gemini 모델(${modelName}) 요청 형식 또는 생성 옵션이 호환되지 않습니다${detail}.`,
     };
   }
 
-  if (
-    httpStatus === 404 ||
-    apiStatus === 'NOT_FOUND' ||
-    lower.includes('is not found') ||
-    lower.includes('not_found') ||
-    lower.includes('not found') ||
-    lower.includes('deprecated') ||
-    lower.includes('retired') ||
-    lower.includes('no longer available')
-  ) {
+  if (isExplicitNotFound || lower.includes('not found')) {
+    const isNewUserRetired =
+      lower.includes('no longer available to new users') ||
+      lower.includes('no longer available');
+    const isApiVersionMismatch = lower.includes('not found for api version');
+    const currentApiVersion = process.env.GOOGLE_GENAI_API_VERSION?.trim() || 'v1';
+    const specificReason = isNewUserRetired
+      ? `models.list 목록에는 표시되더라도 Google이 신규 키·계정에서 모델(${modelName})의 generateContent 호출을 종료(제한)하여 HTTP 404를 반환했습니다. 목록에서 확인된 최신 모델로 GEMINI_MODEL을 변경해 주세요.`
+      : isApiVersionMismatch
+        ? `모델(${modelName})이 현재 API 버전(${currentApiVersion}) 엔드포인트에서 지원되지 않아 HTTP 404를 반환했습니다.`
+        : `설정된 Gemini 모델(${modelName})을 현재 API 키의 계정에서 호출할 수 없거나 지원이 종료되었습니다. 사용 가능한 모델로 GEMINI_MODEL을 변경해 주세요.`;
     return {
       status: 502,
       code: 'model_not_found',
       diagnosticCategory: 'model_not_supported',
       upstreamHttpStatus: httpStatus ?? 404,
       upstreamApiStatus: apiStatus ?? 'NOT_FOUND',
-      message: `설정된 Gemini 모델(${modelName})을 현재 API 키의 계정에서 찾을 수 없거나 지원이 종료되었습니다. 사용 가능한 모델로 GEMINI_MODEL을 변경해 주세요.`,
+      upstreamErrorMessage: parsed.upstreamErrorMessage,
+      message: specificReason,
     };
   }
 
@@ -303,6 +337,7 @@ export function mapGeminiError(
     diagnosticCategory: 'server_error',
     upstreamHttpStatus: httpStatus,
     upstreamApiStatus: apiStatus,
+    upstreamErrorMessage: parsed.upstreamErrorMessage,
     message:
       'AI 응답을 처리하는 중 일시적인 오류가 발생했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
   };

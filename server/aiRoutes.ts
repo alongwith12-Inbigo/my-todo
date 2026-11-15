@@ -45,6 +45,7 @@ import {
   analyzeNoticeWithGemini,
   generateBriefingWithGemini,
   generateDayPlanWithGemini,
+  getEffectiveGeminiApiVersion,
   testGeminiPersonalKey,
   verifyGeminiKeyAuthOnly,
   type GeminiPersonalKeyTestResult,
@@ -518,6 +519,14 @@ export async function handleTestByokKeyRequest(
           ? { upstreamHttpStatus: res.upstreamHttpStatus }
           : {}),
         ...(res.upstreamApiStatus ? { upstreamApiStatus: res.upstreamApiStatus } : {}),
+        ...(res.upstreamErrorMessage
+          ? { upstreamErrorMessage: res.upstreamErrorMessage }
+          : {}),
+        ...(res.requestApiVersion ? { requestApiVersion: res.requestApiVersion } : {}),
+        ...(res.requestEndpoint ? { requestEndpoint: res.requestEndpoint } : {}),
+        ...(typeof res.modelListCached === 'boolean'
+          ? { modelListCached: res.modelListCached }
+          : {}),
         ...(res.availableGenerateModels
           ? { availableGenerateModels: res.availableGenerateModels }
           : {}),
@@ -531,6 +540,8 @@ export async function handleTestByokKeyRequest(
   } catch (err) {
     if (err instanceof GeminiServiceError) {
       const configuredModel = getGeminiModelName();
+      const requestApiVersion = getEffectiveGeminiApiVersion();
+      const requestEndpoint = `models/${configuredModel.replace(/^models\//, '')}:generateContent`;
       const isAuthFailure =
         err.diagnosticCategory === 'auth_failed' ||
         err.diagnosticCategory === 'auth_header_error' ||
@@ -551,6 +562,8 @@ export async function handleTestByokKeyRequest(
           error: err.code,
           errorCode: err.code,
           category: 'gemini_api' satisfies AiErrorCategory,
+          requestApiVersion,
+          requestEndpoint,
           ...(err.diagnosticCategory
             ? { diagnosticCategory: err.diagnosticCategory satisfies GeminiDiagnosticErrorCategory }
             : {}),
@@ -558,6 +571,9 @@ export async function handleTestByokKeyRequest(
             ? { upstreamHttpStatus: err.upstreamHttpStatus }
             : {}),
           ...(err.upstreamApiStatus ? { upstreamApiStatus: err.upstreamApiStatus } : {}),
+          ...(err.upstreamErrorMessage
+            ? { upstreamErrorMessage: err.upstreamErrorMessage }
+            : {}),
           message: err.message,
         },
       };

@@ -117,6 +117,10 @@ export interface AiByokTestResponse {
   diagnosticCategory?: GeminiDiagnosticErrorCategory;
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
+  upstreamErrorMessage?: string;
+  requestApiVersion?: string;
+  requestEndpoint?: string;
+  modelListCached?: boolean;
   availableGenerateModels?: string[];
   recommendedModel?: string | null;
   usage?: AiTokenUsage;
