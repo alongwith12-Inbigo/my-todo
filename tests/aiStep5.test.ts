@@ -343,6 +343,7 @@ test('mapGeminiError never leaks raw API key strings or internal details', () =>
   const mapped = mapGeminiError(
     new Error('API key not valid: AIzaSecretKeyShouldNeverAppearInUi'),
   );
-  assert.equal(mapped.status, 503);
+  assert.equal(mapped.status, 403);
+  assert.equal(mapped.code, 'invalid_api_key');
   assert.ok(!mapped.message.includes('AIzaSecretKeyShouldNeverAppearInUi'));
 });

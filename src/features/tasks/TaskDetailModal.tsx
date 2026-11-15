@@ -56,6 +56,7 @@ export function TaskDetailModal({
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [priority, setPriority] = useState<TaskPriority>('normal');
+  const [estimatedMinutesStr, setEstimatedMinutesStr] = useState('');
   const [dueDateStr, setDueDateStr] = useState('');
   const [scheduledDateStr, setScheduledDateStr] = useState('');
   const [remindDateStr, setRemindDateStr] = useState('');
@@ -75,6 +76,11 @@ export function TaskDetailModal({
     setTitle(target.title);
     setDescription(target.description);
     setPriority(target.priority);
+    setEstimatedMinutesStr(
+      typeof target.estimatedMinutes === 'number'
+        ? String(target.estimatedMinutes)
+        : '',
+    );
     setDueDateStr(getKstDateInputValue(timestampToDate(target.dueAt)));
     setScheduledDateStr(getKstDateInputValue(timestampToDate(target.scheduledAt)));
     setRemindDateStr(getKstDateInputValue(timestampToDate(target.remindAt)));
@@ -206,6 +212,23 @@ export function TaskDetailModal({
       return;
     }
 
+    let parsedEstimatedMinutes: number | null = null;
+    if (estimatedMinutesStr.trim() !== '') {
+      const n = Number(estimatedMinutesStr.trim());
+      if (
+        !Number.isInteger(n) ||
+        n < VALIDATION_LIMITS.TASK_ESTIMATED_MIN ||
+        n > VALIDATION_LIMITS.TASK_ESTIMATED_MAX
+      ) {
+        setFeedback({
+          type: 'error',
+          message: `예상 소요 시간은 ${VALIDATION_LIMITS.TASK_ESTIMATED_MIN}~${VALIDATION_LIMITS.TASK_ESTIMATED_MAX}분 사이의 정수이거나 미지정으로 두어야 합니다.`,
+        });
+        return;
+      }
+      parsedEstimatedMinutes = n;
+    }
+
     try {
       const dueDate = parseKstDateInput(dueDateStr, 'due');
       const scheduledDate = parseKstDateInput(scheduledDateStr, 'schedule');
@@ -218,6 +241,7 @@ export function TaskDetailModal({
         dueAt: dueDate ? Timestamp.fromDate(dueDate) : null,
         scheduledAt: scheduledDate ? Timestamp.fromDate(scheduledDate) : null,
         remindAt: remindDate ? Timestamp.fromDate(remindDate) : null,
+        estimatedMinutes: parsedEstimatedMinutes,
         relatedEventId: relatedEventId.trim() || null,
       });
 
@@ -485,25 +509,76 @@ export function TaskDetailModal({
               />
             </div>
 
-            <div>
-              <label
-                htmlFor="detail-task-priority"
-                className="block text-xs font-medium text-slate-700 mb-1.5"
-              >
-                우선순위
-              </label>
-              <select
-                id="detail-task-priority"
-                disabled={activeTask.isDeleted}
-                value={priority}
-                onChange={(e) => setPriority(e.target.value as TaskPriority)}
-                className="w-full sm:w-48 px-3.5 py-2 text-sm border border-slate-300 rounded-lg bg-white disabled:bg-slate-50 focus:outline-none focus:border-teal-700"
-              >
-                <option value="urgent">긴급</option>
-                <option value="high">높음</option>
-                <option value="normal">보통</option>
-                <option value="low">낮음</option>
-              </select>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label
+                  htmlFor="detail-task-priority"
+                  className="block text-xs font-medium text-slate-700 mb-1.5"
+                >
+                  우선순위
+                </label>
+                <select
+                  id="detail-task-priority"
+                  disabled={activeTask.isDeleted}
+                  value={priority}
+                  onChange={(e) => setPriority(e.target.value as TaskPriority)}
+                  className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg bg-white disabled:bg-slate-50 focus:outline-none focus:border-teal-700"
+                >
+                  <option value="urgent">긴급</option>
+                  <option value="high">높음</option>
+                  <option value="normal">보통</option>
+                  <option value="low">낮음</option>
+                </select>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label
+                    htmlFor="detail-task-estimated-minutes"
+                    className="text-xs font-medium text-slate-700"
+                  >
+                    예상 소요 시간 (선택 · 분)
+                  </label>
+                  {estimatedMinutesStr && !activeTask.isDeleted && (
+                    <button
+                      type="button"
+                      onClick={() => setEstimatedMinutesStr('')}
+                      className="text-xs text-slate-500 hover:text-slate-900 cursor-pointer"
+                    >
+                      미지정
+                    </button>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="detail-task-estimated-minutes"
+                    type="number"
+                    min={VALIDATION_LIMITS.TASK_ESTIMATED_MIN}
+                    max={VALIDATION_LIMITS.TASK_ESTIMATED_MAX}
+                    step={5}
+                    disabled={activeTask.isDeleted}
+                    value={estimatedMinutesStr}
+                    onChange={(e) => setEstimatedMinutesStr(e.target.value)}
+                    placeholder="미지정 (예: 30)"
+                    className="w-full px-3.5 py-2 text-sm border border-slate-300 rounded-lg tabular-nums disabled:bg-slate-50 focus:outline-none focus:border-teal-700"
+                  />
+                  <span className="text-xs text-slate-500 shrink-0">분</span>
+                </div>
+                {!activeTask.isDeleted && (
+                  <div className="mt-1.5 flex flex-wrap gap-2 text-xs text-slate-600">
+                    {[15, 30, 60, 120].map((mins) => (
+                      <button
+                        key={mins}
+                        type="button"
+                        onClick={() => setEstimatedMinutesStr(String(mins))}
+                        className="hover:text-teal-700 underline underline-offset-2 cursor-pointer"
+                      >
+                        {mins >= 60 ? `${mins / 60}시간` : `${mins}분`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2 border-t border-slate-100">

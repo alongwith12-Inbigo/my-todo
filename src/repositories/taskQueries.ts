@@ -57,6 +57,11 @@ function mapTaskDoc(snap: QueryDocumentSnapshot<DocumentData>): TaskRecord {
     scheduledAt: (data.scheduledAt ?? null) as Timestamp | null,
     remindAt: (data.remindAt ?? null) as Timestamp | null,
     completedAt: (data.completedAt ?? null) as Timestamp | null,
+    estimatedMinutes:
+      typeof data.estimatedMinutes === 'number' &&
+      Number.isFinite(data.estimatedMinutes)
+        ? data.estimatedMinutes
+        : null,
     sourceType: data.sourceType,
     relatedEventId: (data.relatedEventId ?? null) as string | null,
     isDeleted: Boolean(data.isDeleted),

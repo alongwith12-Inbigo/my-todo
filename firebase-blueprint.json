@@ -210,6 +210,10 @@
           "type": "string",
           "format": "date-time"
         },
+        "estimatedMinutes": {
+          "type": "integer",
+          "description": "Optional estimated task duration in minutes (5-480, nullable)."
+        },
         "sourceType": {
           "type": "string",
           "enum": ["manual", "note", "import_text", "import_ocr", "import_ai"]
@@ -711,6 +715,72 @@
         "updatedAt",
         "schemaVersion"
       ]
+    },
+    "AiConfigState": {
+      "title": "AiConfigState",
+      "description": "Non-secret per-user AI preferences, daily quota counters, and token metrics stored under users/{uid}/aiConfig/state.",
+      "type": "object",
+      "properties": {
+        "aiEnabled": { "type": "boolean" },
+        "dailyPlanLimit": { "type": "integer" },
+        "dailyTotalLimit": { "type": "integer" },
+        "todayDateKey": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "todayPlanCount": { "type": "integer" },
+        "todayTotalCount": { "type": "integer" },
+        "monthKey": { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+        "monthTotalCount": { "type": "integer" },
+        "totalInputTokens": { "type": "integer" },
+        "totalOutputTokens": { "type": "integer" },
+        "totalThoughtTokens": { "type": "integer" },
+        "lastModel": { "type": "string", "maxLength": 64 },
+        "lastUsedAtIso": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "schemaVersion": { "type": "integer" }
+      },
+      "required": [
+        "aiEnabled",
+        "dailyPlanLimit",
+        "dailyTotalLimit",
+        "todayDateKey",
+        "todayPlanCount",
+        "todayTotalCount",
+        "monthKey",
+        "monthTotalCount",
+        "totalInputTokens",
+        "totalOutputTokens",
+        "totalThoughtTokens",
+        "lastModel",
+        "lastUsedAtIso",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
+    },
+    "AiConfigVault": {
+      "title": "AiConfigVault",
+      "description": "Server AES-256-GCM encrypted personal Gemini API key envelope stored under users/{uid}/aiConfig/vault (never plaintext).",
+      "type": "object",
+      "properties": {
+        "cipherVersion": { "type": "integer" },
+        "iv": { "type": "string", "maxLength": 64 },
+        "authTag": { "type": "string", "maxLength": 64 },
+        "ciphertext": { "type": "string", "maxLength": 512 },
+        "keyHint": { "type": "string", "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "schemaVersion": { "type": "integer" }
+      },
+      "required": [
+        "cipherVersion",
+        "iv",
+        "authTag",
+        "ciphertext",
+        "keyHint",
+        "createdAt",
+        "updatedAt",
+        "schemaVersion"
+      ]
     }
   },
   "firestore": {
@@ -753,6 +823,10 @@
     "/users/{uid}/academicEvents/{academicEventId}": {
       "schema": { "$ref": "#/entities/AcademicEvent" },
       "description": "Teacher private school academic calendar events."
+    },
+    "/users/{uid}/aiConfig/{docId}": {
+      "schema": { "$ref": "#/entities/AiConfigState" },
+      "description": "Private per-user AI quota state ('state') and server-encrypted API key vault ('vault')."
     },
     "/system/{docId}": {
       "schema": { "$ref": "#/entities/SystemConfig" },

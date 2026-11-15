@@ -4,7 +4,15 @@ import type {
   AiAnalyzeNoticeResponse,
   AiBriefingRequest,
   AiBriefingResponse,
+  AiByokSaveRequest,
+  AiByokSaveResponse,
+  AiByokTestRequest,
+  AiByokTestResponse,
+  AiPlannerRequest,
+  AiPlannerResponse,
+  AiPreferencesUpdateRequest,
   AiStatusResponse,
+  AiUsageSnapshot,
 } from '../lib/aiTypes';
 
 export class AiClientError extends Error {
@@ -34,7 +42,7 @@ async function getActiveIdToken(): Promise<string> {
 async function fetchAiJson<T>(
   url: string,
   options: {
-    method: 'GET' | 'POST';
+    method: 'GET' | 'POST' | 'DELETE';
     body?: unknown;
     signal?: AbortSignal;
   },
@@ -45,6 +53,7 @@ async function fetchAiJson<T>(
   try {
     res = await fetch(url, {
       method: options.method,
+      credentials: 'same-origin',
       signal: options.signal,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -59,7 +68,7 @@ async function fetchAiJson<T>(
     throw new AiClientError(
       0,
       'network_error',
-      'AI 서버와 통신할 수 없습니다. 네트워크 상태를 확인하거나 기본 분석을 이용해 주세요.',
+      'AI 서버와 통신할 수 없습니다. 네트워크 상태를 확인하거나 기본 기능을 이용해 주세요.',
     );
   }
 
@@ -73,14 +82,18 @@ async function fetchAiJson<T>(
   if (!res.ok) {
     const errObj =
       payload && typeof payload === 'object'
-        ? (payload as { error?: unknown; message?: unknown })
+        ? (payload as { error?: unknown; errorCode?: unknown; message?: unknown })
         : {};
     const code =
-      typeof errObj.error === 'string' ? errObj.error : `http_${res.status}`;
+      typeof errObj.error === 'string'
+        ? errObj.error
+        : typeof errObj.errorCode === 'string'
+          ? errObj.errorCode
+          : `http_${res.status}`;
     const message =
       typeof errObj.message === 'string'
         ? errObj.message
-        : `AI 요청이 실패했습니다 (HTTP ${res.status}). 기본 분석을 이용해 주세요.`;
+        : `AI 요청이 실패했습니다 (HTTP ${res.status}). 기본 기능을 이용해 주세요.`;
     throw new AiClientError(res.status, code, message);
   }
 
@@ -92,6 +105,57 @@ export async function fetchAiServerStatus(
 ): Promise<AiStatusResponse> {
   return await fetchAiJson<AiStatusResponse>('/api/ai/status', {
     method: 'GET',
+    signal,
+  });
+}
+
+export async function saveByokApiKey(
+  input: AiByokSaveRequest,
+  signal?: AbortSignal,
+): Promise<AiByokSaveResponse> {
+  return await fetchAiJson<AiByokSaveResponse>('/api/ai/byok', {
+    method: 'POST',
+    body: input,
+    signal,
+  });
+}
+
+export async function testByokApiKey(
+  input: AiByokTestRequest = {},
+  signal?: AbortSignal,
+): Promise<AiByokTestResponse> {
+  return await fetchAiJson<AiByokTestResponse>('/api/ai/byok/test', {
+    method: 'POST',
+    body: input,
+    signal,
+  });
+}
+
+export async function deleteByokApiKey(
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; hasPersonalKey: boolean; message: string }> {
+  return await fetchAiJson<{ ok: boolean; hasPersonalKey: boolean; message: string }>(
+    '/api/ai/byok',
+    {
+      method: 'DELETE',
+      signal,
+    },
+  );
+}
+
+export async function updateAiServerPreferences(
+  input: AiPreferencesUpdateRequest,
+  signal?: AbortSignal,
+): Promise<{
+  ok: boolean;
+  aiEnabled: boolean;
+  dailyPlanLimit: number;
+  dailyTotalLimit: number;
+  usage: AiUsageSnapshot;
+}> {
+  return await fetchAiJson('/api/ai/preferences', {
+    method: 'POST',
+    body: input,
     signal,
   });
 }
@@ -112,6 +176,17 @@ export async function requestAiTodayBriefing(
   signal?: AbortSignal,
 ): Promise<AiBriefingResponse> {
   return await fetchAiJson<AiBriefingResponse>('/api/ai/briefing', {
+    method: 'POST',
+    body: input,
+    signal,
+  });
+}
+
+export async function requestAiDayPlan(
+  input: AiPlannerRequest,
+  signal?: AbortSignal,
+): Promise<AiPlannerResponse> {
+  return await fetchAiJson<AiPlannerResponse>('/api/ai/planner', {
     method: 'POST',
     body: input,
     signal,

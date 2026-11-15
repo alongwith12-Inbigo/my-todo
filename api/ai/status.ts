@@ -10,6 +10,6 @@ export default async function handler(
   res: VercelLikeResponse,
 ) {
   await dispatchVercelAiRoute(req, res, 'GET', () =>
-    handleAiStatusRequest(req.headers.authorization),
+    handleAiStatusRequest(req.headers.authorization, {}, req.headers.cookie),
   );
 }

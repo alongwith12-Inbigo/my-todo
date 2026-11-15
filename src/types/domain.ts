@@ -32,6 +32,8 @@ export const VALIDATION_LIMITS = {
   ACADEMIC_SOURCE_TEXT_MAX_LEN: 300,
   ACADEMIC_DEDUPE_KEY_MAX_LEN: 160,
   ACADEMIC_MAX_IMPORT_BATCH: 200,
+  TASK_ESTIMATED_MIN: 5,
+  TASK_ESTIMATED_MAX: 480,
 } as const;
 
 export type AccountStatus = 'pending' | 'active' | 'suspended' | 'rejected';
@@ -93,6 +95,7 @@ export interface TaskRecord {
   scheduledAt: Timestamp | null;
   remindAt: Timestamp | null;
   completedAt: Timestamp | null;
+  estimatedMinutes?: number | null;
   sourceType: TaskSourceType;
   relatedEventId: string | null;
   isDeleted: boolean;

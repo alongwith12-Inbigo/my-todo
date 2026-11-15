@@ -12,6 +12,7 @@ export default async function handler(
   await dispatchVercelAiRoute(req, res, 'POST', (signal) =>
     handleAiBriefingRequest({
       authorizationHeader: req.headers.authorization,
+      cookieHeader: req.headers.cookie,
       body: req.body,
       signal,
     }),

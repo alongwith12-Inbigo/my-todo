@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type, type Schema } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type, type Schema } from '@google/genai';
 import {
   AI_LIMITS,
   type AiAnalyzeNoticeRequest,
@@ -6,13 +6,13 @@ import {
   type AiBriefingRequest,
   type AiBriefingResponse,
   type AiBriefingResult,
+  type AiPlannerRawResult,
+  type AiPlannerRequest,
+  type AiPlannerResponse,
   type AiRawNoticeOutput,
+  type AiTokenUsage,
 } from '../src/lib/aiTypes.ts';
-import {
-  getGeminiApiKey,
-  getGeminiModelName,
-  mapGeminiError,
-} from './aiConfig.ts';
+import { getGeminiModelName, mapGeminiError } from './aiConfig.ts';
 
 const NOTICE_RESPONSE_SCHEMA: Schema = {
   type: Type.OBJECT,
@@ -113,19 +113,94 @@ const BRIEFING_RESPONSE_SCHEMA: Schema = {
   ],
 };
 
-function createGeminiClient(): GoogleGenAI {
-  const apiKey = getGeminiApiKey();
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured');
+const PLANNER_RESPONSE_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    coreAdvice: { type: Type.STRING },
+    recommendations: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          taskId: { type: Type.STRING },
+          order: { type: Type.INTEGER },
+          recommendedStart: { type: Type.STRING, nullable: true },
+          recommendedEnd: { type: Type.STRING, nullable: true },
+          estimatedMinutes: { type: Type.INTEGER },
+          reason: { type: Type.STRING },
+        },
+        required: ['taskId', 'order', 'estimatedMinutes', 'reason'],
+      },
+    },
+    attentionTasks: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          taskId: { type: Type.STRING },
+          reason: { type: Type.STRING },
+        },
+        required: ['taskId', 'reason'],
+      },
+    },
+    deferredTasks: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          taskId: { type: Type.STRING },
+          reason: { type: Type.STRING },
+        },
+        required: ['taskId', 'reason'],
+      },
+    },
+  },
+  required: [
+    'coreAdvice',
+    'recommendations',
+    'attentionTasks',
+    'deferredTasks',
+  ],
+};
+
+function createGeminiClient(apiKey: string): GoogleGenAI {
+  const cleanKey = apiKey.trim();
+  if (!cleanKey) {
+    throw new GeminiServiceError(
+      403,
+      'personal_key_required',
+      '개인 Gemini API 키가 등록되어 있지 않습니다.',
+    );
   }
   return new GoogleGenAI({
-    apiKey,
+    apiKey: cleanKey,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
       },
     },
   });
+}
+
+function extractUsageMetadata(response: {
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    thoughtsTokenCount?: number;
+    totalTokenCount?: number;
+  };
+}): AiTokenUsage {
+  const m = response.usageMetadata;
+  const inputTokens = typeof m?.promptTokenCount === 'number' ? m.promptTokenCount : 0;
+  const outputTokens =
+    typeof m?.candidatesTokenCount === 'number' ? m.candidatesTokenCount : 0;
+  const thoughtTokens =
+    typeof m?.thoughtsTokenCount === 'number' ? m.thoughtsTokenCount : 0;
+  const totalTokens =
+    typeof m?.totalTokenCount === 'number'
+      ? m.totalTokenCount
+      : inputTokens + outputTokens + thoughtTokens;
+  return { inputTokens, outputTokens, thoughtTokens, totalTokens };
 }
 
 async function runWithTimeoutAndAbort<T>(
@@ -183,12 +258,46 @@ export class GeminiServiceError extends Error {
   }
 }
 
+export async function testGeminiPersonalKey(
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<{ model: string; usage: AiTokenUsage }> {
+  const model = getGeminiModelName();
+  const ai = createGeminiClient(apiKey);
+  try {
+    const response = await runWithTimeoutAndAbort(
+      () =>
+        ai.models.generateContent({
+          model,
+          contents: 'Reply with OK.',
+          config: {
+            maxOutputTokens: 16,
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.MINIMAL,
+            },
+          },
+        }),
+      12000,
+      signal,
+    );
+    return {
+      model,
+      usage: extractUsageMetadata(response),
+    };
+  } catch (err) {
+    if (err instanceof GeminiServiceError) throw err;
+    const mapped = mapGeminiError(err);
+    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
+  }
+}
+
 export async function analyzeNoticeWithGemini(
+  apiKey: string,
   input: AiAnalyzeNoticeRequest,
   signal?: AbortSignal,
 ): Promise<AiAnalyzeNoticeResponse> {
   const model = getGeminiModelName();
-  const ai = createGeminiClient();
+  const ai = createGeminiClient(apiKey);
   const todayKey = input.todayKey || new Date().toISOString().slice(0, 10);
 
   const existingList = (input.existingItems ?? [])
@@ -224,6 +333,9 @@ export async function analyzeNoticeWithGemini(
           config: {
             responseMimeType: 'application/json',
             responseSchema: NOTICE_RESPONSE_SCHEMA,
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.LOW,
+            },
           },
         }),
       AI_LIMITS.REQUEST_TIMEOUT_MS,
@@ -244,19 +356,22 @@ export async function analyzeNoticeWithGemini(
           ? parsed.unparsedSummary
           : [],
       },
+      usage: extractUsageMetadata(response),
     };
   } catch (err) {
+    if (err instanceof GeminiServiceError) throw err;
     const mapped = mapGeminiError(err);
     throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
   }
 }
 
 export async function generateBriefingWithGemini(
+  apiKey: string,
   input: AiBriefingRequest,
   signal?: AbortSignal,
 ): Promise<AiBriefingResponse> {
   const model = getGeminiModelName();
-  const ai = createGeminiClient();
+  const ai = createGeminiClient(apiKey);
 
   const tasksText =
     input.tasks.length > 0
@@ -304,6 +419,9 @@ export async function generateBriefingWithGemini(
           config: {
             responseMimeType: 'application/json',
             responseSchema: BRIEFING_RESPONSE_SCHEMA,
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.LOW,
+            },
           },
         }),
       AI_LIMITS.REQUEST_TIMEOUT_MS,
@@ -320,8 +438,95 @@ export async function generateBriefingWithGemini(
       model,
       generatedAtIso: new Date().toISOString(),
       briefing: parsed,
+      usage: extractUsageMetadata(response),
     };
   } catch (err) {
+    if (err instanceof GeminiServiceError) throw err;
+    const mapped = mapGeminiError(err);
+    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
+  }
+}
+
+export async function generateDayPlanWithGemini(
+  apiKey: string,
+  input: AiPlannerRequest,
+  signal?: AbortSignal,
+): Promise<AiPlannerResponse> {
+  const model = getGeminiModelName();
+  const ai = createGeminiClient(apiKey);
+
+  const compactInput = {
+    today: input.todayKey,
+    now: input.currentTimeHhMm,
+    counts: {
+      total: input.totalIncompleteCount,
+      overdue: input.overdueCount,
+      dueToday: input.dueTodayCount,
+    },
+    timetableConfigured: input.timetableConfigured,
+    availMin: input.remainingWorkableMinutes,
+    slots: input.workableSlots,
+    events: input.blockedEventsSummary,
+    academic: input.academicAlertsSummary,
+    tasks: input.tasks,
+    ...(input.constraint ? { constraint: input.constraint } : {}),
+  };
+
+  const prompt = [
+    `당신은 한국 교사의 '오늘의 업무 실행 플래너'입니다.`,
+    `규칙:`,
+    `1. 제공된 tasks의 id만 사용하세요(최대 5건 추천). 없는 id/업무 금지.`,
+    `2. recommendedStart/End(HH:MM)는 반드시 slots 구간 내부에만 겹치지 않게 배치하세요. slots가 비어 있으면 null로 두세요.`,
+    `3. estimatedMinutes는 task.m 값이 있으면 그대로 사용하고, null일 때만 15~90 사이 합리적 정수(5단위)로 추정하세요.`,
+    `4. 마감(ov/dd), 중요도(p: u>h>n>l), 남은 시간, 집중 블록/짧은 공강 적합성을 판단해 우선순위를 정하고 큰 업무는 분할 제안하세요.`,
+    `5. reason은 1문장(35자 내외), coreAdvice는 1~2문장(90자 내외)으로 간결히 작성하세요.`,
+    `입력JSON:${JSON.stringify(compactInput)}`,
+  ].join('\n');
+
+  try {
+    const response = await runWithTimeoutAndAbort(
+      () =>
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            maxOutputTokens: 1200,
+            responseMimeType: 'application/json',
+            responseSchema: PLANNER_RESPONSE_SCHEMA,
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.LOW,
+            },
+          },
+        }),
+      AI_LIMITS.REQUEST_TIMEOUT_MS,
+      signal,
+    );
+
+    const text = response.text;
+    if (!text) {
+      throw new Error('Empty JSON planner response from Gemini');
+    }
+
+    const parsed = JSON.parse(text) as AiPlannerRawResult;
+    return {
+      model,
+      generatedAtIso: new Date().toISOString(),
+      rawPlan: {
+        coreAdvice: typeof parsed.coreAdvice === 'string' ? parsed.coreAdvice : '',
+        recommendations: Array.isArray(parsed.recommendations)
+          ? parsed.recommendations.slice(0, AI_LIMITS.MAX_PLANNER_RECOMMENDATIONS)
+          : [],
+        attentionTasks: Array.isArray(parsed.attentionTasks)
+          ? parsed.attentionTasks.slice(0, 6)
+          : [],
+        deferredTasks: Array.isArray(parsed.deferredTasks)
+          ? parsed.deferredTasks.slice(0, 6)
+          : [],
+      },
+      usage: extractUsageMetadata(response),
+    };
+  } catch (err) {
+    if (err instanceof GeminiServiceError) throw err;
     const mapped = mapGeminiError(err);
     throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
   }

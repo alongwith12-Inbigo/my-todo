@@ -139,6 +139,14 @@ service cloud.firestore {
         isValidSchemaVersion(data);
     }
 
+    function isNullableEstimatedMinutes(data) {
+      return !('estimatedMinutes' in data) ||
+        data.estimatedMinutes == null ||
+        (data.estimatedMinutes is int &&
+         data.estimatedMinutes >= 5 &&
+         data.estimatedMinutes <= 480);
+    }
+
     function isValidTask(data) {
       return data.keys().hasAll([
           'title', 'description', 'status', 'priority',
@@ -148,7 +156,7 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'title', 'description', 'status', 'priority',
-          'dueAt', 'scheduledAt', 'remindAt', 'completedAt',
+          'dueAt', 'scheduledAt', 'remindAt', 'completedAt', 'estimatedMinutes',
           'sourceType', 'relatedEventId', 'isDeleted', 'deletedAt',
           'version', 'createdAt', 'updatedAt', 'schemaVersion'
         ]) &&
@@ -160,6 +168,7 @@ service cloud.firestore {
         isNullableTimestamp(data.scheduledAt) &&
         isNullableTimestamp(data.remindAt) &&
         isNullableTimestamp(data.completedAt) &&
+        isNullableEstimatedMinutes(data) &&
         ((data.status == 'done' && data.completedAt is timestamp) ||
          (data.status != 'done' && data.completedAt == null)) &&
         data.sourceType in ['manual', 'note', 'import_text', 'import_ocr', 'import_ai'] &&
@@ -365,6 +374,62 @@ service cloud.firestore {
         isValidSchemaVersion(data);
     }
 
+    function isValidAiConfigState(data) {
+      return data.keys().hasAll([
+          'aiEnabled', 'dailyPlanLimit', 'dailyTotalLimit',
+          'todayDateKey', 'todayPlanCount', 'todayTotalCount',
+          'monthKey', 'monthTotalCount',
+          'totalInputTokens', 'totalOutputTokens', 'totalThoughtTokens',
+          'lastModel', 'lastUsedAtIso',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'aiEnabled', 'dailyPlanLimit', 'dailyTotalLimit',
+          'todayDateKey', 'todayPlanCount', 'todayTotalCount',
+          'monthKey', 'monthTotalCount',
+          'totalInputTokens', 'totalOutputTokens', 'totalThoughtTokens',
+          'lastModel', 'lastUsedAtIso',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.aiEnabled is bool &&
+        data.dailyPlanLimit is int && data.dailyPlanLimit >= 1 && data.dailyPlanLimit <= 10 &&
+        data.dailyTotalLimit is int && data.dailyTotalLimit >= 1 && data.dailyTotalLimit <= 20 &&
+        isValidDateKey(data.todayDateKey) &&
+        data.todayPlanCount is int && data.todayPlanCount >= 0 && data.todayPlanCount <= 100 &&
+        data.todayTotalCount is int && data.todayTotalCount >= 0 && data.todayTotalCount <= 200 &&
+        data.monthKey is string && data.monthKey.matches('^\\d{4}-\\d{2}$') &&
+        data.monthTotalCount is int && data.monthTotalCount >= 0 && data.monthTotalCount <= 5000 &&
+        data.totalInputTokens is int && data.totalInputTokens >= 0 &&
+        data.totalOutputTokens is int && data.totalOutputTokens >= 0 &&
+        data.totalThoughtTokens is int && data.totalThoughtTokens >= 0 &&
+        (data.lastModel == null || (data.lastModel is string && data.lastModel.size() <= 64)) &&
+        (data.lastUsedAtIso == null || (data.lastUsedAtIso is string && data.lastUsedAtIso.size() <= 40)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
+    function isValidAiConfigVault(data) {
+      return data.keys().hasAll([
+          'cipherVersion', 'iv', 'authTag', 'ciphertext', 'keyHint',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.keys().hasOnly([
+          'cipherVersion', 'iv', 'authTag', 'ciphertext', 'keyHint',
+          'createdAt', 'updatedAt', 'schemaVersion'
+        ]) &&
+        data.cipherVersion is int && data.cipherVersion == 1 &&
+        data.iv is string && data.iv.size() >= 12 && data.iv.size() <= 64 &&
+        data.authTag is string && data.authTag.size() >= 16 && data.authTag.size() <= 64 &&
+        data.ciphertext is string && data.ciphertext.size() >= 16 && data.ciphertext.size() <= 512 &&
+        !data.ciphertext.matches('^AIza.*') &&
+        data.keyHint is string && data.keyHint.size() >= 4 && data.keyHint.size() <= 32 &&
+        data.keyHint.matches('^.+\\.\\.\\..+$') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        isValidSchemaVersion(data);
+    }
+
     // -------------------------------------------------------------------------
     // /access/{uid}: Approval Queue & RBAC Source of Truth
     // -------------------------------------------------------------------------
@@ -491,7 +556,7 @@ service cloud.firestore {
             incoming().isDeleted == false &&
             incoming().diff(existing()).affectedKeys().hasOnly([
               'title', 'description', 'priority', 'dueAt', 'scheduledAt',
-              'remindAt', 'relatedEventId', 'version', 'updatedAt'
+              'remindAt', 'estimatedMinutes', 'relatedEventId', 'version', 'updatedAt'
             ])) ||
           // Action: Transition status (todo/doing/done/on_hold)
           (existing().isDeleted == false &&
@@ -689,6 +754,37 @@ service cloud.firestore {
         incoming().updatedAt == request.time;
 
       allow delete: if isActiveOwner(uid) && isValidId(academicEventId);
+    }
+
+    match /users/{uid}/aiConfig/{docId} {
+      allow get: if isActiveOwner(uid) && (docId == 'state' || docId == 'vault');
+      allow list: if false;
+
+      allow create: if isActiveOwner(uid) && (
+        (docId == 'state' &&
+          isValidAiConfigState(incoming()) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time) ||
+        (docId == 'vault' &&
+          isValidAiConfigVault(incoming()) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time)
+      );
+
+      allow update: if isActiveOwner(uid) && (
+        (docId == 'state' &&
+          isValidAiConfigState(incoming()) &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().schemaVersion == existing().schemaVersion &&
+          incoming().updatedAt == request.time) ||
+        (docId == 'vault' &&
+          isValidAiConfigVault(incoming()) &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().schemaVersion == existing().schemaVersion &&
+          incoming().updatedAt == request.time)
+      );
+
+      allow delete: if isActiveOwner(uid) && docId == 'vault';
     }
 
     // -------------------------------------------------------------------------

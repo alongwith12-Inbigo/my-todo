@@ -184,6 +184,7 @@ function AuthenticatedWorkspace({
             onOpenCalendar={handleOpenCalendar}
             onOpenTimetable={handleOpenTimetable}
             onOpenAcademicCalendar={handleOpenAcademicCalendar}
+            onOpenSettings={() => setActiveNav('settings')}
             focusedTaskId={focusedTaskId}
             onClearFocusedTask={() => setFocusedTaskId(null)}
           />

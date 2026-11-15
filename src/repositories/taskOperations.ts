@@ -61,6 +61,7 @@ export interface CreateTaskInput {
   dueAt?: Timestamp | null;
   scheduledAt?: Timestamp | null;
   remindAt?: Timestamp | null;
+  estimatedMinutes?: number | null;
   sourceType?: TaskSourceType;
   relatedEventId?: string | null;
 }
@@ -72,6 +73,7 @@ export interface UpdateTaskDetailsPatch {
   dueAt?: Timestamp | null;
   scheduledAt?: Timestamp | null;
   remindAt?: Timestamp | null;
+  estimatedMinutes?: number | null;
   relatedEventId?: string | null;
 }
 
@@ -101,6 +103,25 @@ function assertValidRelatedEventId(relatedEventId: string | null | undefined): s
     throw new TaskValidationError('유효하지 않은 연결 일정 식별자입니다.');
   }
   return relatedEventId;
+}
+
+function assertValidEstimatedMinutes(
+  value: number | null | undefined,
+): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < VALIDATION_LIMITS.TASK_ESTIMATED_MIN ||
+    value > VALIDATION_LIMITS.TASK_ESTIMATED_MAX
+  ) {
+    throw new TaskValidationError(
+      `예상 소요 시간은 ${VALIDATION_LIMITS.TASK_ESTIMATED_MIN}분부터 ${VALIDATION_LIMITS.TASK_ESTIMATED_MAX}분(8시간) 사이의 정수로 입력해 주세요.`,
+    );
+  }
+  return value;
 }
 
 export function buildCreateTaskPayload(
@@ -133,6 +154,7 @@ export function buildCreateTaskPayload(
   }
 
   const relatedEventId = assertValidRelatedEventId(input.relatedEventId);
+  const estimatedMinutes = assertValidEstimatedMinutes(input.estimatedMinutes);
 
   return {
     title,
@@ -143,6 +165,7 @@ export function buildCreateTaskPayload(
     scheduledAt: input.scheduledAt ?? null,
     remindAt: input.remindAt ?? null,
     completedAt: status === 'done' ? nowSentinel : null,
+    estimatedMinutes,
     sourceType,
     relatedEventId,
     isDeleted: false,
@@ -193,6 +216,9 @@ export function buildTaskDetailsPatch(
   }
   if (patch.remindAt !== undefined) {
     payload.remindAt = patch.remindAt;
+  }
+  if (patch.estimatedMinutes !== undefined) {
+    payload.estimatedMinutes = assertValidEstimatedMinutes(patch.estimatedMinutes);
   }
   if (patch.relatedEventId !== undefined) {
     payload.relatedEventId = assertValidRelatedEventId(patch.relatedEventId);

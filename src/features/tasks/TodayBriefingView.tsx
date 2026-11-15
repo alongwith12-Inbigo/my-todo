@@ -18,10 +18,21 @@ import {
 import { buildMinimalBriefingPayload } from '../../lib/aiBriefing';
 import { normalizeAiBriefingResult } from '../../lib/aiImportValidator';
 import {
+  buildAiPlannerContext,
+  buildDeterministicDayPlan,
+  excludePlanItemFromToday,
+  movePlanItemOrder,
+  reassignPlanItemSlot,
+  validateAndRepairAiPlan,
+  type PlanAdjustmentFilter,
+  type ValidatedDayPlan,
+} from '../../lib/aiPlanner';
+import {
   getStoredAiEnabled,
+  setStoredAiEnabled,
   subscribeAiEnabledChange,
 } from '../../lib/aiPreferences';
-import type { AiBriefingResponse } from '../../lib/aiTypes';
+import type { AiBriefingResponse, AiPlannerRawResult } from '../../lib/aiTypes';
 import { classifyTodayBriefing, timestampToDate } from '../../lib/briefing';
 import { classifyTodayEvents, getMinutesUntilEventStart } from '../../lib/calendar';
 import {
@@ -36,7 +47,12 @@ import {
   SLOT_KIND_LABELS,
 } from '../../lib/timetable';
 import type { TaskFilterTab } from '../../repositories/taskRepo';
-import { AiClientError, requestAiTodayBriefing } from '../../services/aiClient';
+import {
+  AiClientError,
+  fetchAiServerStatus,
+  requestAiDayPlan,
+  requestAiTodayBriefing,
+} from '../../services/aiClient';
 import type { CalendarEventRecord, TaskRecord } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
@@ -44,6 +60,7 @@ import { EventModal } from '../calendar/EventModal';
 import { useAcademicEventData } from '../academic/AcademicEventDataContext';
 import { useTimetableData } from '../timetable/TimetableDataContext';
 import { AiTodayBriefingCard } from './AiTodayBriefingCard';
+import { AiTodayPlannerCard } from './AiTodayPlannerCard';
 import { useTaskData } from './TaskDataContext';
 import { TaskDetailModal } from './TaskDetailModal';
 import { TaskQuickAddBar } from './TaskQuickAddBar';
@@ -56,6 +73,7 @@ interface TodayBriefingViewProps {
   onOpenCalendar: (eventId?: string) => void;
   onOpenTimetable?: () => void;
   onOpenAcademicCalendar?: () => void;
+  onOpenSettings?: () => void;
   focusedTaskId?: string | null;
   onClearFocusedTask?: () => void;
 }
@@ -169,6 +187,7 @@ export function TodayBriefingView({
   onOpenCalendar,
   onOpenTimetable,
   onOpenAcademicCalendar,
+  onOpenSettings,
   focusedTaskId,
   onClearFocusedTask,
 }: TodayBriefingViewProps) {
@@ -199,11 +218,30 @@ export function TodayBriefingView({
   const [aiEnabled, setAiEnabled] = useState(() =>
     getStoredAiEnabled(firebaseUser?.uid),
   );
+  const [hasPersonalKey, setHasPersonalKey] = useState<boolean>(false);
+  const [aiStatusFetched, setAiStatusFetched] = useState<boolean>(false);
+
   const [aiBriefingLoading, setAiBriefingLoading] = useState(false);
   const [aiBriefingError, setAiBriefingError] = useState<string | null>(null);
   const [aiBriefingData, setAiBriefingData] =
     useState<AiBriefingResponse | null>(null);
   const aiBriefingAbortRef = useRef<AbortController | null>(null);
+
+  // Stage 5C: AI Today Work Planner state & session fingerprint cache
+  const [plannerVisible, setPlannerVisible] = useState(false);
+  const [plannerLoading, setPlannerLoading] = useState(false);
+  const [plannerError, setPlannerError] = useState<string | null>(null);
+  const [plannerErrorCode, setPlannerErrorCode] = useState<string | null>(null);
+  const [plannerPlan, setPlannerPlan] = useState<ValidatedDayPlan | null>(null);
+  const [plannerFilter, setPlannerFilter] = useState<PlanAdjustmentFilter>({});
+  const plannerAbortRef = useRef<AbortController | null>(null);
+  const plannerCacheRef = useRef<Map<string, ValidatedDayPlan>>(new Map());
+  const rawAiPlanRef = useRef<{
+    raw: AiPlannerRawResult;
+    model: string;
+    generatedAtIso: string;
+    usage?: ValidatedDayPlan['usage'];
+  } | null>(null);
 
   useEffect(() => {
     setAiEnabled(getStoredAiEnabled(firebaseUser?.uid));
@@ -211,13 +249,277 @@ export function TodayBriefingView({
   }, [firebaseUser?.uid]);
 
   useEffect(() => {
+    if (!firebaseUser?.uid) return;
+    let cancelled = false;
+    void fetchAiServerStatus()
+      .then((status) => {
+        if (cancelled) return;
+        setHasPersonalKey(status.hasPersonalKey);
+        setAiEnabled(status.aiEnabled);
+        setStoredAiEnabled(firebaseUser.uid, status.aiEnabled);
+        setAiStatusFetched(true);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAiStatusFetched(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [firebaseUser?.uid]);
+
+  useEffect(() => {
     return () => {
       aiBriefingAbortRef.current?.abort();
+      plannerAbortRef.current?.abort();
     };
   }, []);
 
   const imminentDays = workspace?.preferences.imminentDays ?? 3;
   const displayName = workspace?.profile.displayName ?? '선생님';
+
+  const plannerContext = useMemo(
+    () =>
+      buildAiPlannerContext({
+        uid: firebaseUser?.uid ?? 'anonymous',
+        todayKey,
+        now,
+        imminentDays,
+        tasks: briefingTasks,
+        events,
+        timetables,
+        overridesByDate,
+        academicEvents,
+        filter: plannerFilter,
+      }),
+    [
+      firebaseUser?.uid,
+      todayKey,
+      now,
+      imminentDays,
+      briefingTasks,
+      events,
+      timetables,
+      overridesByDate,
+      academicEvents,
+      plannerFilter,
+    ],
+  );
+
+  function handleRunDeterministicPlan(nextFilter: PlanAdjustmentFilter = plannerFilter) {
+    const ctx = buildAiPlannerContext({
+      uid: firebaseUser?.uid ?? 'anonymous',
+      todayKey,
+      now,
+      imminentDays,
+      tasks: briefingTasks,
+      events,
+      timetables,
+      overridesByDate,
+      academicEvents,
+      filter: nextFilter,
+    });
+    rawAiPlanRef.current = null;
+    setPlannerVisible(true);
+    setPlannerError(null);
+    setPlannerErrorCode(null);
+    setPlannerPlan(buildDeterministicDayPlan(ctx));
+  }
+
+  async function handleRunAiPlanner(
+    forceRefresh = false,
+    constraintText?: string,
+  ) {
+    if (plannerLoading) return;
+    setPlannerVisible(true);
+    setPlannerError(null);
+    setPlannerErrorCode(null);
+
+    const nextFilter: PlanAdjustmentFilter = {
+      ...plannerFilter,
+      constraintText: constraintText?.trim() || undefined,
+    };
+    if (constraintText !== undefined) {
+      setPlannerFilter(nextFilter);
+    }
+
+    // Refresh server status once if not loaded yet so BYOK status is accurate
+    let currentHasKey = hasPersonalKey;
+    let currentEnabled = aiEnabled;
+    if (!aiStatusFetched) {
+      try {
+        const status = await fetchAiServerStatus();
+        currentHasKey = status.hasPersonalKey;
+        currentEnabled = status.aiEnabled;
+        setHasPersonalKey(status.hasPersonalKey);
+        setAiEnabled(status.aiEnabled);
+        setStoredAiEnabled(firebaseUser?.uid, status.aiEnabled);
+        setAiStatusFetched(true);
+      } catch {
+        setAiStatusFetched(true);
+      }
+    }
+
+    if (!currentEnabled || !currentHasKey) {
+      setPlannerPlan(null);
+      setPlannerErrorCode(
+        !currentEnabled ? 'ai_disabled_by_user' : 'personal_key_required',
+      );
+      return;
+    }
+
+    const ctx = buildAiPlannerContext({
+      uid: firebaseUser?.uid ?? 'anonymous',
+      todayKey,
+      now,
+      imminentDays,
+      tasks: briefingTasks,
+      events,
+      timetables,
+      overridesByDate,
+      academicEvents,
+      filter: nextFilter,
+    });
+
+    if (ctx.compressedRequest.tasks.length === 0) {
+      rawAiPlanRef.current = null;
+      setPlannerPlan(buildDeterministicDayPlan(ctx));
+      return;
+    }
+
+    if (!forceRefresh) {
+      const cached = plannerCacheRef.current.get(ctx.fingerprint);
+      if (cached) {
+        setPlannerPlan({ ...cached, fromCache: true });
+        return;
+      }
+    }
+
+    plannerAbortRef.current?.abort();
+    const controller = new AbortController();
+    plannerAbortRef.current = controller;
+    setPlannerLoading(true);
+
+    try {
+      const res = await requestAiDayPlan(ctx.compressedRequest, controller.signal);
+      if (controller.signal.aborted) return;
+
+      rawAiPlanRef.current = {
+        raw: res.rawPlan,
+        model: res.model,
+        generatedAtIso: res.generatedAtIso,
+        usage: res.usage,
+      };
+
+      const validated = validateAndRepairAiPlan(res.rawPlan, ctx, {
+        model: res.model,
+        generatedAtIso: res.generatedAtIso,
+        usage: res.usage,
+      });
+
+      plannerCacheRef.current.set(ctx.fingerprint, validated);
+      setPlannerPlan(validated);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      if (err instanceof AiClientError) {
+        setPlannerError(err.message);
+        setPlannerErrorCode(err.code);
+        if (err.code === 'personal_key_required') {
+          setHasPersonalKey(false);
+          setPlannerPlan(null);
+        }
+      } else {
+        setPlannerError(
+          err instanceof Error
+            ? err.message
+            : 'AI 업무 계획을 생성하지 못했습니다.',
+        );
+        setPlannerErrorCode('unknown_error');
+      }
+    } finally {
+      if (plannerAbortRef.current === controller) {
+        plannerAbortRef.current = null;
+        setPlannerLoading(false);
+      }
+    }
+  }
+
+  function handleApplyQuickFilter(nextFilter: PlanAdjustmentFilter) {
+    setPlannerFilter(nextFilter);
+    const ctx = buildAiPlannerContext({
+      uid: firebaseUser?.uid ?? 'anonymous',
+      todayKey,
+      now,
+      imminentDays,
+      tasks: briefingTasks,
+      events,
+      timetables,
+      overridesByDate,
+      academicEvents,
+      filter: nextFilter,
+    });
+
+    if (plannerPlan?.mode === 'ai' && rawAiPlanRef.current) {
+      setPlannerPlan(
+        validateAndRepairAiPlan(rawAiPlanRef.current.raw, ctx, {
+          model: rawAiPlanRef.current.model,
+          generatedAtIso: rawAiPlanRef.current.generatedAtIso,
+          usage: rawAiPlanRef.current.usage,
+        }),
+      );
+    } else {
+      setPlannerPlan(buildDeterministicDayPlan(ctx));
+    }
+  }
+
+  function handleMovePlanItem(taskId: string, direction: 'up' | 'down') {
+    setPlannerPlan((prev) =>
+      prev
+        ? movePlanItemOrder(
+            prev,
+            taskId,
+            direction,
+            plannerContext.remainingWorkableIntervals,
+          )
+        : prev,
+    );
+  }
+
+  function handleExcludePlanItem(taskId: string) {
+    const nextExcluded = Array.from(
+      new Set([...(plannerFilter.excludedTaskIds ?? []), taskId]),
+    );
+    setPlannerFilter((prev) => ({ ...prev, excludedTaskIds: nextExcluded }));
+    setPlannerPlan((prev) =>
+      prev
+        ? excludePlanItemFromToday(
+            prev,
+            taskId,
+            plannerContext.remainingWorkableIntervals,
+          )
+        : prev,
+    );
+  }
+
+  function handleReassignPlanSlot(taskId: string, intervalIndex: number) {
+    setPlannerPlan((prev) =>
+      prev
+        ? reassignPlanItemSlot(
+            prev,
+            taskId,
+            intervalIndex,
+            plannerContext.remainingWorkableIntervals,
+          )
+        : prev,
+    );
+  }
+
+  function handleResetLocalAdjustments() {
+    const cleared: PlanAdjustmentFilter = {};
+    setPlannerFilter(cleared);
+    handleApplyQuickFilter(cleared);
+  }
 
   async function handleRunAiBriefing() {
     if (!aiEnabled || aiBriefingLoading) return;
@@ -350,7 +652,19 @@ export function TodayBriefingView({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          {aiEnabled && (
+          <button
+            type="button"
+            disabled={plannerLoading}
+            onClick={() => void handleRunAiPlanner(false)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>
+              {plannerLoading ? '업무 계획 정리 중...' : 'AI로 오늘 업무 계획 세우기'}
+            </span>
+          </button>
+
+          {aiEnabled && hasPersonalKey && (
             <button
               type="button"
               disabled={aiBriefingLoading}
@@ -382,7 +696,7 @@ export function TodayBriefingView({
           <button
             type="button"
             onClick={() => onOpenTasksView('active')}
-            className="px-4 py-2 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0 cursor-pointer"
+            className="px-4 py-2 text-xs font-semibold text-slate-800 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
           >
             전체 업무 관리
           </button>
@@ -404,6 +718,50 @@ export function TodayBriefingView({
         onOpenEvent={(eventId) => onOpenCalendar(eventId)}
         onGoToTasksView={() => onOpenTasksView('active')}
         onGoToCalendarView={() => onOpenCalendar()}
+      />
+
+      <AiTodayPlannerCard
+        visible={plannerVisible}
+        loading={plannerLoading}
+        error={plannerError}
+        errorCode={plannerErrorCode}
+        plan={plannerPlan}
+        hasPersonalKey={hasPersonalKey}
+        aiEnabled={aiEnabled}
+        availableIntervals={plannerContext.remainingWorkableIntervals}
+        activeFilter={plannerFilter}
+        onCancel={() => {
+          plannerAbortRef.current?.abort();
+          plannerAbortRef.current = null;
+          setPlannerLoading(false);
+        }}
+        onClose={() => {
+          setPlannerVisible(false);
+          setPlannerError(null);
+          setPlannerErrorCode(null);
+        }}
+        onRunAiPlan={(force, constraint) =>
+          void handleRunAiPlanner(force, constraint)
+        }
+        onRunDeterministicPlan={() => handleRunDeterministicPlan()}
+        onOpenSettings={onOpenSettings}
+        onOpenTimetable={onOpenTimetable}
+        onOpenAcademicCalendar={onOpenAcademicCalendar}
+        onOpenTask={(taskId) => {
+          const matched = briefingTasks.find((t) => t.id === taskId);
+          if (matched) {
+            setSelectedTask(matched);
+          } else {
+            void refreshSingleTask(taskId).then((fetched) => {
+              if (fetched) setSelectedTask(fetched);
+            });
+          }
+        }}
+        onMoveItemOrder={handleMovePlanItem}
+        onExcludeItem={handleExcludePlanItem}
+        onReassignItemSlot={handleReassignPlanSlot}
+        onApplyQuickFilter={handleApplyQuickFilter}
+        onResetLocalAdjustments={handleResetLocalAdjustments}
       />
 
       <AiTodayBriefingCard

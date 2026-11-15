@@ -59,6 +59,7 @@ export function TaskQuickAddBar({
   const [dueDateStr, setDueDateStr] = useState('');
   const [scheduledDateStr, setScheduledDateStr] = useState('');
   const [remindDateStr, setRemindDateStr] = useState('');
+  const [estimatedMinutesStr, setEstimatedMinutesStr] = useState('');
   const [isDraggingFile, setIsDraggingFile] = useState(false);
 
   const [feedback, setFeedback] = useState<{
@@ -91,6 +92,10 @@ export function TaskQuickAddBar({
       const dueDate = parseKstDateInput(dueDateStr, 'due');
       const scheduledDate = parseKstDateInput(scheduledDateStr, 'schedule');
       const remindDate = parseKstDateInput(remindDateStr, 'remind');
+      const parsedEstimated =
+        estimatedMinutesStr.trim() !== ''
+          ? Number(estimatedMinutesStr.trim())
+          : null;
 
       const created = await createNewTask({
         title: trimmedTitle,
@@ -99,6 +104,7 @@ export function TaskQuickAddBar({
         dueAt: dueDate ? Timestamp.fromDate(dueDate) : null,
         scheduledAt: scheduledDate ? Timestamp.fromDate(scheduledDate) : null,
         remindAt: remindDate ? Timestamp.fromDate(remindDate) : null,
+        estimatedMinutes: parsedEstimated,
       });
 
       // Clear inputs ONLY after confirmed server write
@@ -108,6 +114,7 @@ export function TaskQuickAddBar({
       setDueDateStr('');
       setScheduledDateStr('');
       setRemindDateStr('');
+      setEstimatedMinutesStr('');
       setFeedback({
         type: 'success',
         message: `"${created.title}" 업무를 등록했습니다.`,
@@ -520,6 +527,29 @@ export function TaskQuickAddBar({
                   </button>
                 </div>
               </div>
+            </div>
+            <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-3">
+              <label
+                htmlFor="quick-task-estimated"
+                className="text-xs font-medium text-slate-800 shrink-0"
+              >
+                예상 소요 시간 (선택)
+              </label>
+              <select
+                id="quick-task-estimated"
+                value={estimatedMinutesStr}
+                onChange={(e) => setEstimatedMinutesStr(e.target.value)}
+                className="px-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white text-slate-800 tabular-nums focus:outline-none focus:border-teal-700"
+              >
+                <option value="">미지정</option>
+                <option value="10">10분</option>
+                <option value="20">20분</option>
+                <option value="30">30분</option>
+                <option value="45">45분</option>
+                <option value="60">1시간 (60분)</option>
+                <option value="90">1시간 30분 (90분)</option>
+                <option value="120">2시간 (120분)</option>
+              </select>
             </div>
           </div>
         )}

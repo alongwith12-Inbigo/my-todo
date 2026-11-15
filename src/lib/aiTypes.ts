@@ -4,17 +4,88 @@ export const AI_LIMITS = {
   MAX_BRIEFING_TASKS: 30,
   MAX_BRIEFING_EVENTS: 20,
   MAX_CANDIDATES: 25,
+  MAX_PLANNER_TASKS: 15,
+  MAX_PLANNER_SLOTS: 8,
+  MAX_PLANNER_RECOMMENDATIONS: 5,
+  MAX_ADJUST_CONSTRAINT_CHARS: 180,
   REQUEST_TIMEOUT_MS: 25000,
   RATE_LIMIT_MAX_REQUESTS: 12,
   RATE_LIMIT_WINDOW_MS: 60_000,
+  DEFAULT_DAILY_PLAN_LIMIT: 3,
+  DEFAULT_DAILY_TOTAL_LIMIT: 5,
+  MAX_DAILY_PLAN_LIMIT: 10,
+  MAX_DAILY_TOTAL_LIMIT: 20,
 } as const;
+
+export type AiPersistenceMode = 'encrypted_vault' | 'session_memory_only';
+
+export interface AiTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  thoughtTokens: number;
+  totalTokens: number;
+}
+
+export interface AiUsageSnapshot {
+  todayDateKey: string;
+  todayPlanCount: number;
+  todayTotalCount: number;
+  monthKey: string;
+  monthTotalCount: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalThoughtTokens: number;
+  lastModel: string | null;
+  lastUsedAtIso: string | null;
+}
 
 export interface AiStatusResponse {
   configured: boolean;
+  hasPersonalKey: boolean;
+  keyHint: string | null;
+  persistenceMode: AiPersistenceMode;
   model: string;
+  aiEnabled: boolean;
+  dailyPlanLimit: number;
+  dailyTotalLimit: number;
+  usage: AiUsageSnapshot;
   rateLimitMaxRequests: number;
   rateLimitWindowSeconds: number;
   maxNoticeChars: number;
+}
+
+export interface AiByokSaveRequest {
+  apiKey: string;
+  testBeforeSave?: boolean;
+}
+
+export interface AiByokSaveResponse {
+  ok: boolean;
+  hasPersonalKey: boolean;
+  keyHint: string;
+  persistenceMode: AiPersistenceMode;
+  message: string;
+  usage?: AiTokenUsage;
+}
+
+export interface AiByokTestRequest {
+  apiKey?: string;
+}
+
+export interface AiByokTestResponse {
+  ok: boolean;
+  model: string;
+  latencyMs: number;
+  keyHint: string | null;
+  message: string;
+  errorCode?: string;
+  usage?: AiTokenUsage;
+}
+
+export interface AiPreferencesUpdateRequest {
+  aiEnabled?: boolean;
+  dailyPlanLimit?: number;
+  dailyTotalLimit?: number;
 }
 
 export interface MinimalExistingContextItem {
@@ -58,6 +129,7 @@ export interface AiRawNoticeOutput {
 export interface AiAnalyzeNoticeResponse {
   model: string;
   rawOutput: AiRawNoticeOutput;
+  usage?: AiTokenUsage;
 }
 
 export interface MinimalBriefingTask {
@@ -109,4 +181,75 @@ export interface AiBriefingResponse {
   model: string;
   generatedAtIso: string;
   briefing: AiBriefingResult;
+  usage?: AiTokenUsage;
+}
+
+/**
+ * Compressed Task representation for AI Today Work Planner (max 15 items, zero description/notes).
+ */
+export interface MinimalPlannerTask {
+  id: string;
+  t: string; // sanitized title (max 70 chars)
+  d: string | null; // dueDateKey YYYY-MM-DD
+  ov: boolean; // overdue
+  dd: number | null; // D-day relative to todayKey
+  p: 'u' | 'h' | 'n' | 'l'; // urgent | high | normal | low
+  s: 'td' | 'dg' | 'oh'; // todo | doing | on_hold
+  m: number | null; // user-supplied estimatedMinutes (nullable)
+  tdy: boolean; // due/scheduled/reminded today
+}
+
+export interface MinimalPlannerSlot {
+  st: string; // HH:MM
+  et: string; // HH:MM
+  min: number; // usable minutes
+  lb: string; // short label
+}
+
+export interface AiPlannerRequest {
+  todayKey: string;
+  currentTimeHhMm: string;
+  totalIncompleteCount: number;
+  overdueCount: number;
+  dueTodayCount: number;
+  timetableConfigured: boolean;
+  remainingWorkableMinutes: number;
+  workableSlots: MinimalPlannerSlot[];
+  blockedEventsSummary: string[];
+  academicAlertsSummary: string[];
+  tasks: MinimalPlannerTask[];
+  constraint?: string;
+}
+
+export interface AiPlannerRawRecommendation {
+  taskId: string;
+  order: number;
+  recommendedStart: string | null; // HH:MM
+  recommendedEnd: string | null; // HH:MM
+  estimatedMinutes: number;
+  reason: string;
+}
+
+export interface AiPlannerRawAttentionItem {
+  taskId: string;
+  reason: string;
+}
+
+export interface AiPlannerRawDeferredItem {
+  taskId: string;
+  reason: string;
+}
+
+export interface AiPlannerRawResult {
+  coreAdvice: string;
+  recommendations: AiPlannerRawRecommendation[];
+  attentionTasks: AiPlannerRawAttentionItem[];
+  deferredTasks: AiPlannerRawDeferredItem[];
+}
+
+export interface AiPlannerResponse {
+  model: string;
+  generatedAtIso: string;
+  rawPlan: AiPlannerRawResult;
+  usage?: AiTokenUsage;
 }

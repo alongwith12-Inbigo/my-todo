@@ -202,6 +202,18 @@ export function TaskRow({ task, onSelect, onError, compact = false }: TaskRowPro
               </>
             )}
 
+            {typeof task.estimatedMinutes === 'number' && !task.isDeleted && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>
+                  예상{' '}
+                  {task.estimatedMinutes >= 60 && task.estimatedMinutes % 60 === 0
+                    ? `${task.estimatedMinutes / 60}시간`
+                    : `${task.estimatedMinutes}분`}
+                </span>
+              </>
+            )}
+
             {!dueDate && !scheduledDate && !remindDate && !task.isDeleted && (
               <>
                 <span aria-hidden="true">·</span>
