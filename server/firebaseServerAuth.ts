@@ -38,18 +38,47 @@ const FIREBASE_JWKS = createRemoteJWKSet(
 
 function loadFirebaseProjectConfig(): FirebaseClientConfigFile {
   if (cachedConfig) return cachedConfig;
-  const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
-  const raw = JSON.parse(
-    fs.readFileSync(configPath, 'utf8'),
-  ) as Partial<FirebaseClientConfigFile>;
-  if (!raw.projectId || !raw.firestoreDatabaseId) {
-    throw new Error('firebase-applet-config.json is missing projectId or firestoreDatabaseId.');
+
+  const envProjectId =
+    process.env.FIREBASE_PROJECT_ID?.trim() ||
+    process.env.VITE_FIREBASE_PROJECT_ID?.trim();
+  const envDbId =
+    process.env.FIREBASE_FIRESTORE_DATABASE_ID?.trim() ||
+    process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID?.trim();
+  if (envProjectId && envDbId) {
+    cachedConfig = {
+      projectId: envProjectId,
+      firestoreDatabaseId: envDbId,
+    };
+    return cachedConfig;
   }
-  cachedConfig = {
-    projectId: raw.projectId,
-    firestoreDatabaseId: raw.firestoreDatabaseId,
-  };
-  return cachedConfig;
+
+  const candidatePaths = [
+    new URL('../firebase-applet-config.json', import.meta.url),
+    path.resolve(process.cwd(), 'firebase-applet-config.json'),
+  ];
+
+  for (const candidate of candidatePaths) {
+    try {
+      const rawText = fs.readFileSync(candidate, 'utf8');
+      const raw = JSON.parse(rawText) as Partial<FirebaseClientConfigFile>;
+      if (raw.projectId && raw.firestoreDatabaseId) {
+        cachedConfig = {
+          projectId: raw.projectId,
+          firestoreDatabaseId: raw.firestoreDatabaseId,
+        };
+        return cachedConfig;
+      }
+    } catch {
+      // Try next candidate path
+    }
+  }
+
+  throw new ServerAuthError(
+    500,
+    'firebase_config_missing',
+    '서버에서 Firebase 프로젝트 설정(firebase-applet-config.json 또는 FIREBASE_PROJECT_ID / FIREBASE_FIRESTORE_DATABASE_ID)을 읽을 수 없습니다.',
+  );
 }
 
 export function extractBearerToken(

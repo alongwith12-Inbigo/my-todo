@@ -19,6 +19,15 @@ export const AI_LIMITS = {
 
 export type AiPersistenceMode = 'encrypted_vault' | 'session_memory_only';
 
+export type AiErrorCategory =
+  | 'input_format'
+  | 'request_format'
+  | 'auth'
+  | 'encryption_config'
+  | 'gemini_api'
+  | 'network'
+  | 'server_internal';
+
 export interface AiTokenUsage {
   inputTokens: number;
   outputTokens: number;
@@ -44,6 +53,8 @@ export interface AiStatusResponse {
   hasPersonalKey: boolean;
   keyHint: string | null;
   persistenceMode: AiPersistenceMode;
+  encryptionConfigured?: boolean;
+  serverlessRuntime?: boolean;
   model: string;
   aiEnabled: boolean;
   dailyPlanLimit: number;
@@ -54,6 +65,8 @@ export interface AiStatusResponse {
   maxNoticeChars: number;
 }
 
+export type GeminiApiKeyType = 'auth_aq' | 'standard_aiza' | 'generic';
+
 export interface AiByokSaveRequest {
   apiKey: string;
   testBeforeSave?: boolean;
@@ -63,8 +76,10 @@ export interface AiByokSaveResponse {
   ok: boolean;
   hasPersonalKey: boolean;
   keyHint: string;
+  keyType?: GeminiApiKeyType;
   persistenceMode: AiPersistenceMode;
   message: string;
+  warning?: string;
   usage?: AiTokenUsage;
 }
 
@@ -77,8 +92,12 @@ export interface AiByokTestResponse {
   model: string;
   latencyMs: number;
   keyHint: string | null;
+  keyType?: GeminiApiKeyType;
   message: string;
+  warning?: string;
   errorCode?: string;
+  detailCode?: string;
+  category?: AiErrorCategory;
   usage?: AiTokenUsage;
 }
 

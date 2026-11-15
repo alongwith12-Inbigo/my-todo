@@ -5,20 +5,25 @@ import {
   type AiAnalyzeNoticeResponse,
   type AiBriefingRequest,
   type AiBriefingResponse,
+  type AiErrorCategory,
   type AiPlannerRequest,
   type AiPlannerResponse,
   type AiStatusResponse,
   type AiTokenUsage,
+  type GeminiApiKeyType,
 } from '../src/lib/aiTypes.ts';
+import { detectGeminiApiKeyType } from '../src/lib/byokKeyFormat.ts';
 import { getAiStatusBasePayload, getGeminiModelName } from './aiConfig.ts';
 import {
   acquireUidInFlightLock,
   applyUsageIncrement,
   buildByokClearCookieHeader,
   buildByokSetCookieHeader,
+  ByokVaultError,
   checkDailyQuotaForKind,
   deletePersonalApiKeyForUid,
   getPersistenceMode,
+  isVercelServerlessRuntime,
   loadUserAiState,
   maskGeminiApiKey,
   normalizeGeminiApiKeyInput,
@@ -83,7 +88,13 @@ export interface AiRouteDeps {
   testApiKey?: (
     apiKey: string,
     signal?: AbortSignal,
-  ) => Promise<{ model: string; usage: AiTokenUsage }>;
+  ) => Promise<{
+    model: string;
+    usage: AiTokenUsage;
+    authVerified?: boolean;
+    keyType?: GeminiApiKeyType;
+    warning?: string;
+  }>;
 }
 
 const defaultRateLimiter = new SlidingWindowRateLimiter(
@@ -113,25 +124,86 @@ function resolveDeps(deps: AiRouteDeps = {}) {
   };
 }
 
+function parseRequestObjectBody(
+  body: unknown,
+): { ok: true; data: Record<string, unknown> } | { ok: false; result: AiRouteResult } {
+  if (body === undefined || body === null || body === '') {
+    return { ok: true, data: {} };
+  }
+  if (typeof body === 'string') {
+    try {
+      const parsed = JSON.parse(body) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { ok: true, data: parsed as Record<string, unknown> };
+      }
+    } catch {
+      return {
+        ok: false,
+        result: {
+          status: 400,
+          body: {
+            error: 'invalid_request_body',
+            category: 'request_format' satisfies AiErrorCategory,
+            message: '요청 본문(JSON) 형식이 올바르지 않습니다.',
+          },
+        },
+      };
+    }
+  }
+  if (typeof body === 'object' && !Array.isArray(body)) {
+    return { ok: true, data: body as Record<string, unknown> };
+  }
+  return {
+    ok: false,
+    result: {
+      status: 400,
+      body: {
+        error: 'invalid_request_body',
+        category: 'request_format' satisfies AiErrorCategory,
+        message: '요청 본문은 JSON 객체여야 합니다.',
+      },
+    },
+  };
+}
+
 function handleRouteError(err: unknown): AiRouteResult {
   if (err instanceof ServerAuthError) {
     return {
       status: err.statusCode,
-      body: { error: err.code, message: err.message },
+      body: {
+        error: err.code,
+        category: 'auth' satisfies AiErrorCategory,
+        message: err.message,
+      },
+    };
+  }
+  if (err instanceof ByokVaultError) {
+    return {
+      status: err.statusCode,
+      body: {
+        error: err.code,
+        category: 'encryption_config' satisfies AiErrorCategory,
+        message: err.message,
+      },
     };
   }
   if (err instanceof GeminiServiceError) {
     return {
       status: err.status,
-      body: { error: err.code, message: err.message },
+      body: {
+        error: err.code,
+        category: 'gemini_api' satisfies AiErrorCategory,
+        message: err.message,
+      },
     };
   }
   return {
     status: 500,
     body: {
       error: 'internal_error',
+      category: 'server_internal' satisfies AiErrorCategory,
       message:
-        'AI 요청 처리 중 예기치 않은 오류가 발생했습니다. 기본 기능을 이용해 주세요.',
+        'AI 서버 내부 처리 중 예기치 않은 오류가 발생했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
     },
   };
 }
@@ -148,6 +220,7 @@ async function resolveCallerKeyOrError(params: {
         status: 503,
         body: {
           error: 'ai_not_configured',
+          category: 'encryption_config' satisfies AiErrorCategory,
           message:
             '개인 Gemini API 키가 등록되어 있지 않습니다. 설정에서 개인 API 키를 등록하거나 기본 기능을 이용해 주세요.',
         },
@@ -162,10 +235,22 @@ async function resolveCallerKeyOrError(params: {
     idToken: params.idToken,
   });
   if (!found) {
+    if (isVercelServerlessRuntime() && getPersistenceMode() !== 'encrypted_vault') {
+      return {
+        status: 503,
+        body: {
+          error: 'encryption_secret_missing',
+          category: 'encryption_config' satisfies AiErrorCategory,
+          message:
+            'Vercel 서버 환경변수 BYOK_ENCRYPTION_SECRET가 설정되지 않아 등록된 개인 API 키를 불러올 수 없습니다. Vercel 설정에서 환경변수를 추가해 주세요.',
+        },
+      };
+    }
     return {
       status: 403,
       body: {
         error: 'personal_key_required',
+        category: 'encryption_config' satisfies AiErrorCategory,
         message:
           '개인 Gemini API 키가 등록되어 있지 않습니다. [설정 > AI 스마트 업무비서]에서 본인의 Gemini API 키를 등록해 주세요.',
       },
@@ -197,11 +282,14 @@ export async function handleAiStatusRequest(
     const userState = await loadUserAiState(user.uid, idToken);
     const base = getAiStatusBasePayload();
 
+    const persistenceMode = getPersistenceMode();
     const body: AiStatusResponse = {
       configured: Boolean(personalKey),
       hasPersonalKey: Boolean(personalKey),
       keyHint: personalKey?.keyHint ?? null,
-      persistenceMode: getPersistenceMode(),
+      persistenceMode,
+      encryptionConfigured: persistenceMode === 'encrypted_vault',
+      serverlessRuntime: isVercelServerlessRuntime(),
       model: base.model,
       aiEnabled: userState.aiEnabled,
       dailyPlanLimit: userState.dailyPlanLimit,
@@ -235,10 +323,11 @@ export async function handleSaveByokKeyRequest(
   try {
     const user = await resolved.verifyAuth(params.authorizationHeader);
     const idToken = extractBearerToken(params.authorizationHeader) ?? undefined;
-    const rawBody =
-      params.body && typeof params.body === 'object'
-        ? (params.body as Record<string, unknown>)
-        : {};
+    const parsedBody = parseRequestObjectBody(params.body);
+    if (parsedBody.ok === false) {
+      return parsedBody.result;
+    }
+    const rawBody = parsedBody.data;
 
     const validation = validateGeminiApiKeyFormat(rawBody.apiKey);
     if (!validation.valid || !validation.apiKey) {
@@ -246,15 +335,20 @@ export async function handleSaveByokKeyRequest(
         status: 400,
         body: {
           error: 'invalid_key_format',
+          errorCode: 'invalid_key_format',
+          detailCode: validation.reasonCode,
+          category: 'input_format' satisfies AiErrorCategory,
           message: validation.message || 'API 키 형식이 올바르지 않습니다.',
         },
       };
     }
 
     let testUsage: AiTokenUsage | undefined;
+    let testWarning: string | undefined;
     if (rawBody.testBeforeSave === true) {
       const testRes = await resolved.testApiKey(validation.apiKey, params.signal);
       testUsage = testRes.usage;
+      testWarning = testRes.warning;
     }
 
     const saved = await savePersonalApiKeyForUid({
@@ -279,6 +373,9 @@ export async function handleSaveByokKeyRequest(
       Boolean(params.isSecure),
     );
 
+    const keyType =
+      validation.keyType ?? detectGeminiApiKeyType(validation.apiKey);
+
     return {
       status: 200,
       headers: {
@@ -289,11 +386,13 @@ export async function handleSaveByokKeyRequest(
         ok: true,
         hasPersonalKey: true,
         keyHint: saved.keyHint,
+        keyType,
         persistenceMode: saved.persistenceMode,
         message:
           saved.persistenceMode === 'encrypted_vault'
             ? '개인 Gemini API 키를 암호화하여 안전하게 등록했습니다.'
             : '개인 Gemini API 키를 현재 서버 세션(암호화 쿠키·메모리)에 등록했습니다.',
+        ...(testWarning ? { warning: testWarning } : {}),
         ...(testUsage ? { usage: testUsage } : {}),
       },
     };
@@ -315,10 +414,11 @@ export async function handleTestByokKeyRequest(
   try {
     const user = await resolved.verifyAuth(params.authorizationHeader);
     const idToken = extractBearerToken(params.authorizationHeader) ?? undefined;
-    const rawBody =
-      params.body && typeof params.body === 'object'
-        ? (params.body as Record<string, unknown>)
-        : {};
+    const parsedBody = parseRequestObjectBody(params.body);
+    if (parsedBody.ok === false) {
+      return parsedBody.result;
+    }
+    const rawBody = parsedBody.data;
 
     let targetKey: string | null = null;
     let keyHint: string | null = null;
@@ -333,7 +433,10 @@ export async function handleTestByokKeyRequest(
           status: 400,
           body: {
             ok: false,
+            error: 'invalid_key_format',
             errorCode: 'invalid_key_format',
+            detailCode: validation.reasonCode,
+            category: 'input_format' satisfies AiErrorCategory,
             message: validation.message || 'API 키 형식이 올바르지 않습니다.',
           },
         };
@@ -347,11 +450,26 @@ export async function handleTestByokKeyRequest(
         idToken,
       });
       if (!stored) {
+        if (isVercelServerlessRuntime() && getPersistenceMode() !== 'encrypted_vault') {
+          return {
+            status: 503,
+            body: {
+              ok: false,
+              error: 'encryption_secret_missing',
+              errorCode: 'encryption_secret_missing',
+              category: 'encryption_config' satisfies AiErrorCategory,
+              message:
+                'Vercel 서버 환경변수 BYOK_ENCRYPTION_SECRET가 설정되지 않아 저장된 개인 API 키를 복호화할 수 없습니다.',
+            },
+          };
+        }
         return {
           status: 403,
           body: {
             ok: false,
+            error: 'personal_key_required',
             errorCode: 'personal_key_required',
+            category: 'encryption_config' satisfies AiErrorCategory,
             message: '테스트할 개인 API 키가 등록되어 있지 않습니다.',
           },
         };
@@ -363,6 +481,7 @@ export async function handleTestByokKeyRequest(
     const startMs = Date.now();
     const res = await resolved.testApiKey(targetKey, params.signal);
     const latencyMs = Math.max(1, Date.now() - startMs);
+    const keyType = res.keyType ?? detectGeminiApiKeyType(targetKey);
 
     return {
       status: 200,
@@ -372,7 +491,9 @@ export async function handleTestByokKeyRequest(
         model: res.model,
         latencyMs,
         keyHint,
-        message: `개인 API 키 연결 확인 완료 (${res.model}, ${latencyMs}ms)`,
+        keyType,
+        message: `개인 API 키 인증 확인 완료 (${res.model}, ${latencyMs}ms)`,
+        ...(res.warning ? { warning: res.warning } : {}),
         usage: res.usage,
       },
     };
@@ -386,7 +507,9 @@ export async function handleTestByokKeyRequest(
           model: getGeminiModelName(),
           latencyMs: 0,
           keyHint: null,
+          error: err.code,
           errorCode: err.code,
+          category: 'gemini_api' satisfies AiErrorCategory,
           message: err.message,
         },
       };
@@ -1042,18 +1165,28 @@ export async function dispatchVercelAiRoute(
   const allowed = Array.isArray(expectedMethod) ? expectedMethod : [expectedMethod];
   if (!req.method || !allowed.includes(req.method as 'GET' | 'POST' | 'DELETE')) {
     res.setHeader('Allow', allowed.join(', '));
-    res.status(405).json({ error: 'method_not_allowed', message: '허용되지 않은 요청 방식입니다.' });
+    res.status(405).json({
+      error: 'method_not_allowed',
+      category: 'request_format' satisfies AiErrorCategory,
+      message: '허용되지 않은 요청 방식입니다.',
+    });
     return;
   }
 
   const controller = new AbortController();
   req.on?.('close', () => controller.abort());
 
-  const result = await runner(controller.signal);
-  if (result.headers) {
-    for (const [k, v] of Object.entries(result.headers)) {
-      res.setHeader(k, v);
+  try {
+    const result = await runner(controller.signal);
+    if (result.headers) {
+      for (const [k, v] of Object.entries(result.headers)) {
+        res.setHeader(k, v);
+      }
     }
+    res.status(result.status).json(result.body);
+  } catch (err) {
+    const fallback = handleRouteError(err);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(fallback.status).json(fallback.body);
   }
-  res.status(result.status).json(result.body);
 }

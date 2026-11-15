@@ -29,12 +29,21 @@ import {
   type StoredAiUserState,
 } from '../server/byokVault.ts';
 import {
+  dispatchVercelAiRoute,
   handleAiPlannerRequest,
+  handleAiStatusRequest,
   handleSaveByokKeyRequest,
   handleTestByokKeyRequest,
 } from '../server/aiRoutes.ts';
+import { mapGeminiError } from '../server/aiConfig.ts';
 import { ServerAuthError } from '../server/firebaseServerAuth.ts';
+import {
+  createGeminiClient,
+  GeminiServiceError,
+  testGeminiPersonalKey,
+} from '../server/geminiService.ts';
 import { SlidingWindowRateLimiter } from '../server/rateLimiter.ts';
+import { detectGeminiApiKeyType } from '../src/lib/byokKeyFormat.ts';
 import type {
   AcademicEventRecord,
   CalendarEventRecord,
@@ -615,77 +624,94 @@ test('taskOperations supports optional nullable estimatedMinutes and rejects out
   );
 });
 
-test('validateGeminiApiKeyFormat allows valid keys with A-Z a-z 0-9 _ - and strips edge whitespace/invisible chars', () => {
-  const validCases = [
-    'AIzaSyAbCdEfGhIjKlMnOpQrStUvWxYz_01-234',
-    'AIzaSy9876543210-_abcdefghijklmnopqrstuvwxyz',
-    'A'.repeat(20),
-    'Ab_0-9'.repeat(42) + '1234', // 256 chars max boundary
+test('validateGeminiApiKeyFormat allows both AIza... and AQ.... dummy keys and strips edge whitespace/invisible Unicode chars', () => {
+  const validDummyCases = [
+    'AIzaSyDummyKeyAbCdEfGhIjKlMnOpQrStUvWx_01-234',
+    'AIzaSyDummy9876543210-_abcdefghijklmnop',
+    'AQ.Ab8RN6DummyAuthKeySegment_01-23456789ABCDEF',
+    'AQ.Ab8RN6Dummy.MultiSegment_Part2-XYZ123456789',
+    'D'.repeat(20),
+    'Ab_0-9'.repeat(63) + '12', // 380 chars max boundary
   ];
 
-  for (const key of validCases) {
+  for (const key of validDummyCases) {
     const res = validateGeminiApiKeyFormat(key);
     assert.equal(res.valid, true, `Expected valid for key length ${key.length}`);
     assert.equal(res.apiKey, key);
   }
 
-  const cleanKey = 'AIzaSyTest_Copy-Paste_1234567890ABCDEFG';
+  assert.equal(detectGeminiApiKeyType('AQ.Ab8RN6DummyAuthKey_1234567890'), 'auth_aq');
+  assert.equal(detectGeminiApiKeyType('AIzaSyDummyKeyAbCdEfGhIjKlMnOp123'), 'standard_aiza');
+
+  const cleanAqDummyKey = 'AQ.Ab8RN6Dummy_Copy-Paste.Key_1234567890ABCDEF';
   const copyPasteArtifacts = [
-    `  ${cleanKey}  `,
-    `\r\n${cleanKey}\n`,
-    `\t\u00A0\u3000${cleanKey}\u00A0\t`,
-    `\uFEFF\u200B${cleanKey}\u200C\u200D`,
-    `\u200E\u202A\u2060\u00AD${cleanKey}\u202E\u200F\u2060`,
-    `\r\n \u200B\uFEFF${cleanKey}\u200B \n\r`,
+    `  ${cleanAqDummyKey}  `,
+    `\r\n${cleanAqDummyKey}\n`,
+    `\t\u00A0\u3000${cleanAqDummyKey}\u00A0\t`,
+    `\uFEFF\u200B${cleanAqDummyKey}\u200C\u200D`,
+    `\u200E\u202A\u2060\u00AD\u061C\u180E\u034F${cleanAqDummyKey}\u202E\u200F\u2060\u3164\u2800`,
+    `\r\n \u200B\uFEFF${cleanAqDummyKey}\u200B \n\r`,
   ];
 
   for (const noisy of copyPasteArtifacts) {
-    assert.equal(normalizeGeminiApiKeyInput(noisy), cleanKey);
+    assert.equal(normalizeGeminiApiKeyInput(noisy), cleanAqDummyKey);
     const res = validateGeminiApiKeyFormat(noisy);
     assert.equal(res.valid, true);
-    assert.equal(res.apiKey, cleanKey);
+    assert.equal(res.apiKey, cleanAqDummyKey);
+    assert.equal(res.keyType, 'auth_aq');
   }
 });
 
-test('validateGeminiApiKeyFormat rejects internal whitespace, invalid chars, and bad lengths without leaking raw key', () => {
-  const invalidFormatCases = [
-    'AIzaSyFakeKey 123456789012345', // internal space
-    'AIzaSyFakeKey\n123456789012345', // internal newline
-    'AIzaSyFakeKey\t123456789012345', // internal tab
-    'AIzaSyFakeKey\u200B123456789012345', // internal zero-width char
-    'AIzaSyFakeKey!123456789012345',
-    'AIzaSyFakeKey@123456789012345',
-    'AIzaSyFakeKey+123456789012345=',
-    'AIzaSyFakeKey/123456789012345',
-    '"AIzaSyFakeKey1234567890123456"',
-    'AIzaSy한글포함키테스트1234567890',
+test('validateGeminiApiKeyFormat distinguishes dot errors, masked placeholders, internal whitespace, invisible chars, non-ASCII, special chars, and length without leaking key', () => {
+  const classifiedCases: Array<{
+    input: string;
+    expectedReason: string;
+  }> = [
+    { input: 'AQ.Ab8DummyKey 123456789012345', expectedReason: 'internal_whitespace' },
+    { input: 'AQ.Ab8DummyKey\n123456789012345', expectedReason: 'internal_whitespace' },
+    { input: 'AQ.Ab8DummyKey\t123456789012345', expectedReason: 'internal_whitespace' },
+    { input: 'AQ.Ab8DummyKey\u200B123456789012345', expectedReason: 'internal_invisible_chars' },
+    { input: 'AQ.Ab8DummyKey\u00AD123456789012345', expectedReason: 'internal_invisible_chars' },
+    { input: 'AQ.Ab8••••••••••••1234567890', expectedReason: 'masked_placeholder' },
+    { input: 'AQ.Ab8Dummy...12345678901234', expectedReason: 'masked_placeholder' },
+    { input: 'AQ..Ab8DummyKey12345678901234', expectedReason: 'masked_placeholder' },
+    { input: 'AQ.Ab8****DummyKey1234567890', expectedReason: 'masked_placeholder' },
+    { input: '.AQAb8DummyKey12345678901234', expectedReason: 'invalid_dot_placement' },
+    { input: 'AQ.Ab8DummyKey12345678901234.', expectedReason: 'invalid_dot_placement' },
+    { input: 'AQ.한글포함더미키123456789012', expectedReason: 'non_ascii_chars' },
+    { input: 'AQ.Ab8DummyKey!123456789012345', expectedReason: 'invalid_special_chars' },
+    { input: 'AQ.Ab8DummyKey+123456789012345=', expectedReason: 'invalid_special_chars' },
+    { input: '"AQ.Ab8DummyKey1234567890123456"', expectedReason: 'invalid_special_chars' },
+    { input: 'D'.repeat(19), expectedReason: 'invalid_length' },
+    { input: 'D'.repeat(381), expectedReason: 'invalid_length' },
   ];
 
-  for (const bad of invalidFormatCases) {
-    const res = validateGeminiApiKeyFormat(bad);
+  const seenMessages = new Set<string>();
+  for (const item of classifiedCases) {
+    const res = validateGeminiApiKeyFormat(item.input);
     assert.equal(res.valid, false);
-    assert.equal(
-      res.message,
-      'API 키에 허용되지 않는 공백이나 특수문자가 포함되어 있습니다.',
-    );
-    assert.ok(!res.message?.includes('AIzaSy'));
-    assert.ok(!res.message?.includes(bad));
+    assert.equal(res.category, 'input_format');
+    assert.equal(res.reasonCode, item.expectedReason);
+    assert.ok(res.message && res.message.length > 0);
+    seenMessages.add(res.message);
+    assert.ok(!res.message.includes('Ab8Dummy'));
+    assert.ok(!res.message.includes(item.input));
   }
+  assert.equal(seenMessages.size, 7);
 
-  const emptyCases = ['', '   ', '\r\n\t', '\u200B\uFEFF\u2060'];
+  const emptyCases = ['', '   ', '\r\n\t', '\u200B\uFEFF\u2060\u180E'];
   for (const empty of emptyCases) {
     const res = validateGeminiApiKeyFormat(empty);
     assert.equal(res.valid, false);
+    assert.equal(res.reasonCode, 'empty_key');
     assert.equal(res.message, 'Gemini API 키를 입력해 주세요.');
   }
 
-  assert.equal(validateGeminiApiKeyFormat('A'.repeat(19)).valid, false);
-  assert.equal(validateGeminiApiKeyFormat('A'.repeat(257)).valid, false);
-  assert.equal(validateGeminiApiKeyFormat(null).valid, false);
-  assert.equal(validateGeminiApiKeyFormat(1234567890).valid, false);
+  assert.equal(validateGeminiApiKeyFormat(null).reasonCode, 'non_string_key');
+  assert.equal(validateGeminiApiKeyFormat(1234567890).reasonCode, 'non_string_key');
 });
 
-test('BYOK save and test routes pass normalized key to server connection test and block internal invalid chars without leaking key', async () => {
+test('BYOK routes distinguish input format, request JSON, auth, Vercel encryption env, and Gemini upstream errors cleanly', async () => {
   const activeAuth = async () => ({
     uid: 'teacher-byok-copy-test',
     email: 'teacher@icedu.kr',
@@ -694,14 +720,15 @@ test('BYOK save and test routes pass normalized key to server connection test an
     role: 'teacher',
   });
 
-  const cleanKey = 'AIzaSyRoute_Test-Key_1234567890ABCDEFGH';
-  const pastedFromUi = `\uFEFF\u200B \n${cleanKey}\r\n\u200C `;
+  const cleanDummyKey = 'AIzaSyDummy_Route-Test_1234567890ABCDEF';
+  const pastedFromUi = `\uFEFF\u200B \n${cleanDummyKey}\r\n\u200C `;
 
+  // 1. Valid dummy key with surrounding copy artifacts passes normalized key to server test & saves cleanly
   const testedKeysOnSave: string[] = [];
   const saveRes = await handleSaveByokKeyRequest(
     {
       authorizationHeader: 'Bearer test-token',
-      body: { apiKey: pastedFromUi, testBeforeSave: true },
+      body: JSON.stringify({ apiKey: pastedFromUi, testBeforeSave: true }),
       isSecure: false,
     },
     {
@@ -709,7 +736,7 @@ test('BYOK save and test routes pass normalized key to server connection test an
       testApiKey: async (apiKey) => {
         testedKeysOnSave.push(apiKey);
         return {
-          model: 'gemini-3.1-flash-lite-preview',
+          model: 'gemini-4-hydrogen',
           usage: {
             inputTokens: 4,
             outputTokens: 2,
@@ -721,9 +748,10 @@ test('BYOK save and test routes pass normalized key to server connection test an
     },
   );
   assert.equal(saveRes.status, 200);
-  assert.deepEqual(testedKeysOnSave, [cleanKey]);
-  assert.ok(!JSON.stringify(saveRes.body).includes(cleanKey));
+  assert.deepEqual(testedKeysOnSave, [cleanDummyKey]);
+  assert.ok(!JSON.stringify(saveRes.body).includes(cleanDummyKey));
 
+  // 2. Test route passes normalized key and rejects invalid internal chars with input_format category
   const testedKeysOnTestRoute: string[] = [];
   const testRes = await handleTestByokKeyRequest(
     {
@@ -735,7 +763,7 @@ test('BYOK save and test routes pass normalized key to server connection test an
       testApiKey: async (apiKey) => {
         testedKeysOnTestRoute.push(apiKey);
         return {
-          model: 'gemini-3.1-flash-lite-preview',
+          model: 'gemini-4-hydrogen',
           usage: {
             inputTokens: 4,
             outputTokens: 2,
@@ -747,10 +775,10 @@ test('BYOK save and test routes pass normalized key to server connection test an
     },
   );
   assert.equal(testRes.status, 200);
-  assert.deepEqual(testedKeysOnTestRoute, [cleanKey]);
-  assert.ok(!JSON.stringify(testRes.body).includes(cleanKey));
+  assert.deepEqual(testedKeysOnTestRoute, [cleanDummyKey]);
+  assert.ok(!JSON.stringify(testRes.body).includes(cleanDummyKey));
 
-  const badInternalKey = 'AIzaSyBad Key With$Special123456';
+  const badInternalKey = 'AIzaSyDummy Key With$Special123';
   const badTestRes = await handleTestByokKeyRequest(
     {
       authorizationHeader: 'Bearer test-token',
@@ -764,9 +792,243 @@ test('BYOK save and test routes pass normalized key to server connection test an
     },
   );
   assert.equal(badTestRes.status, 400);
-  const badBodyStr = JSON.stringify(badTestRes.body);
-  assert.ok(badBodyStr.includes('invalid_key_format'));
-  assert.ok(!badBodyStr.includes('AIzaSy'));
-  assert.ok(!badBodyStr.includes(badInternalKey));
+  const badBody = badTestRes.body as {
+    error: string;
+    category: string;
+    detailCode: string;
+    message: string;
+  };
+  assert.equal(badBody.error, 'invalid_key_format');
+  assert.equal(badBody.category, 'input_format');
+  assert.equal(badBody.detailCode, 'internal_whitespace');
+  assert.ok(!JSON.stringify(badTestRes.body).includes('AIzaSy'));
+
+  // 3. Malformed JSON string body -> request_format (distinct from input_format)
+  const malformedJsonRes = await handleSaveByokKeyRequest(
+    {
+      authorizationHeader: 'Bearer test-token',
+      body: '{bad json',
+    },
+    { verifyAuth: activeAuth },
+  );
+  assert.equal(malformedJsonRes.status, 400);
+  assert.equal((malformedJsonRes.body as { category: string }).category, 'request_format');
+  assert.equal((malformedJsonRes.body as { error: string }).error, 'invalid_request_body');
+
+  // 4. Auth failure -> auth category (distinct from input_format & encryption_config)
+  const unauthRes = await handleSaveByokKeyRequest({
+    authorizationHeader: undefined,
+    body: { apiKey: cleanDummyKey },
+  });
+  assert.equal(unauthRes.status, 401);
+  assert.equal((unauthRes.body as { category: string }).category, 'auth');
+  assert.equal((unauthRes.body as { error: string }).error, 'unauthenticated');
+
+  // 5. Vercel serverless runtime without BYOK_ENCRYPTION_SECRET -> encryption_config error (503)
+  const prevVercel = process.env.VERCEL;
+  const prevSecret = process.env.BYOK_ENCRYPTION_SECRET;
+  try {
+    process.env.VERCEL = '1';
+    delete process.env.BYOK_ENCRYPTION_SECRET;
+
+    const statusOnVercel = await handleAiStatusRequest('Bearer test-token', {
+      verifyAuth: activeAuth,
+    });
+    assert.equal(statusOnVercel.status, 200);
+    assert.equal(
+      (statusOnVercel.body as { encryptionConfigured?: boolean }).encryptionConfigured,
+      false,
+    );
+    assert.equal(
+      (statusOnVercel.body as { serverlessRuntime?: boolean }).serverlessRuntime,
+      true,
+    );
+
+    const saveWithoutSecret = await handleSaveByokKeyRequest(
+      {
+        authorizationHeader: 'Bearer test-token',
+        body: { apiKey: cleanDummyKey, testBeforeSave: false },
+      },
+      { verifyAuth: activeAuth },
+    );
+    assert.equal(saveWithoutSecret.status, 503);
+    assert.equal(
+      (saveWithoutSecret.body as { error: string }).error,
+      'encryption_secret_missing',
+    );
+    assert.equal(
+      (saveWithoutSecret.body as { category: string }).category,
+      'encryption_config',
+    );
+  } finally {
+    if (prevVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = prevVercel;
+    if (prevSecret === undefined) delete process.env.BYOK_ENCRYPTION_SECRET;
+    else process.env.BYOK_ENCRYPTION_SECRET = prevSecret;
+  }
+
+  // 6. Gemini upstream errors map distinctly from input format / auth / encryption errors
+  assert.equal(mapGeminiError(new Error('API_KEY_INVALID')).code, 'invalid_api_key');
+  assert.equal(
+    mapGeminiError(new Error('PERMISSION_DENIED: API disabled')).code,
+    'api_key_permission_denied',
+  );
+  assert.equal(mapGeminiError(new Error('404 model not found')).code, 'model_not_found');
+  assert.equal(mapGeminiError(new Error('429 RESOURCE_EXHAUSTED')).code, 'ai_quota_exceeded');
+
+  // 7. Vercel dispatcher returns clean JSON 500 if unexpected error is thrown
+  let dispatchedStatus = 0;
+  let dispatchedBody: unknown = null;
+  const headersSent: Record<string, string | string[]> = {};
+  await dispatchVercelAiRoute(
+    { method: 'POST', headers: {} },
+    {
+      status(code: number) {
+        dispatchedStatus = code;
+        return this;
+      },
+      json(payload: unknown) {
+        dispatchedBody = payload;
+      },
+      setHeader(name: string, value: string | string[]) {
+        headersSent[name] = value;
+      },
+    },
+    'POST',
+    async () => {
+      throw new Error('Unexpected test boom');
+    },
+  );
+  assert.equal(dispatchedStatus, 500);
+  assert.equal((dispatchedBody as { error: string }).error, 'internal_error');
+  assert.equal((dispatchedBody as { category: string }).category, 'server_internal');
+  assert.equal(headersSent['Cache-Control'], 'no-store');
 });
+
+test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, Firestore vault limits, route metadata, and auth-first connection test', async () => {
+  // 1. SDK authentication header verification: createGeminiClient injects x-goog-api-key (NEVER Authorization: Bearer)
+  const dummyAqKey = 'AQ.Ab8RN6DummyAuthKeyForSdkHeaderCheck_0123456789';
+  const client = createGeminiClient(` \uFEFF${dummyAqKey}\n `) as unknown as {
+    apiClient: {
+      clientOptions: {
+        httpOptions?: { baseUrl?: string };
+        auth?: { addAuthHeaders: (headers: Headers) => Promise<void> };
+      };
+    };
+  };
+  const headers = new Headers();
+  await client.apiClient.clientOptions.auth?.addAuthHeaders(headers);
+  assert.equal(headers.get('x-goog-api-key'), dummyAqKey);
+  assert.equal(headers.get('authorization'), null);
+  assert.equal(
+    client.apiClient.clientOptions.httpOptions?.baseUrl,
+    'https://generativelanguage.googleapis.com/',
+  );
+
+  // 2. Encryption & masking satisfy firestore.rules bounds even at 380-char AQ. keys
+  const longAqKey = `AQ.${'Ab8_Cd9-Ef0'.repeat(34)}XYZ`;
+  assert.ok(longAqKey.length <= 380);
+  const encLong = encryptApiKeyForUid(longAqKey, 'uid-aq-1');
+  assert.ok(encLong.ciphertext.length <= 512);
+  assert.match(encLong.keyHint, /^.+\.\.\..+$/);
+  assert.ok(encLong.keyHint.length >= 4 && encLong.keyHint.length <= 32);
+  assert.equal(decryptApiKeyForUid(encLong, 'uid-aq-1'), longAqKey);
+  assert.equal(decryptApiKeyForUid(encLong, 'uid-aq-2'), null);
+  assert.equal(maskGeminiApiKey(dummyAqKey), 'AQ.Ab8...6789');
+
+  // 3. auth-first connection test: models.list success verifies Gemini API authentication
+  const okRes = await testGeminiPersonalKey(dummyAqKey, undefined, {
+    models: {
+      list: async () => ({
+        page: [{ name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] }],
+      }),
+      generateContent: async () => ({
+        usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+      }),
+    },
+  });
+  assert.equal(okRes.authVerified, true);
+  assert.equal(okRes.keyType, 'auth_aq');
+  assert.equal(okRes.usage.totalTokens, 7);
+  assert.equal(okRes.warning, undefined);
+
+  // 4. Invalid API key or incompatible auth header on models.list throws distinct GeminiServiceError
+  await assert.rejects(
+    () =>
+      testGeminiPersonalKey(dummyAqKey, undefined, {
+        models: {
+          list: async () => {
+            throw new Error('400 API_KEY_INVALID: API key not valid');
+          },
+          generateContent: async () => ({}),
+        },
+      }),
+    (err: unknown) => err instanceof GeminiServiceError && err.code === 'invalid_api_key',
+  );
+
+  await assert.rejects(
+    () =>
+      testGeminiPersonalKey(dummyAqKey, undefined, {
+        models: {
+          list: async () => {
+            throw new Error('401 ACCESS_TOKEN_TYPE_UNSUPPORTED');
+          },
+          generateContent: async () => ({}),
+        },
+      }),
+    (err: unknown) => err instanceof GeminiServiceError && err.code === 'gemini_auth_header_error',
+  );
+  assert.equal(
+    mapGeminiError(new Error('401 ACCESS_TOKEN_TYPE_UNSUPPORTED')).code,
+    'gemini_auth_header_error',
+  );
+
+  // 5. If models.list authenticates cleanly but configured model returns 404, fallback probe verifies auth without falsely claiming invalid key
+  const modelFallbackRes = await testGeminiPersonalKey(dummyAqKey, undefined, {
+    models: {
+      list: async () => ({
+        page: [{ name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] }],
+      }),
+      generateContent: async ({ model }) => {
+        if (model !== 'gemini-2.5-flash') {
+          throw new Error(`404 models/${model} is not found`);
+        }
+        return {
+          usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 },
+        };
+      },
+    },
+  });
+  assert.equal(modelFallbackRes.authVerified, true);
+  assert.equal(modelFallbackRes.keyType, 'auth_aq');
+  assert.equal(modelFallbackRes.model, 'gemini-2.5-flash');
+  assert.ok(modelFallbackRes.warning && modelFallbackRes.warning.includes('GEMINI_MODEL'));
+
+  // 6. Route test returns keyType='auth_aq' cleanly without exposing raw key
+  const activeAuth = async () => ({
+    uid: 'teacher-aq-1',
+    email: 'aq@icedu.kr',
+    emailVerified: true,
+    accessStatus: 'active' as const,
+    role: 'teacher',
+  });
+  const aqRouteRes = await handleTestByokKeyRequest(
+    {
+      authorizationHeader: 'Bearer test-token',
+      body: { apiKey: ` \n${dummyAqKey}\t ` },
+    },
+    {
+      verifyAuth: activeAuth,
+      testApiKey: async () => modelFallbackRes,
+    },
+  );
+  assert.equal(aqRouteRes.status, 200);
+  const aqBody = aqRouteRes.body as { ok: boolean; keyType: string; keyHint: string; warning?: string };
+  assert.equal(aqBody.ok, true);
+  assert.equal(aqBody.keyType, 'auth_aq');
+  assert.equal(aqBody.keyHint, 'AQ.Ab8...6789');
+  assert.ok(aqBody.warning);
+  assert.ok(!JSON.stringify(aqRouteRes.body).includes(dummyAqKey));
+});
+
 

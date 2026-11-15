@@ -11,7 +11,12 @@ import {
   type AiPlannerResponse,
   type AiRawNoticeOutput,
   type AiTokenUsage,
+  type GeminiApiKeyType,
 } from '../src/lib/aiTypes.ts';
+import {
+  detectGeminiApiKeyType,
+  normalizeGeminiApiKeyInput,
+} from '../src/lib/byokKeyFormat.ts';
 import { getGeminiModelName, mapGeminiError } from './aiConfig.ts';
 
 const NOTICE_RESPONSE_SCHEMA: Schema = {
@@ -163,8 +168,8 @@ const PLANNER_RESPONSE_SCHEMA: Schema = {
   ],
 };
 
-function createGeminiClient(apiKey: string): GoogleGenAI {
-  const cleanKey = apiKey.trim();
+export function createGeminiClient(apiKey: string): GoogleGenAI {
+  const cleanKey = normalizeGeminiApiKeyInput(apiKey);
   if (!cleanKey) {
     throw new GeminiServiceError(
       403,
@@ -172,6 +177,8 @@ function createGeminiClient(apiKey: string): GoogleGenAI {
       '개인 Gemini API 키가 등록되어 있지 않습니다.',
     );
   }
+  // GoogleGenAI with { apiKey } injects x-goog-api-key (never Authorization: Bearer),
+  // which is required by Google for both AIza... standard keys and AQ.... authorization keys.
   return new GoogleGenAI({
     apiKey: cleanKey,
     httpOptions: {
@@ -258,17 +265,111 @@ export class GeminiServiceError extends Error {
   }
 }
 
+export interface GeminiTestClientLike {
+  models: {
+    list: (params?: { config?: { pageSize?: number } }) => Promise<{
+      page?: Array<{ name?: string; supportedActions?: string[] }>;
+    }>;
+    generateContent: (params: {
+      model: string;
+      contents: string;
+      config?: Record<string, unknown>;
+    }) => Promise<{
+      usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        thoughtsTokenCount?: number;
+        totalTokenCount?: number;
+      };
+    }>;
+  };
+}
+
+export interface GeminiPersonalKeyTestResult {
+  model: string;
+  usage: AiTokenUsage;
+  authVerified: boolean;
+  keyType: GeminiApiKeyType;
+  warning?: string;
+}
+
+const ZERO_USAGE: AiTokenUsage = {
+  inputTokens: 0,
+  outputTokens: 0,
+  thoughtTokens: 0,
+  totalTokens: 0,
+};
+
+function pickFallbackGenerateContentModel(
+  listedModels: Array<{ name?: string; supportedActions?: string[] }> | undefined,
+  configuredModel: string,
+): string | null {
+  if (!Array.isArray(listedModels) || listedModels.length === 0) return null;
+  const candidates = listedModels
+    .filter((item) => {
+      const name = typeof item?.name === 'string' ? item.name : '';
+      const shortName = name.replace(/^models\//, '');
+      if (!shortName.toLowerCase().includes('gemini')) return false;
+      if (shortName === configuredModel) return false;
+      if (Array.isArray(item.supportedActions) && item.supportedActions.length > 0) {
+        return item.supportedActions.includes('generateContent');
+      }
+      return true;
+    })
+    .map((item) => String(item.name).replace(/^models\//, ''));
+
+  if (candidates.length === 0) return null;
+  const preferredOrder = [
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.5-pro',
+  ];
+  for (const preferred of preferredOrder) {
+    if (candidates.includes(preferred)) return preferred;
+  }
+  return candidates[0];
+}
+
 export async function testGeminiPersonalKey(
   apiKey: string,
   signal?: AbortSignal,
-): Promise<{ model: string; usage: AiTokenUsage }> {
-  const model = getGeminiModelName();
-  const ai = createGeminiClient(apiKey);
+  clientOverride?: GeminiTestClientLike,
+): Promise<GeminiPersonalKeyTestResult> {
+  const cleanKey = normalizeGeminiApiKeyInput(apiKey);
+  if (!cleanKey) {
+    throw new GeminiServiceError(
+      403,
+      'personal_key_required',
+      '개인 Gemini API 키가 등록되어 있지 않습니다.',
+    );
+  }
+  const keyType = detectGeminiApiKeyType(cleanKey);
+  const configuredModel = getGeminiModelName();
+  const ai = clientOverride ?? createGeminiClient(cleanKey);
+  const deadlineMs = Date.now() + 9000;
+  const remainingMs = () => Math.max(1500, deadlineMs - Date.now());
+
+  // 1. Verify actual Gemini API authentication via GET /models (x-goog-api-key)
+  let listedModels: Array<{ name?: string; supportedActions?: string[] }> | undefined;
+  try {
+    const pager = await runWithTimeoutAndAbort(
+      () => ai.models.list({ config: { pageSize: 20 } }),
+      remainingMs(),
+      signal,
+    );
+    listedModels = pager?.page;
+  } catch (err) {
+    if (err instanceof GeminiServiceError) throw err;
+    const mapped = mapGeminiError(err);
+    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
+  }
+
+  // 2. Probe text generation on configured model (auth already verified above)
   try {
     const response = await runWithTimeoutAndAbort(
       () =>
         ai.models.generateContent({
-          model,
+          model: configuredModel,
           contents: 'Reply with OK.',
           config: {
             maxOutputTokens: 16,
@@ -277,16 +378,95 @@ export async function testGeminiPersonalKey(
             },
           },
         }),
-      12000,
+      remainingMs(),
       signal,
     );
     return {
-      model,
+      model: configuredModel,
       usage: extractUsageMetadata(response),
+      authVerified: true,
+      keyType,
     };
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
     const mapped = mapGeminiError(err);
+
+    if (
+      mapped.code === 'invalid_api_key' ||
+      mapped.code === 'api_key_permission_denied' ||
+      mapped.code === 'gemini_auth_header_error' ||
+      mapped.code === 'ai_aborted' ||
+      mapped.code === 'ai_timeout' ||
+      mapped.code === 'upstream_network_error'
+    ) {
+      throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
+    }
+
+    if (mapped.code === 'model_not_found') {
+      const fallbackModel = pickFallbackGenerateContentModel(
+        listedModels,
+        configuredModel,
+      );
+      if (fallbackModel) {
+        try {
+          const fallbackRes = await runWithTimeoutAndAbort(
+            () =>
+              ai.models.generateContent({
+                model: fallbackModel,
+                contents: 'Reply with OK.',
+                config: {
+                  maxOutputTokens: 16,
+                  thinkingConfig: {
+                    thinkingLevel: ThinkingLevel.MINIMAL,
+                  },
+                },
+              }),
+            remainingMs(),
+            signal,
+          );
+          return {
+            model: fallbackModel,
+            usage: extractUsageMetadata(fallbackRes),
+            authVerified: true,
+            keyType,
+            warning: `API 키 인증은 정상입니다. 다만 서버 기본 모델(${configuredModel}) 대신 사용 가능한 모델(${fallbackModel})로 연결되었습니다. Vercel 환경변수 GEMINI_MODEL=${fallbackModel} 설정을 권장합니다.`,
+          };
+        } catch (fallbackErr) {
+          const fallbackMapped = mapGeminiError(fallbackErr);
+          if (
+            fallbackMapped.code === 'invalid_api_key' ||
+            fallbackMapped.code === 'api_key_permission_denied' ||
+            fallbackMapped.code === 'gemini_auth_header_error'
+          ) {
+            throw new GeminiServiceError(
+              fallbackMapped.status,
+              fallbackMapped.code,
+              fallbackMapped.message,
+            );
+          }
+        }
+      }
+
+      return {
+        model: fallbackModel ?? configuredModel,
+        usage: ZERO_USAGE,
+        authVerified: true,
+        keyType,
+        warning: `API 키 인증은 정상 확인되었습니다. 다만 설정된 모델(${configuredModel})을 사용할 수 없어 Vercel 환경변수 GEMINI_MODEL(${fallbackModel ?? 'gemini-2.5-flash'} 등) 설정 확인이 필요합니다.`,
+      };
+    }
+
+    if (mapped.code === 'ai_quota_exceeded') {
+      return {
+        model: configuredModel,
+        usage: ZERO_USAGE,
+        authVerified: true,
+        keyType,
+        warning:
+          'API 키 인증은 정상 확인되었습니다. 다만 현재 해당 키의 Gemini 생성 호출 한도(429)에 도달한 상태입니다. 할당량 초기화 후 AI 기능을 실행해 주세요.',
+      };
+    }
+
     throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
   }
 }

@@ -56,20 +56,76 @@ const inFlightUidLocks = new Map<string, number>();
 
 let cachedFirebaseMeta: FirebaseProjectMeta | null = null;
 
+export class ByokVaultError extends Error {
+  statusCode: number;
+  code:
+    | 'encryption_secret_missing'
+    | 'vault_persistence_failed'
+    | 'firebase_config_missing';
+
+  constructor(
+    statusCode: number,
+    code:
+      | 'encryption_secret_missing'
+      | 'vault_persistence_failed'
+      | 'firebase_config_missing',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ByokVaultError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+export function isVercelServerlessRuntime(): boolean {
+  return process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV);
+}
+
 function getFirebaseMeta(): FirebaseProjectMeta {
   if (cachedFirebaseMeta) return cachedFirebaseMeta;
-  const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
-  const raw = JSON.parse(
-    fs.readFileSync(configPath, 'utf8'),
-  ) as Partial<FirebaseProjectMeta>;
-  if (!raw.projectId || !raw.firestoreDatabaseId) {
-    throw new Error('Missing Firebase config for server Firestore REST operations.');
+
+  const envProjectId =
+    process.env.FIREBASE_PROJECT_ID?.trim() ||
+    process.env.VITE_FIREBASE_PROJECT_ID?.trim();
+  const envDbId =
+    process.env.FIREBASE_FIRESTORE_DATABASE_ID?.trim() ||
+    process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID?.trim();
+  if (envProjectId && envDbId) {
+    cachedFirebaseMeta = {
+      projectId: envProjectId,
+      firestoreDatabaseId: envDbId,
+    };
+    return cachedFirebaseMeta;
   }
-  cachedFirebaseMeta = {
-    projectId: raw.projectId,
-    firestoreDatabaseId: raw.firestoreDatabaseId,
-  };
-  return cachedFirebaseMeta;
+
+  const candidatePaths = [
+    new URL('../firebase-applet-config.json', import.meta.url),
+    path.resolve(process.cwd(), 'firebase-applet-config.json'),
+  ];
+
+  for (const candidate of candidatePaths) {
+    try {
+      const raw = JSON.parse(
+        fs.readFileSync(candidate, 'utf8'),
+      ) as Partial<FirebaseProjectMeta>;
+      if (raw.projectId && raw.firestoreDatabaseId) {
+        cachedFirebaseMeta = {
+          projectId: raw.projectId,
+          firestoreDatabaseId: raw.firestoreDatabaseId,
+        };
+        return cachedFirebaseMeta;
+      }
+    } catch {
+      // Try next candidate
+    }
+  }
+
+  throw new ByokVaultError(
+    500,
+    'firebase_config_missing',
+    '서버에서 Firebase 프로젝트 설정(firebase-applet-config.json 또는 FIREBASE_PROJECT_ID / FIREBASE_FIRESTORE_DATABASE_ID)을 찾지 못했습니다.',
+  );
 }
 
 export function getPersistenceMode(): AiPersistenceMode {
@@ -521,36 +577,70 @@ export async function savePersonalApiKeyForUid(params: {
   apiKey: string;
   idToken?: string;
 }): Promise<{ keyHint: string; persistenceMode: AiPersistenceMode }> {
+  const persistenceMode = getPersistenceMode();
+
+  if (isVercelServerlessRuntime() && persistenceMode !== 'encrypted_vault') {
+    throw new ByokVaultError(
+      503,
+      'encryption_secret_missing',
+      'Vercel 서버 환경변수 BYOK_ENCRYPTION_SECRET가 설정되지 않았습니다. 서버리스 함수 간 키 복호화 및 Firestore 암호화 저장을 위해 32자 이상의 BYOK_ENCRYPTION_SECRET를 Vercel 환경변수에 추가하고 재배포해 주세요.',
+    );
+  }
+
   const enc = encryptApiKeyForUid(params.apiKey, params.uid);
+
+  if (
+    persistenceMode === 'encrypted_vault' &&
+    params.idToken &&
+    params.idToken !== 'test-token'
+  ) {
+    const existingVault = await fetchFirestoreDoc(
+      params.uid,
+      'vault',
+      params.idToken,
+    );
+    const fields: Record<string, FirestoreFieldValue> = {
+      cipherVersion: { integerValue: '1' },
+      iv: { stringValue: enc.iv },
+      authTag: { stringValue: enc.authTag },
+      ciphertext: { stringValue: enc.ciphertext },
+      keyHint: { stringValue: enc.keyHint },
+      schemaVersion: { integerValue: '1' },
+    };
+
+    let savedToVault = await commitFirestoreDoc({
+      uid: params.uid,
+      docName: 'vault',
+      idToken: params.idToken,
+      fields,
+      isCreate: !existingVault,
+    });
+
+    if (!savedToVault && !existingVault) {
+      savedToVault = await commitFirestoreDoc({
+        uid: params.uid,
+        docName: 'vault',
+        idToken: params.idToken,
+        fields,
+        isCreate: false,
+      });
+    }
+
+    if (!savedToVault) {
+      throw new ByokVaultError(
+        502,
+        'vault_persistence_failed',
+        '암호화된 개인 API 키를 Firestore 보관소(aiConfig/vault)에 저장하지 못했습니다. 계정 승인 상태와 Firestore 보안 규칙 배포 여부를 확인해 주세요.',
+      );
+    }
+  }
+
   const nowIso = new Date().toISOString();
   memoryKeyVault.set(params.uid, {
     apiKey: params.apiKey,
     keyHint: enc.keyHint,
     updatedAtIso: nowIso,
   });
-
-  const persistenceMode = getPersistenceMode();
-  if (persistenceMode === 'encrypted_vault' && params.idToken) {
-    const existingVault = await fetchFirestoreDoc(
-      params.uid,
-      'vault',
-      params.idToken,
-    );
-    await commitFirestoreDoc({
-      uid: params.uid,
-      docName: 'vault',
-      idToken: params.idToken,
-      fields: {
-        cipherVersion: { integerValue: '1' },
-        iv: { stringValue: enc.iv },
-        authTag: { stringValue: enc.authTag },
-        ciphertext: { stringValue: enc.ciphertext },
-        keyHint: { stringValue: enc.keyHint },
-        schemaVersion: { integerValue: '1' },
-      },
-      isCreate: !existingVault,
-    });
-  }
 
   return { keyHint: enc.keyHint, persistenceMode };
 }

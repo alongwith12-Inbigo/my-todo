@@ -17,9 +17,11 @@ import {
 import {
   AI_LIMITS,
   type AiByokTestResponse,
+  type AiErrorCategory,
   type AiStatusResponse,
 } from '../../lib/aiTypes';
 import {
+  AiClientError,
   deleteByokApiKey,
   fetchAiServerStatus,
   saveByokApiKey,
@@ -56,8 +58,46 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
   const [testResult, setTestResult] = useState<AiByokTestResponse | null>(null);
   const [sectionFeedback, setSectionFeedback] = useState<{
     type: 'success' | 'error';
+    categoryLabel?: string;
     message: string;
+    warning?: string;
   } | null>(null);
+
+  function getCategoryLabel(category?: AiErrorCategory): string {
+    switch (category) {
+      case 'input_format':
+        return '입력 형식 오류';
+      case 'request_format':
+        return '요청 형식 오류';
+      case 'auth':
+        return '로그인·계정 승인 오류';
+      case 'encryption_config':
+        return '서버 암호화·보관소 설정 오류';
+      case 'gemini_api':
+        return 'Gemini API 연결 오류';
+      case 'network':
+        return '네트워크 통신 오류';
+      case 'server_internal':
+        return '서버 내부 오류';
+      default:
+        return '요청 오류';
+    }
+  }
+
+  function toErrorFeedback(err: unknown, fallbackMessage: string) {
+    if (err instanceof AiClientError) {
+      return {
+        type: 'error' as const,
+        categoryLabel: getCategoryLabel(err.category),
+        message: err.message,
+      };
+    }
+    return {
+      type: 'error' as const,
+      categoryLabel: '요청 오류',
+      message: err instanceof Error ? err.message : fallbackMessage,
+    };
+  }
 
   async function loadStatus() {
     setStatusLoading(true);
@@ -91,6 +131,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     if (!validation.valid || !validation.apiKey) {
       setSectionFeedback({
         type: 'error',
+        categoryLabel: getCategoryLabel(validation.category ?? 'input_format'),
         message: validation.message || '올바른 Gemini API 키를 입력해 주세요.',
       });
       return;
@@ -110,16 +151,13 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       setSectionFeedback({
         type: 'success',
         message: res.message,
+        warning: res.warning,
       });
       await loadStatus();
     } catch (err) {
-      setSectionFeedback({
-        type: 'error',
-        message:
-          err instanceof Error
-            ? err.message
-            : '개인 API 키 검증 및 등록에 실패했습니다.',
-      });
+      setSectionFeedback(
+        toErrorFeedback(err, '개인 API 키 검증 및 등록에 실패했습니다.'),
+      );
     } finally {
       setSavingKey(false);
     }
@@ -137,6 +175,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
         if (!validation.valid || !validation.apiKey) {
           setSectionFeedback({
             type: 'error',
+            categoryLabel: getCategoryLabel(validation.category ?? 'input_format'),
             message: validation.message || '올바른 Gemini API 키를 입력해 주세요.',
           });
           setTestingKey(false);
@@ -147,6 +186,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
         setSectionFeedback({
           type: 'success',
           message: res.message,
+          warning: res.warning,
         });
         return;
       }
@@ -155,15 +195,12 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       setSectionFeedback({
         type: 'success',
         message: res.message,
+        warning: res.warning,
       });
     } catch (err) {
-      setSectionFeedback({
-        type: 'error',
-        message:
-          err instanceof Error
-            ? err.message
-            : 'API 키 연결 테스트에 실패했습니다.',
-      });
+      setSectionFeedback(
+        toErrorFeedback(err, 'API 키 연결 테스트에 실패했습니다.'),
+      );
     } finally {
       setTestingKey(false);
     }
@@ -318,13 +355,23 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       {sectionFeedback && (
         <div
           role={sectionFeedback.type === 'error' ? 'alert' : 'status'}
-          className={`p-3.5 rounded-lg border text-xs font-medium ${
+          className={`p-3.5 rounded-lg border text-xs font-medium space-y-1 ${
             sectionFeedback.type === 'error'
               ? 'border-red-200 bg-red-50 text-red-800'
               : 'border-teal-200 bg-teal-50 text-teal-900'
           }`}
         >
-          {sectionFeedback.message}
+          {sectionFeedback.type === 'error' && sectionFeedback.categoryLabel && (
+            <p className="text-[11px] font-bold uppercase tracking-wide text-red-700">
+              [{sectionFeedback.categoryLabel}]
+            </p>
+          )}
+          <p>{sectionFeedback.message}</p>
+          {sectionFeedback.warning && (
+            <p className="text-amber-800 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5 mt-1 font-normal">
+              {sectionFeedback.warning}
+            </p>
+          )}
         </div>
       )}
 
@@ -334,6 +381,18 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
           className="p-3.5 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-900"
         >
           {statusError}
+        </div>
+      )}
+
+      {aiStatus?.serverlessRuntime && aiStatus.encryptionConfigured === false && (
+        <div
+          role="alert"
+          className="p-3.5 rounded-lg border border-amber-300 bg-amber-50 text-xs text-amber-950 space-y-1"
+        >
+          <p className="font-semibold">[서버 암호화 설정 안내] BYOK_ENCRYPTION_SECRET 미설정</p>
+          <p>
+            현재 Vercel 서버리스 환경에 <code className="font-mono bg-amber-100 px-1 rounded">BYOK_ENCRYPTION_SECRET</code> 환경변수가 설정되지 않아 개인 키를 영구 암호화 저장할 수 없습니다. 아래 「입력 키 테스트」로 연결 확인은 가능하지만, 저장·사용하려면 Vercel 프로젝트 환경변수에 32자 이상의 비밀키를 등록하고 재배포해 주세요.
+          </p>
         </div>
       )}
 
@@ -386,40 +445,68 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                 <div className="relative flex items-center">
                   <input
                     id="byok-api-key-input"
+                    name="gemini-api-key-byok"
                     type={showKeyInput ? 'text' : 'password'}
-                    autoComplete="off"
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
+                    data-bwignore="true"
+                    data-form-type="other"
                     spellCheck={false}
                     value={apiKeyInput}
-                    onChange={(e) => setApiKeyInput(e.target.value)}
+                    onChange={(e) => {
+                      setApiKeyInput(e.target.value);
+                      if (sectionFeedback?.type === 'error') {
+                        setSectionFeedback(null);
+                      }
+                    }}
                     onPaste={(e) => {
                       const pasted = e.clipboardData?.getData('text');
                       const el = e.currentTarget;
+                      const currentClean = normalizeGeminiApiKeyInput(apiKeyInput);
                       const replacesAll =
                         el.selectionStart === 0 &&
                         el.selectionEnd === apiKeyInput.length;
-                      if (typeof pasted === 'string' && (!apiKeyInput || replacesAll)) {
+                      if (typeof pasted === 'string' && (!currentClean || replacesAll)) {
                         e.preventDefault();
                         setApiKeyInput(normalizeGeminiApiKeyInput(pasted));
+                        if (sectionFeedback?.type === 'error') {
+                          setSectionFeedback(null);
+                        }
                       }
                     }}
-                    placeholder="AIza... 형태의 본인 API 키 입력"
-                    className="w-full pr-10 pl-3.5 py-2 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:border-teal-700"
+                    placeholder="AQ.... 또는 AIza... 형태의 본인 Gemini API 키 입력"
+                    className={`w-full ${apiKeyInput ? 'pr-20' : 'pr-10'} pl-3.5 py-2 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:border-teal-700`}
                   />
-                  <button
-                    type="button"
-                    onClick={() => setShowKeyInput((prev) => !prev)}
-                    aria-label={showKeyInput ? 'API 키 숨기기' : 'API 키 보기'}
-                    className="absolute right-2.5 p-1 text-slate-400 hover:text-slate-700 cursor-pointer"
-                  >
-                    {showKeyInput ? (
-                      <EyeOff className="w-4 h-4" aria-hidden="true" />
-                    ) : (
-                      <Eye className="w-4 h-4" aria-hidden="true" />
+                  <div className="absolute right-2 flex items-center gap-1">
+                    {apiKeyInput.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setApiKeyInput('');
+                          setSectionFeedback(null);
+                        }}
+                        className="px-1.5 py-0.5 text-[11px] font-medium text-slate-500 hover:text-slate-800 bg-slate-100 rounded cursor-pointer"
+                      >
+                        지우기
+                      </button>
                     )}
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowKeyInput((prev) => !prev)}
+                      aria-label={showKeyInput ? 'API 키 숨기기' : 'API 키 보기'}
+                      className="p-1 text-slate-400 hover:text-slate-700 cursor-pointer"
+                    >
+                      {showKeyInput ? (
+                        <EyeOff className="w-4 h-4" aria-hidden="true" />
+                      ) : (
+                        <Eye className="w-4 h-4" aria-hidden="true" />
+                      )}
+                    </button>
+                  </div>
                 </div>
                 <p className="mt-1 text-[11px] text-slate-500">
-                  입력한 키는 검증 후 브라우저 localStorage·sessionStorage에 남기지 않고 즉시 비워집니다. 앞뒤 공백·줄바꿈은 자동 제거됩니다.
+                  Google AI Studio의 신규 인증 키(AQ....)와 기존 표준 키(AIza...)를 모두 지원합니다. 입력한 키는 검증 후 브라우저 저장소에 남기지 않고 즉시 비워지며, 앞뒤 공백·줄바꿈·제어 문자는 자동 제거됩니다.
                 </p>
               </div>
 
@@ -489,14 +576,27 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
             </form>
 
             {testResult && testResult.ok && (
-              <div className="p-3 rounded-lg bg-teal-50/70 border border-teal-200 text-xs text-teal-900 flex items-center gap-2 tabular-nums">
-                <CheckCircle2 className="w-4 h-4 text-teal-700 shrink-0" aria-hidden="true" />
-                <span>
-                  연결 정상 · 모델 {testResult.model} · 응답 {testResult.latencyMs}ms
-                  {testResult.usage
-                    ? ` (토큰 ${testResult.usage.totalTokens})`
-                    : ''}
-                </span>
+              <div className="p-3 rounded-lg bg-teal-50/70 border border-teal-200 text-xs text-teal-900 space-y-1.5 tabular-nums">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-teal-700 shrink-0" aria-hidden="true" />
+                  <span>
+                    인증 정상
+                    {testResult.keyType === 'auth_aq'
+                      ? ' (AQ. 인증 키)'
+                      : testResult.keyType === 'standard_aiza'
+                        ? ' (AIza 표준 키)'
+                        : ''}
+                    {' · '}모델 {testResult.model} · 응답 {testResult.latencyMs}ms
+                    {testResult.usage
+                      ? ` (토큰 ${testResult.usage.totalTokens})`
+                      : ''}
+                  </span>
+                </div>
+                {testResult.warning && (
+                  <p className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                    {testResult.warning}
+                  </p>
+                )}
               </div>
             )}
           </div>
