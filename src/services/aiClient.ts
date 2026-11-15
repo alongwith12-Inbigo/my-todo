@@ -21,6 +21,7 @@ export class AiClientError extends Error {
   code: string;
   category?: AiErrorCategory;
   detailCode?: string;
+  diagnostic?: AiByokTestResponse;
 
   constructor(
     status: number,
@@ -28,6 +29,7 @@ export class AiClientError extends Error {
     message: string,
     category?: AiErrorCategory,
     detailCode?: string,
+    diagnostic?: AiByokTestResponse,
   ) {
     super(message);
     this.name = 'AiClientError';
@@ -35,6 +37,7 @@ export class AiClientError extends Error {
     this.code = code;
     this.category = category;
     this.detailCode = detailCode;
+    this.diagnostic = diagnostic;
   }
 }
 
@@ -132,7 +135,21 @@ async function fetchAiJson<T>(
         : payload === null
           ? `서버가 JSON 응답을 반환하지 못했습니다 (HTTP ${res.status}). Vercel API 함수 로그 또는 배포 상태를 확인해 주세요.`
           : `AI 요청이 실패했습니다 (HTTP ${res.status}). 기본 기능을 이용해 주세요.`;
-    throw new AiClientError(res.status, code, message, category, detailCode);
+    const diagnostic =
+      payload &&
+      typeof payload === 'object' &&
+      'configuredModel' in payload &&
+      'apiKeyAuthOk' in payload
+        ? (payload as AiByokTestResponse)
+        : undefined;
+    throw new AiClientError(
+      res.status,
+      code,
+      message,
+      category,
+      detailCode,
+      diagnostic,
+    );
   }
 
   return payload as T;

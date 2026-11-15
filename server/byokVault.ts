@@ -6,15 +6,21 @@ import {
   type AiPersistenceMode,
   type AiTokenUsage,
   type AiUsageSnapshot,
+  type GeminiApiKeyType,
 } from '../src/lib/aiTypes.ts';
 import { getKstDateParts } from '../src/lib/dateKst.ts';
 
 import {
+  detectGeminiApiKeyType,
   normalizeGeminiApiKeyInput,
   validateGeminiApiKeyFormat,
 } from '../src/lib/byokKeyFormat.ts';
 
-export { normalizeGeminiApiKeyInput, validateGeminiApiKeyFormat };
+export {
+  detectGeminiApiKeyType,
+  normalizeGeminiApiKeyInput,
+  validateGeminiApiKeyFormat,
+};
 
 export const BYOK_COOKIE_NAME = 'sp_byok_key';
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
@@ -22,9 +28,11 @@ const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
 // Random process secret used ONLY when BYOK_ENCRYPTION_SECRET is unset (session_memory_only mode).
 const EPHEMERAL_PROCESS_KEY = crypto.randomBytes(32);
 
+export const REDACTED_VAULT_KEY_HINT = 'hidden...key';
+
 interface StoredMemoryKey {
   apiKey: string;
-  keyHint: string;
+  keyType: GeminiApiKeyType;
   updatedAtIso: string;
 }
 
@@ -150,10 +158,8 @@ function getCipherKey(): Buffer {
   return EPHEMERAL_PROCESS_KEY;
 }
 
-export function maskGeminiApiKey(apiKey: string): string {
-  const trimmed = apiKey.trim();
-  if (trimmed.length <= 10) return '****...****';
-  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
+export function maskGeminiApiKey(_apiKey: string): string {
+  return REDACTED_VAULT_KEY_HINT;
 }
 
 export function encryptApiKeyForUid(
@@ -173,7 +179,7 @@ export function encryptApiKeyForUid(
     iv: iv.toString('base64url'),
     authTag: authTag.toString('base64url'),
     ciphertext: encrypted.toString('base64url'),
-    keyHint: maskGeminiApiKey(apiKey),
+    keyHint: REDACTED_VAULT_KEY_HINT,
   };
 }
 
@@ -576,7 +582,7 @@ export async function savePersonalApiKeyForUid(params: {
   uid: string;
   apiKey: string;
   idToken?: string;
-}): Promise<{ keyHint: string; persistenceMode: AiPersistenceMode }> {
+}): Promise<{ keyType: GeminiApiKeyType; persistenceMode: AiPersistenceMode }> {
   const persistenceMode = getPersistenceMode();
 
   if (isVercelServerlessRuntime() && persistenceMode !== 'encrypted_vault') {
@@ -588,6 +594,7 @@ export async function savePersonalApiKeyForUid(params: {
   }
 
   const enc = encryptApiKeyForUid(params.apiKey, params.uid);
+  const keyType = detectGeminiApiKeyType(params.apiKey);
 
   if (
     persistenceMode === 'encrypted_vault' &&
@@ -638,11 +645,11 @@ export async function savePersonalApiKeyForUid(params: {
   const nowIso = new Date().toISOString();
   memoryKeyVault.set(params.uid, {
     apiKey: params.apiKey,
-    keyHint: enc.keyHint,
+    keyType,
     updatedAtIso: nowIso,
   });
 
-  return { keyHint: enc.keyHint, persistenceMode };
+  return { keyType, persistenceMode };
 }
 
 export async function deletePersonalApiKeyForUid(params: {
@@ -659,26 +666,26 @@ export async function resolvePersonalApiKeyForUid(params: {
   uid: string;
   cookieHeader?: string | string[];
   idToken?: string;
-}): Promise<{ apiKey: string; keyHint: string } | null> {
+}): Promise<{ apiKey: string; keyType: GeminiApiKeyType } | null> {
   // 1. Check HttpOnly AES-256-GCM encrypted cookie bound to uid (0 Firestore reads)
   const cookies = parseCookies(params.cookieHeader);
   const fromCookie = unsealByokCookieValue(cookies[BYOK_COOKIE_NAME], params.uid);
   if (fromCookie) {
-    const keyHint = maskGeminiApiKey(fromCookie);
+    const keyType = detectGeminiApiKeyType(fromCookie);
     if (!memoryKeyVault.has(params.uid)) {
       memoryKeyVault.set(params.uid, {
         apiKey: fromCookie,
-        keyHint,
+        keyType,
         updatedAtIso: new Date().toISOString(),
       });
     }
-    return { apiKey: fromCookie, keyHint };
+    return { apiKey: fromCookie, keyType };
   }
 
   // 2. Check process memory vault (0 Firestore reads)
   const fromMemory = memoryKeyVault.get(params.uid);
   if (fromMemory) {
-    return { apiKey: fromMemory.apiKey, keyHint: fromMemory.keyHint };
+    return { apiKey: fromMemory.apiKey, keyType: fromMemory.keyType };
   }
 
   // 3. Check persistent AES-256-GCM encrypted Firestore vault if server master secret is set
@@ -694,13 +701,13 @@ export async function resolvePersonalApiKeyForUid(params: {
           params.uid,
         );
         if (decrypted) {
-          const keyHint = maskGeminiApiKey(decrypted);
+          const keyType = detectGeminiApiKeyType(decrypted);
           memoryKeyVault.set(params.uid, {
             apiKey: decrypted,
-            keyHint,
+            keyType,
             updatedAtIso: new Date().toISOString(),
           });
-          return { apiKey: decrypted, keyHint };
+          return { apiKey: decrypted, keyType };
         }
       }
     }

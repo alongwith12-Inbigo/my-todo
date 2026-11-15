@@ -48,10 +48,25 @@ export interface AiUsageSnapshot {
   lastUsedAtIso: string | null;
 }
 
+export type GeminiApiKeyType = 'auth_aq' | 'standard_aiza' | 'generic';
+
+export type GeminiDiagnosticErrorCategory =
+  | 'auth_failed'
+  | 'auth_header_error'
+  | 'model_permission_denied'
+  | 'model_not_supported'
+  | 'model_generate_unsupported'
+  | 'invalid_request_format'
+  | 'quota_exceeded'
+  | 'timeout'
+  | 'network'
+  | 'aborted'
+  | 'server_error';
+
 export interface AiStatusResponse {
   configured: boolean;
   hasPersonalKey: boolean;
-  keyHint: string | null;
+  keyType?: GeminiApiKeyType | null;
   persistenceMode: AiPersistenceMode;
   encryptionConfigured?: boolean;
   serverlessRuntime?: boolean;
@@ -65,17 +80,15 @@ export interface AiStatusResponse {
   maxNoticeChars: number;
 }
 
-export type GeminiApiKeyType = 'auth_aq' | 'standard_aiza' | 'generic';
-
 export interface AiByokSaveRequest {
   apiKey: string;
   testBeforeSave?: boolean;
+  verifyAuthBeforeSave?: boolean;
 }
 
 export interface AiByokSaveResponse {
   ok: boolean;
   hasPersonalKey: boolean;
-  keyHint: string;
   keyType?: GeminiApiKeyType;
   persistenceMode: AiPersistenceMode;
   message: string;
@@ -90,14 +103,22 @@ export interface AiByokTestRequest {
 export interface AiByokTestResponse {
   ok: boolean;
   model: string;
+  configuredModel: string;
+  apiKeyAuthOk: boolean;
+  modelAccessible: boolean;
+  generateContentOk: boolean;
   latencyMs: number;
-  keyHint: string | null;
   keyType?: GeminiApiKeyType;
   message: string;
   warning?: string;
   errorCode?: string;
   detailCode?: string;
   category?: AiErrorCategory;
+  diagnosticCategory?: GeminiDiagnosticErrorCategory;
+  upstreamHttpStatus?: number;
+  upstreamApiStatus?: string;
+  availableGenerateModels?: string[];
+  recommendedModel?: string | null;
   usage?: AiTokenUsage;
 }
 

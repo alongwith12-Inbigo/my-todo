@@ -16,6 +16,7 @@ import {
   buildTaskDetailsPatch,
   TaskValidationError,
 } from '../src/repositories/taskOperations.ts';
+import { ThinkingLevel } from '@google/genai';
 import {
   applyUsageIncrement,
   checkDailyQuotaForKind,
@@ -23,6 +24,7 @@ import {
   encryptApiKeyForUid,
   maskGeminiApiKey,
   normalizeGeminiApiKeyInput,
+  REDACTED_VAULT_KEY_HINT,
   sealByokCookieValue,
   unsealByokCookieValue,
   validateGeminiApiKeyFormat,
@@ -32,14 +34,18 @@ import {
   dispatchVercelAiRoute,
   handleAiPlannerRequest,
   handleAiStatusRequest,
+  handleDeleteByokKeyRequest,
   handleSaveByokKeyRequest,
   handleTestByokKeyRequest,
 } from '../server/aiRoutes.ts';
 import { mapGeminiError } from '../server/aiConfig.ts';
 import { ServerAuthError } from '../server/firebaseServerAuth.ts';
 import {
+  buildThinkingConfigForModel,
   createGeminiClient,
   GeminiServiceError,
+  generateDayPlanWithGemini,
+  inspectListedGeminiModels,
   testGeminiPersonalKey,
 } from '../server/geminiService.ts';
 import { SlidingWindowRateLimiter } from '../server/rateLimiter.ts';
@@ -472,10 +478,12 @@ test('BYOK AES-256-GCM encryption binds strictly to UID, masks key, validates fo
   assert.equal(validateGeminiApiKeyFormat('short').valid, false);
   assert.equal(validateGeminiApiKeyFormat('AIza with spaces 1234567890').valid, false);
   assert.equal(validateGeminiApiKeyFormat(sampleKey).valid, true);
-  assert.equal(maskGeminiApiKey(sampleKey), 'AIzaSy...3456');
+  assert.equal(maskGeminiApiKey(sampleKey), REDACTED_VAULT_KEY_HINT);
 
   const enc = encryptApiKeyForUid(sampleKey, 'uid-alpha');
   assert.ok(!enc.ciphertext.includes('AIza'));
+  assert.equal(enc.keyHint, REDACTED_VAULT_KEY_HINT);
+  assert.ok(!enc.keyHint.includes('AIza') && !enc.keyHint.includes('3456'));
   assert.equal(decryptApiKeyForUid(enc, 'uid-alpha'), sampleKey);
   assert.equal(decryptApiKeyForUid(enc, 'uid-beta'), null);
 
@@ -593,6 +601,7 @@ test('planner route requires caller personal key (no operator fallback) and supp
     { verifyAuth: activeAuth },
   );
   assert.equal(saveRes.status, 200);
+  assert.equal('keyHint' in (saveRes.body as Record<string, unknown>), false);
   const setCookie = String(saveRes.headers?.['Set-Cookie'] ?? '');
   assert.ok(setCookie.includes('HttpOnly'));
   assert.ok(!setCookie.includes('AIzaSyFakeKeyForSaveRoute12345678'));
@@ -870,11 +879,23 @@ test('BYOK routes distinguish input format, request JSON, auth, Vercel encryptio
   // 6. Gemini upstream errors map distinctly from input format / auth / encryption errors
   assert.equal(mapGeminiError(new Error('API_KEY_INVALID')).code, 'invalid_api_key');
   assert.equal(
-    mapGeminiError(new Error('PERMISSION_DENIED: API disabled')).code,
+    mapGeminiError(new Error('401 UNAUTHENTICATED: invalid credentials')).code,
     'api_key_permission_denied',
+  );
+  assert.equal(
+    mapGeminiError(new Error('403 PERMISSION_DENIED: model disabled')).code,
+    'model_permission_denied',
+  );
+  assert.equal(
+    mapGeminiError(
+      new Error('400 INVALID_ARGUMENT: Thinking level is not supported for this model.'),
+      'gemini-2.5-flash',
+    ).code,
+    'invalid_request_format',
   );
   assert.equal(mapGeminiError(new Error('404 model not found')).code, 'model_not_found');
   assert.equal(mapGeminiError(new Error('429 RESOURCE_EXHAUSTED')).code, 'ai_quota_exceeded');
+  assert.equal(mapGeminiError(new Error('504 DEADLINE_EXCEEDED')).code, 'ai_timeout');
 
   // 7. Vercel dispatcher returns clean JSON 500 if unexpected error is thrown
   let dispatchedStatus = 0;
@@ -905,7 +926,7 @@ test('BYOK routes distinguish input format, request JSON, auth, Vercel encryptio
   assert.equal(headersSent['Cache-Control'], 'no-store');
 });
 
-test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, Firestore vault limits, route metadata, and auth-first connection test', async () => {
+test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, redacted vault hint, and honest 5-part connection test', async () => {
   // 1. SDK authentication header verification: createGeminiClient injects x-goog-api-key (NEVER Authorization: Bearer)
   const dummyAqKey = 'AQ.Ab8RN6DummyAuthKeyForSdkHeaderCheck_0123456789';
   const client = createGeminiClient(` \uFEFF${dummyAqKey}\n `) as unknown as {
@@ -925,29 +946,37 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, Firestore
     'https://generativelanguage.googleapis.com/',
   );
 
-  // 2. Encryption & masking satisfy firestore.rules bounds even at 380-char AQ. keys
+  // 2. Encryption & redacted vault hint satisfy firestore.rules bounds with zero key characters exposed
   const longAqKey = `AQ.${'Ab8_Cd9-Ef0'.repeat(34)}XYZ`;
   assert.ok(longAqKey.length <= 380);
   const encLong = encryptApiKeyForUid(longAqKey, 'uid-aq-1');
   assert.ok(encLong.ciphertext.length <= 512);
+  assert.equal(encLong.keyHint, REDACTED_VAULT_KEY_HINT);
   assert.match(encLong.keyHint, /^.+\.\.\..+$/);
   assert.ok(encLong.keyHint.length >= 4 && encLong.keyHint.length <= 32);
+  assert.ok(!encLong.keyHint.includes('AQ.') && !encLong.keyHint.includes('XYZ'));
   assert.equal(decryptApiKeyForUid(encLong, 'uid-aq-1'), longAqKey);
   assert.equal(decryptApiKeyForUid(encLong, 'uid-aq-2'), null);
-  assert.equal(maskGeminiApiKey(dummyAqKey), 'AQ.Ab8...6789');
+  assert.equal(maskGeminiApiKey(dummyAqKey), REDACTED_VAULT_KEY_HINT);
 
-  // 3. auth-first connection test: models.list success verifies Gemini API authentication
+  // 3. Connection test passes ONLY when both models.list and generateContent succeed
   const okRes = await testGeminiPersonalKey(dummyAqKey, undefined, {
     models: {
       list: async () => ({
-        page: [{ name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] }],
+        page: [
+          { name: 'models/gemini-4-hydrogen', supportedActions: ['generateContent'] },
+          { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+        ],
       }),
       generateContent: async () => ({
         usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
       }),
     },
   });
-  assert.equal(okRes.authVerified, true);
+  assert.equal(okRes.ok, true);
+  assert.equal(okRes.apiKeyAuthOk, true);
+  assert.equal(okRes.modelAccessible, true);
+  assert.equal(okRes.generateContentOk, true);
   assert.equal(okRes.keyType, 'auth_aq');
   assert.equal(okRes.usage.totalTokens, 7);
   assert.equal(okRes.warning, undefined);
@@ -983,28 +1012,43 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, Firestore
     'gemini_auth_header_error',
   );
 
-  // 5. If models.list authenticates cleanly but configured model returns 404, fallback probe verifies auth without falsely claiming invalid key
-  const modelFallbackRes = await testGeminiPersonalKey(dummyAqKey, undefined, {
-    models: {
-      list: async () => ({
-        page: [{ name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] }],
-      }),
-      generateContent: async ({ model }) => {
-        if (model !== 'gemini-2.5-flash') {
-          throw new Error(`404 models/${model} is not found`);
-        }
-        return {
-          usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 },
-        };
+  // 5. CRITICAL: When models.list succeeds but configured model generateContent fails (404),
+  //    test must report ok=false, apiKeyAuthOk=true, generateContentOk=false (never mask as pass!)
+  const prevModel = process.env.GEMINI_MODEL;
+  let modelMismatchRes;
+  try {
+    process.env.GEMINI_MODEL = 'gemini-missing-model';
+    modelMismatchRes = await testGeminiPersonalKey(dummyAqKey, undefined, {
+      models: {
+        list: async () => ({
+          page: [{ name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] }],
+        }),
+        generateContent: async ({ model }) => {
+          if (model !== 'gemini-2.5-flash') {
+            throw new Error(`404 models/${model} is not found`);
+          }
+          return {
+            usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 },
+          };
+        },
       },
-    },
-  });
-  assert.equal(modelFallbackRes.authVerified, true);
-  assert.equal(modelFallbackRes.keyType, 'auth_aq');
-  assert.equal(modelFallbackRes.model, 'gemini-2.5-flash');
-  assert.ok(modelFallbackRes.warning && modelFallbackRes.warning.includes('GEMINI_MODEL'));
+    });
+  } finally {
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+  assert.equal(modelMismatchRes.ok, false);
+  assert.equal(modelMismatchRes.apiKeyAuthOk, true);
+  assert.equal(modelMismatchRes.modelAccessible, false);
+  assert.equal(modelMismatchRes.generateContentOk, false);
+  assert.equal(modelMismatchRes.configuredModel, 'gemini-missing-model');
+  assert.equal(modelMismatchRes.diagnosticCategory, 'model_not_supported');
+  assert.equal(modelMismatchRes.recommendedModel, 'gemini-2.5-flash');
+  assert.deepEqual(modelMismatchRes.availableGenerateModels, ['gemini-2.5-flash']);
+  assert.equal(modelMismatchRes.keyType, 'auth_aq');
+  assert.ok(modelMismatchRes.warning && modelMismatchRes.warning.includes('GEMINI_MODEL'));
 
-  // 6. Route test returns keyType='auth_aq' cleanly without exposing raw key
+  // 6. Route test returns structured 5-part diagnostic without keyHint or raw key
   const activeAuth = async () => ({
     uid: 'teacher-aq-1',
     email: 'aq@icedu.kr',
@@ -1019,16 +1063,232 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, Firestore
     },
     {
       verifyAuth: activeAuth,
-      testApiKey: async () => modelFallbackRes,
+      testApiKey: async () => modelMismatchRes,
     },
   );
   assert.equal(aqRouteRes.status, 200);
-  const aqBody = aqRouteRes.body as { ok: boolean; keyType: string; keyHint: string; warning?: string };
-  assert.equal(aqBody.ok, true);
+  const aqBody = aqRouteRes.body as Record<string, unknown>;
+  assert.equal(aqBody.ok, false);
+  assert.equal(aqBody.apiKeyAuthOk, true);
+  assert.equal(aqBody.generateContentOk, false);
+  assert.equal(aqBody.modelAccessible, false);
+  assert.equal(aqBody.configuredModel, 'gemini-missing-model');
   assert.equal(aqBody.keyType, 'auth_aq');
-  assert.equal(aqBody.keyHint, 'AQ.Ab8...6789');
-  assert.ok(aqBody.warning);
+  assert.equal('keyHint' in aqBody, false);
   assert.ok(!JSON.stringify(aqRouteRes.body).includes(dummyAqKey));
+  assert.ok(!JSON.stringify(aqRouteRes.body).includes('Ab8RN6'));
+  assert.ok(!JSON.stringify(aqRouteRes.body).includes('6789'));
 });
 
+test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on gemini-4, and day planner works + falls back on 404', async () => {
+  // 1. Model-aware thinkingConfig rules
+  assert.equal(buildThinkingConfigForModel('gemini-2.5-flash', 'probe'), undefined);
+  assert.equal(buildThinkingConfigForModel('gemini-2.5-flash', 'low_reasoning'), undefined);
+  assert.equal(buildThinkingConfigForModel('gemini-2.5-pro', 'low_reasoning'), undefined);
+  assert.deepEqual(buildThinkingConfigForModel('gemini-4-hydrogen', 'probe'), {
+    thinkingLevel: ThinkingLevel.LOW,
+  });
+  assert.deepEqual(buildThinkingConfigForModel('gemini-3.1-flash-lite-preview', 'probe'), {
+    thinkingLevel: ThinkingLevel.MINIMAL,
+  });
+  assert.deepEqual(buildThinkingConfigForModel('gemini-3-flash-preview', 'low_reasoning'), {
+    thinkingLevel: ThinkingLevel.LOW,
+  });
 
+  // 2. inspectListedGeminiModels filters to active generateContent text models only
+  const inspection = inspectListedGeminiModels(
+    [
+      { name: 'models/text-embedding-004', supportedActions: ['embedContent'] },
+      { name: 'models/gemini-2.5-flash-tts', supportedActions: ['generateContent'] },
+      { name: 'models/gemini-2.0-flash', supportedActions: ['generateContent'] },
+      { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+      { name: 'models/gemini-3-flash-preview', supportedActions: ['generateContent'] },
+    ],
+    'gemini-missing-test',
+  );
+  assert.deepEqual(inspection.availableGenerateModels, [
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash',
+  ]);
+  assert.equal(inspection.recommendedFallbackModel, 'gemini-3-flash-preview');
+
+  const samplePlannerInput = {
+    todayKey: '2026-11-16',
+    currentTimeHhMm: '09:00',
+    totalIncompleteCount: 1,
+    overdueCount: 0,
+    dueTodayCount: 1,
+    timetableConfigured: true,
+    remainingWorkableMinutes: 50,
+    workableSlots: [{ st: '10:00', et: '10:50', min: 50, lb: '2교시 공강' }],
+    blockedEventsSummary: [],
+    academicAlertsSummary: [],
+    tasks: [
+      { id: 't1', t: '가정통신문 결재', d: '2026-11-16', ov: false, dd: 0, p: 'u' as const, s: 'td' as const, m: 25, tdy: true },
+    ],
+  };
+
+  const prevModel = process.env.GEMINI_MODEL;
+  try {
+    // 3. With GEMINI_MODEL=gemini-2.5-flash, generateDayPlanWithGemini must omit thinkingConfig
+    process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+    const capturedConfigs: Array<Record<string, unknown> | undefined> = [];
+    const planOk = await generateDayPlanWithGemini(
+      'AQ.Ab8DummyPlannerKey_1234567890ABCDEF',
+      samplePlannerInput,
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async (params) => {
+            capturedConfigs.push(params.config);
+            return {
+              text: JSON.stringify({
+                coreAdvice: '2교시 공강에 긴급 결재를 완료하세요.',
+                recommendations: [
+                  {
+                    taskId: 't1',
+                    order: 1,
+                    recommendedStart: '10:00',
+                    recommendedEnd: '10:25',
+                    estimatedMinutes: 25,
+                    reason: '오늘 마감 긴급 업무입니다.',
+                  },
+                ],
+                attentionTasks: [],
+                deferredTasks: [],
+              }),
+              usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 40, totalTokenCount: 160 },
+            };
+          },
+        },
+      },
+    );
+    assert.equal(planOk.model, 'gemini-2.5-flash');
+    assert.equal(capturedConfigs.length, 1);
+    assert.equal(capturedConfigs[0]?.thinkingConfig, undefined);
+    assert.equal(planOk.rawPlan.recommendations[0].taskId, 't1');
+
+    // 4. When configured model returns 404 NOT_FOUND, planner looks up models.list and falls back to supported active model
+    process.env.GEMINI_MODEL = 'gemini-unavailable-alias';
+    const attemptedModels: string[] = [];
+    const planFallback = await generateDayPlanWithGemini(
+      'AQ.Ab8DummyPlannerKey_1234567890ABCDEF',
+      samplePlannerInput,
+      undefined,
+      {
+        models: {
+          list: async () => ({
+            page: [
+              { name: 'models/text-embedding-004', supportedActions: ['embedContent'] },
+              { name: 'models/gemini-2.5-flash-tts', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+            ],
+          }),
+          generateContent: async (params) => {
+            attemptedModels.push(params.model);
+            if (params.model === 'gemini-unavailable-alias') {
+              throw new Error('404 models/gemini-unavailable-alias is not found');
+            }
+            return {
+              text: JSON.stringify({
+                coreAdvice: '대체 모델로 계획을 생성했습니다.',
+                recommendations: [],
+                attentionTasks: [],
+                deferredTasks: [],
+              }),
+              usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 30, totalTokenCount: 130 },
+            };
+          },
+        },
+      },
+    );
+    assert.deepEqual(attemptedModels, ['gemini-unavailable-alias', 'gemini-2.5-flash']);
+    assert.equal(planFallback.model, 'gemini-2.5-flash');
+
+    // 5. Permission denied (403) must NOT be hidden or retried as model_not_found
+    process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+    await assert.rejects(
+      () =>
+        generateDayPlanWithGemini(
+          'AQ.Ab8DummyPlannerKey_1234567890ABCDEF',
+          samplePlannerInput,
+          undefined,
+          {
+            models: {
+              list: async () => ({
+                page: [{ name: 'models/gemini-3-flash-preview', supportedActions: ['generateContent'] }],
+              }),
+              generateContent: async () => {
+                throw new Error('403 PERMISSION_DENIED: model not permitted for project');
+              },
+            },
+          },
+        ),
+      (err: unknown) =>
+        err instanceof GeminiServiceError &&
+        err.code === 'model_permission_denied' &&
+        err.diagnosticCategory === 'model_permission_denied' &&
+        err.upstreamHttpStatus === 403,
+    );
+  } finally {
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
+test('verifyAuthBeforeSave avoids generateContent on save, and no route ever exposes keyHint or partial key strings', async () => {
+  const activeAuth = async () => ({
+    uid: 'teacher-no-leak-1',
+    email: 'noleak@icedu.kr',
+    emailVerified: true,
+    accessStatus: 'active' as const,
+    role: 'teacher',
+  });
+  const aqDummyKey = 'AQ.Ab8RN6DummySecretKeyNeverExpose_TvAg99';
+  let authOnlyCalls = 0;
+  let generateProbeCalls = 0;
+
+  const saveRes = await handleSaveByokKeyRequest(
+    {
+      authorizationHeader: 'Bearer test-token',
+      body: { apiKey: aqDummyKey, verifyAuthBeforeSave: true },
+      isSecure: false,
+    },
+    {
+      verifyAuth: activeAuth,
+      verifyKeyAuthOnly: async (key) => {
+        authOnlyCalls += 1;
+        assert.equal(key, aqDummyKey);
+        return { keyType: 'auth_aq', availableGenerateModels: ['gemini-2.5-flash'] };
+      },
+      testApiKey: async () => {
+        generateProbeCalls += 1;
+        throw new Error('testApiKey must NOT run during verifyAuthBeforeSave');
+      },
+    },
+  );
+  assert.equal(saveRes.status, 200);
+  assert.equal(authOnlyCalls, 1);
+  assert.equal(generateProbeCalls, 0);
+
+  const statusRes = await handleAiStatusRequest('Bearer test-token', {
+    verifyAuth: activeAuth,
+  });
+  assert.equal(statusRes.status, 200);
+
+  const delRes = await handleDeleteByokKeyRequest(
+    { authorizationHeader: 'Bearer test-token', isSecure: false },
+    { verifyAuth: activeAuth },
+  );
+  assert.equal(delRes.status, 200);
+
+  for (const res of [saveRes, statusRes, delRes]) {
+    const bodyObj = res.body as Record<string, unknown>;
+    assert.equal('keyHint' in bodyObj, false);
+    const serialized = JSON.stringify(bodyObj);
+    assert.ok(!serialized.includes('AQ.Ab8'));
+    assert.ok(!serialized.includes('TvAg'));
+    assert.ok(!serialized.includes(aqDummyKey));
+  }
+});

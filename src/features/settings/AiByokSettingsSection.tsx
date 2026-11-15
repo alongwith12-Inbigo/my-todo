@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import {
+  AlertTriangle,
   CheckCircle2,
   Eye,
   EyeOff,
@@ -19,6 +20,7 @@ import {
   type AiByokTestResponse,
   type AiErrorCategory,
   type AiStatusResponse,
+  type GeminiDiagnosticErrorCategory,
 } from '../../lib/aiTypes';
 import {
   AiClientError,
@@ -84,11 +86,42 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     }
   }
 
+  function getDiagnosticErrorLabel(diag?: GeminiDiagnosticErrorCategory): string {
+    switch (diag) {
+      case 'auth_failed':
+        return 'API 키 인증 오류';
+      case 'auth_header_error':
+        return 'API 인증 헤더 오류';
+      case 'model_permission_denied':
+        return '모델 접근 권한 오류';
+      case 'model_not_supported':
+        return '모델 미지원 / 찾을 수 없음';
+      case 'model_generate_unsupported':
+        return 'generateContent 미지원 모델';
+      case 'invalid_request_format':
+        return '요청 형식 / 파라미터 오류';
+      case 'quota_exceeded':
+        return 'API 호출 한도 초과';
+      case 'timeout':
+        return '응답 시간 초과';
+      case 'network':
+        return '네트워크 통신 오류';
+      case 'aborted':
+        return '요청 취소';
+      case 'server_error':
+        return 'Gemini 서버 오류';
+      default:
+        return '모델 호출 오류';
+    }
+  }
+
   function toErrorFeedback(err: unknown, fallbackMessage: string) {
     if (err instanceof AiClientError) {
       return {
         type: 'error' as const,
-        categoryLabel: getCategoryLabel(err.category),
+        categoryLabel: err.diagnostic?.diagnosticCategory
+          ? getDiagnosticErrorLabel(err.diagnostic.diagnosticCategory)
+          : getCategoryLabel(err.category),
         message: err.message,
       };
     }
@@ -143,7 +176,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     try {
       const res = await saveByokApiKey({
         apiKey: validation.apiKey,
-        testBeforeSave: true,
+        verifyAuthBeforeSave: true,
       });
       // Immediately clear key from component state after submission
       setApiKeyInput('');
@@ -161,6 +194,26 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     } finally {
       setSavingKey(false);
     }
+  }
+
+  function applyTestResponse(res: AiByokTestResponse) {
+    setTestResult(res);
+    if (res.ok && res.apiKeyAuthOk && res.generateContentOk) {
+      setSectionFeedback({
+        type: 'success',
+        message: res.message,
+        warning: res.warning,
+      });
+      return;
+    }
+    setSectionFeedback({
+      type: 'error',
+      categoryLabel: res.diagnosticCategory
+        ? getDiagnosticErrorLabel(res.diagnosticCategory)
+        : 'Gemini 모델 호출 오류',
+      message: res.message,
+      warning: res.warning,
+    });
   }
 
   async function handleTestKey() {
@@ -182,22 +235,15 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
           return;
         }
         const res = await testByokApiKey({ apiKey: validation.apiKey });
-        setTestResult(res);
-        setSectionFeedback({
-          type: 'success',
-          message: res.message,
-          warning: res.warning,
-        });
+        applyTestResponse(res);
         return;
       }
       const res = await testByokApiKey({});
-      setTestResult(res);
-      setSectionFeedback({
-        type: 'success',
-        message: res.message,
-        warning: res.warning,
-      });
+      applyTestResponse(res);
     } catch (err) {
+      if (err instanceof AiClientError && err.diagnostic) {
+        setTestResult(err.diagnostic);
+      }
       setSectionFeedback(
         toErrorFeedback(err, 'API 키 연결 테스트에 실패했습니다.'),
       );
@@ -409,14 +455,20 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                 </h3>
               </div>
               <span
-                className={`px-2 py-0.5 text-[11px] font-semibold rounded-md border whitespace-nowrap ${
+                className={`px-2.5 py-0.5 text-[11px] font-semibold rounded-md border whitespace-nowrap ${
                   hasPersonalKey
                     ? 'border-teal-200 bg-teal-50 text-teal-800'
                     : 'border-slate-200 bg-slate-50 text-slate-600'
                 }`}
               >
                 {hasPersonalKey
-                  ? `등록됨 (${aiStatus?.keyHint ?? '****'})`
+                  ? `등록 완료 · 개인 API 키${
+                      aiStatus?.keyType === 'auth_aq'
+                        ? ' (신규 인증 키)'
+                        : aiStatus?.keyType === 'standard_aiza'
+                          ? ' (기존 표준 키)'
+                          : ''
+                    }`
                   : '미등록'}
               </span>
             </div>
@@ -573,27 +625,115 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                   </div>
                 )}
               </div>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                「저장」은 토큰을 소모하지 않는 인증 확인만 수행하며, 「테스트」 버튼을 직접 누를 때만 최소 토큰으로 실제 <code className="font-mono bg-slate-100 px-1 rounded">generateContent</code> 호출을 확인합니다(소량의 API 사용량이 발생할 수 있음).
+              </p>
             </form>
 
-            {testResult && testResult.ok && (
-              <div className="p-3 rounded-lg bg-teal-50/70 border border-teal-200 text-xs text-teal-900 space-y-1.5 tabular-nums">
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-teal-700 shrink-0" aria-hidden="true" />
-                  <span>
-                    인증 정상
-                    {testResult.keyType === 'auth_aq'
-                      ? ' (AQ. 인증 키)'
-                      : testResult.keyType === 'standard_aiza'
-                        ? ' (AIza 표준 키)'
-                        : ''}
-                    {' · '}모델 {testResult.model} · 응답 {testResult.latencyMs}ms
-                    {testResult.usage
-                      ? ` (토큰 ${testResult.usage.totalTokens})`
+            {testResult && (
+              <div
+                className={`p-3.5 rounded-lg border text-xs space-y-2.5 tabular-nums ${
+                  testResult.ok
+                    ? 'bg-teal-50/70 border-teal-200 text-teal-950'
+                    : 'bg-red-50/70 border-red-200 text-red-950'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 font-semibold">
+                    {testResult.ok ? (
+                      <CheckCircle2 className="w-4 h-4 text-teal-700 shrink-0" aria-hidden="true" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 text-red-700 shrink-0" aria-hidden="true" />
+                    )}
+                    <span>
+                      {testResult.ok ? '모델 연결 진단 · 정상' : '모델 연결 진단 · 확인 필요'}
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-slate-600">
+                    응답 {testResult.latencyMs}ms
+                    {testResult.usage && testResult.usage.totalTokens > 0
+                      ? ` · 토큰 ${testResult.usage.totalTokens}`
                       : ''}
                   </span>
                 </div>
+
+                <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1.5 pt-2 border-t border-slate-200/70 text-[11px]">
+                  <div className="flex items-center justify-between gap-2">
+                    <dt className="text-slate-600">1. API 키 인증</dt>
+                    <dd
+                      className={`font-semibold ${
+                        testResult.apiKeyAuthOk ? 'text-teal-800' : 'text-red-700'
+                      }`}
+                    >
+                      {testResult.apiKeyAuthOk ? '정상' : '실패'}
+                      {testResult.keyType === 'auth_aq'
+                        ? ' (신규 인증 키)'
+                        : testResult.keyType === 'standard_aiza'
+                          ? ' (기존 표준 키)'
+                          : ''}
+                    </dd>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <dt className="text-slate-600">2. 현재 설정 모델</dt>
+                    <dd className="font-mono font-semibold text-slate-900">
+                      {testResult.configuredModel}
+                    </dd>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <dt className="text-slate-600">3. 모델 접근 가능 여부</dt>
+                    <dd
+                      className={`font-semibold ${
+                        testResult.modelAccessible ? 'text-teal-800' : 'text-red-700'
+                      }`}
+                    >
+                      {testResult.modelAccessible ? '가능 (generateContent 지원)' : '불가'}
+                    </dd>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <dt className="text-slate-600">4. generateContent 호출</dt>
+                    <dd
+                      className={`font-semibold ${
+                        testResult.generateContentOk ? 'text-teal-800' : 'text-red-700'
+                      }`}
+                    >
+                      {testResult.generateContentOk ? '성공' : '실패'}
+                    </dd>
+                  </div>
+
+                  <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-200/60">
+                    <dt className="text-slate-600">5. 오류 유형</dt>
+                    <dd className="font-semibold text-slate-900">
+                      {testResult.ok
+                        ? '오류 없음'
+                        : `${getDiagnosticErrorLabel(testResult.diagnosticCategory)}${
+                            typeof testResult.upstreamHttpStatus === 'number'
+                              ? ` (HTTP ${testResult.upstreamHttpStatus}${
+                                  testResult.upstreamApiStatus
+                                    ? ` · ${testResult.upstreamApiStatus}`
+                                    : ''
+                                })`
+                              : ''
+                          }`}
+                    </dd>
+                  </div>
+                </dl>
+
+                {!testResult.ok &&
+                  testResult.availableGenerateModels &&
+                  testResult.availableGenerateModels.length > 0 && (
+                    <p className="text-[11px] text-slate-700 bg-white/80 border border-slate-200 rounded px-2.5 py-1.5 leading-relaxed">
+                      <strong className="font-semibold">계정에서 조회된 generateContent 지원 모델:</strong>{' '}
+                      <span className="font-mono">
+                        {testResult.availableGenerateModels.join(', ')}
+                      </span>
+                    </p>
+                  )}
+
                 {testResult.warning && (
-                  <p className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                  <p className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5 leading-relaxed">
                     {testResult.warning}
                   </p>
                 )}

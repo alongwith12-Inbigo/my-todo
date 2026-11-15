@@ -11,6 +11,7 @@ import {
   type AiStatusResponse,
   type AiTokenUsage,
   type GeminiApiKeyType,
+  type GeminiDiagnosticErrorCategory,
 } from '../src/lib/aiTypes.ts';
 import { detectGeminiApiKeyType } from '../src/lib/byokKeyFormat.ts';
 import { getAiStatusBasePayload, getGeminiModelName } from './aiConfig.ts';
@@ -25,7 +26,6 @@ import {
   getPersistenceMode,
   isVercelServerlessRuntime,
   loadUserAiState,
-  maskGeminiApiKey,
   normalizeGeminiApiKeyInput,
   releaseUidInFlightLock,
   resolvePersonalApiKeyForUid,
@@ -46,6 +46,8 @@ import {
   generateBriefingWithGemini,
   generateDayPlanWithGemini,
   testGeminiPersonalKey,
+  verifyGeminiKeyAuthOnly,
+  type GeminiPersonalKeyTestResult,
 } from './geminiService.ts';
 import { SlidingWindowRateLimiter } from './rateLimiter.ts';
 
@@ -69,7 +71,7 @@ export interface AiRouteDeps {
     uid: string;
     cookieHeader?: string | string[];
     idToken?: string;
-  }) => Promise<{ apiKey: string; keyHint: string } | null>;
+  }) => Promise<{ apiKey: string; keyType?: GeminiApiKeyType } | null>;
   analyzeNotice?: (
     input: AiAnalyzeNoticeRequest,
     signal?: AbortSignal,
@@ -85,16 +87,19 @@ export interface AiRouteDeps {
     signal?: AbortSignal,
     apiKey?: string,
   ) => Promise<AiPlannerResponse>;
+  verifyKeyAuthOnly?: (
+    apiKey: string,
+    signal?: AbortSignal,
+  ) => Promise<{ keyType: GeminiApiKeyType; availableGenerateModels: string[] }>;
   testApiKey?: (
     apiKey: string,
     signal?: AbortSignal,
-  ) => Promise<{
-    model: string;
-    usage: AiTokenUsage;
-    authVerified?: boolean;
-    keyType?: GeminiApiKeyType;
-    warning?: string;
-  }>;
+  ) => Promise<
+    Partial<GeminiPersonalKeyTestResult> & {
+      model: string;
+      usage: AiTokenUsage;
+    }
+  >;
 }
 
 const defaultRateLimiter = new SlidingWindowRateLimiter(
@@ -120,6 +125,7 @@ function resolveDeps(deps: AiRouteDeps = {}) {
       deps.generateDayPlan ??
       ((input: AiPlannerRequest, signal?: AbortSignal, apiKey?: string) =>
         generateDayPlanWithGemini(apiKey ?? '', input, signal)),
+    verifyKeyAuthOnly: deps.verifyKeyAuthOnly ?? verifyGeminiKeyAuthOnly,
     testApiKey: deps.testApiKey ?? testGeminiPersonalKey,
   };
 }
@@ -213,7 +219,7 @@ async function resolveCallerKeyOrError(params: {
   cookieHeader?: string | string[];
   idToken?: string;
   resolvedDeps: ReturnType<typeof resolveDeps>;
-}): Promise<{ apiKey: string; keyHint: string } | AiRouteResult> {
+}): Promise<{ apiKey: string; keyType?: GeminiApiKeyType } | AiRouteResult> {
   if (params.resolvedDeps.isConfiguredOverride) {
     if (!params.resolvedDeps.isConfiguredOverride()) {
       return {
@@ -226,7 +232,7 @@ async function resolveCallerKeyOrError(params: {
         },
       };
     }
-    return { apiKey: 'test-injected-key', keyHint: 'test...key' };
+    return { apiKey: 'test-injected-key', keyType: 'generic' };
   }
 
   const found = await params.resolvedDeps.resolveApiKey({
@@ -271,7 +277,7 @@ export async function handleAiStatusRequest(
 
     const personalKey = resolved.isConfiguredOverride
       ? resolved.isConfiguredOverride()
-        ? { apiKey: 'test', keyHint: 'test...key' }
+        ? { apiKey: 'test', keyType: 'generic' as GeminiApiKeyType }
         : null
       : await resolved.resolveApiKey({
           uid: user.uid,
@@ -286,7 +292,7 @@ export async function handleAiStatusRequest(
     const body: AiStatusResponse = {
       configured: Boolean(personalKey),
       hasPersonalKey: Boolean(personalKey),
-      keyHint: personalKey?.keyHint ?? null,
+      keyType: personalKey ? (personalKey.keyType ?? detectGeminiApiKeyType(personalKey.apiKey)) : null,
       persistenceMode,
       encryptionConfigured: persistenceMode === 'encrypted_vault',
       serverlessRuntime: isVercelServerlessRuntime(),
@@ -349,6 +355,8 @@ export async function handleSaveByokKeyRequest(
       const testRes = await resolved.testApiKey(validation.apiKey, params.signal);
       testUsage = testRes.usage;
       testWarning = testRes.warning;
+    } else if (rawBody.verifyAuthBeforeSave === true) {
+      await resolved.verifyKeyAuthOnly(validation.apiKey, params.signal);
     }
 
     const saved = await savePersonalApiKeyForUid({
@@ -385,7 +393,6 @@ export async function handleSaveByokKeyRequest(
       body: {
         ok: true,
         hasPersonalKey: true,
-        keyHint: saved.keyHint,
         keyType,
         persistenceMode: saved.persistenceMode,
         message:
@@ -421,7 +428,7 @@ export async function handleTestByokKeyRequest(
     const rawBody = parsedBody.data;
 
     let targetKey: string | null = null;
-    let keyHint: string | null = null;
+    let resolvedKeyType: GeminiApiKeyType | undefined;
 
     if (
       typeof rawBody.apiKey === 'string' &&
@@ -442,7 +449,7 @@ export async function handleTestByokKeyRequest(
         };
       }
       targetKey = validation.apiKey;
-      keyHint = maskGeminiApiKey(validation.apiKey);
+      resolvedKeyType = validation.keyType ?? detectGeminiApiKeyType(validation.apiKey);
     } else {
       const stored = await resolved.resolveApiKey({
         uid: user.uid,
@@ -475,41 +482,82 @@ export async function handleTestByokKeyRequest(
         };
       }
       targetKey = stored.apiKey;
-      keyHint = stored.keyHint;
+      resolvedKeyType = stored.keyType ?? detectGeminiApiKeyType(stored.apiKey);
     }
 
     const startMs = Date.now();
     const res = await resolved.testApiKey(targetKey, params.signal);
     const latencyMs = Math.max(1, Date.now() - startMs);
-    const keyType = res.keyType ?? detectGeminiApiKeyType(targetKey);
+    const keyType = res.keyType ?? resolvedKeyType ?? detectGeminiApiKeyType(targetKey);
+    const configuredModel = res.configuredModel ?? getGeminiModelName();
+    const apiKeyAuthOk = res.apiKeyAuthOk ?? true;
+    const generateContentOk = res.generateContentOk ?? (res.ok ?? true);
+    const modelAccessible = res.modelAccessible ?? generateContentOk;
+    const overallOk = Boolean(res.ok ?? (apiKeyAuthOk && generateContentOk));
 
     return {
       status: 200,
       headers: { 'Cache-Control': 'no-store' },
       body: {
-        ok: true,
+        ok: overallOk,
         model: res.model,
+        configuredModel,
+        apiKeyAuthOk,
+        modelAccessible,
+        generateContentOk,
         latencyMs,
-        keyHint,
         keyType,
-        message: `개인 API 키 인증 확인 완료 (${res.model}, ${latencyMs}ms)`,
+        message:
+          res.message ||
+          (overallOk
+            ? `개인 API 키 인증 및 모델(${res.model}) 호출 확인 완료 (${latencyMs}ms)`
+            : `API 키 인증은 정상이나 설정 모델(${configuredModel}) generateContent 호출에 실패했습니다.`),
+        ...(res.errorCode ? { errorCode: res.errorCode } : {}),
+        ...(res.diagnosticCategory ? { diagnosticCategory: res.diagnosticCategory } : {}),
+        ...(typeof res.upstreamHttpStatus === 'number'
+          ? { upstreamHttpStatus: res.upstreamHttpStatus }
+          : {}),
+        ...(res.upstreamApiStatus ? { upstreamApiStatus: res.upstreamApiStatus } : {}),
+        ...(res.availableGenerateModels
+          ? { availableGenerateModels: res.availableGenerateModels }
+          : {}),
+        ...(res.recommendedModel !== undefined
+          ? { recommendedModel: res.recommendedModel }
+          : {}),
         ...(res.warning ? { warning: res.warning } : {}),
         usage: res.usage,
       },
     };
   } catch (err) {
     if (err instanceof GeminiServiceError) {
+      const configuredModel = getGeminiModelName();
+      const isAuthFailure =
+        err.diagnosticCategory === 'auth_failed' ||
+        err.diagnosticCategory === 'auth_header_error' ||
+        err.code === 'invalid_api_key' ||
+        err.code === 'api_key_permission_denied' ||
+        err.code === 'gemini_auth_header_error';
       return {
         status: err.status,
         headers: { 'Cache-Control': 'no-store' },
         body: {
           ok: false,
-          model: getGeminiModelName(),
+          model: configuredModel,
+          configuredModel,
+          apiKeyAuthOk: !isAuthFailure,
+          modelAccessible: false,
+          generateContentOk: false,
           latencyMs: 0,
-          keyHint: null,
           error: err.code,
           errorCode: err.code,
           category: 'gemini_api' satisfies AiErrorCategory,
+          ...(err.diagnosticCategory
+            ? { diagnosticCategory: err.diagnosticCategory satisfies GeminiDiagnosticErrorCategory }
+            : {}),
+          ...(typeof err.upstreamHttpStatus === 'number'
+            ? { upstreamHttpStatus: err.upstreamHttpStatus }
+            : {}),
+          ...(err.upstreamApiStatus ? { upstreamApiStatus: err.upstreamApiStatus } : {}),
           message: err.message,
         },
       };

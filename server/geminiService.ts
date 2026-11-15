@@ -12,12 +12,17 @@ import {
   type AiRawNoticeOutput,
   type AiTokenUsage,
   type GeminiApiKeyType,
+  type GeminiDiagnosticErrorCategory,
 } from '../src/lib/aiTypes.ts';
 import {
   detectGeminiApiKeyType,
   normalizeGeminiApiKeyInput,
 } from '../src/lib/byokKeyFormat.ts';
-import { getGeminiModelName, mapGeminiError } from './aiConfig.ts';
+import {
+  getGeminiModelName,
+  mapGeminiError,
+  type MappedGeminiError,
+} from './aiConfig.ts';
 
 const NOTICE_RESPONSE_SCHEMA: Schema = {
   type: Type.OBJECT,
@@ -256,13 +261,61 @@ async function runWithTimeoutAndAbort<T>(
 export class GeminiServiceError extends Error {
   status: number;
   code: string;
+  diagnosticCategory?: GeminiDiagnosticErrorCategory;
+  upstreamHttpStatus?: number;
+  upstreamApiStatus?: string;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    extra?: {
+      diagnosticCategory?: GeminiDiagnosticErrorCategory;
+      upstreamHttpStatus?: number;
+      upstreamApiStatus?: string;
+    },
+  ) {
     super(message);
     this.name = 'GeminiServiceError';
     this.status = status;
     this.code = code;
+    this.diagnosticCategory = extra?.diagnosticCategory;
+    this.upstreamHttpStatus = extra?.upstreamHttpStatus;
+    this.upstreamApiStatus = extra?.upstreamApiStatus;
   }
+}
+
+function toServiceError(mapped: MappedGeminiError): GeminiServiceError {
+  return new GeminiServiceError(mapped.status, mapped.code, mapped.message, {
+    diagnosticCategory: mapped.diagnosticCategory,
+    upstreamHttpStatus: mapped.upstreamHttpStatus,
+    upstreamApiStatus: mapped.upstreamApiStatus,
+  });
+}
+
+/**
+ * thinkingConfig.thinkingLevel is only supported on Gemini 3 and Gemini 4 models.
+ * Passing thinkingLevel to Gemini 2.5 models causes HTTP 400 INVALID_ARGUMENT,
+ * and passing ThinkingLevel.MINIMAL to gemini-4-* models also causes a 400 error.
+ */
+export function buildThinkingConfigForModel(
+  modelName: string,
+  mode: 'probe' | 'low_reasoning',
+): { thinkingLevel: ThinkingLevel } | undefined {
+  const short = modelName.replace(/^models\//, '').trim().toLowerCase();
+  if (short.startsWith('gemini-4-')) {
+    return { thinkingLevel: ThinkingLevel.LOW };
+  }
+  if (short.startsWith('gemini-3.1-flash-lite')) {
+    return {
+      thinkingLevel:
+        mode === 'probe' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+    };
+  }
+  if (short.startsWith('gemini-3')) {
+    return { thinkingLevel: ThinkingLevel.LOW };
+  }
+  return undefined;
 }
 
 export interface GeminiTestClientLike {
@@ -275,6 +328,7 @@ export interface GeminiTestClientLike {
       contents: string;
       config?: Record<string, unknown>;
     }) => Promise<{
+      text?: string;
       usageMetadata?: {
         promptTokenCount?: number;
         candidatesTokenCount?: number;
@@ -286,10 +340,21 @@ export interface GeminiTestClientLike {
 }
 
 export interface GeminiPersonalKeyTestResult {
+  ok: boolean;
   model: string;
+  configuredModel: string;
+  apiKeyAuthOk: boolean;
+  modelAccessible: boolean;
+  generateContentOk: boolean;
   usage: AiTokenUsage;
-  authVerified: boolean;
   keyType: GeminiApiKeyType;
+  diagnosticCategory?: GeminiDiagnosticErrorCategory;
+  upstreamHttpStatus?: number;
+  upstreamApiStatus?: string;
+  availableGenerateModels: string[];
+  recommendedModel: string | null;
+  errorCode?: string;
+  message?: string;
   warning?: string;
 }
 
@@ -300,34 +365,130 @@ const ZERO_USAGE: AiTokenUsage = {
   totalTokens: 0,
 };
 
-function pickFallbackGenerateContentModel(
+const EXCLUDED_MODEL_SUBSTRINGS = [
+  'embedding',
+  '-image',
+  '-tts',
+  '-live',
+  '-transcribe',
+  'imagen',
+  'veo',
+  'lyria',
+  'robotics',
+  'computer-use',
+  'aqa',
+  'gemini-1.5',
+  'gemini-2.0',
+];
+
+const PREFERRED_TEXT_MODEL_ORDER = [
+  'gemini-4-hydrogen',
+  'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite',
+  'gemini-3.1-flash-lite-preview',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-pro',
+];
+
+export interface ListedModelInspection {
+  configuredModelInList: boolean;
+  configuredModelSupportsGenerate: boolean;
+  availableGenerateModels: string[];
+  recommendedFallbackModel: string | null;
+}
+
+export function inspectListedGeminiModels(
   listedModels: Array<{ name?: string; supportedActions?: string[] }> | undefined,
   configuredModel: string,
-): string | null {
-  if (!Array.isArray(listedModels) || listedModels.length === 0) return null;
-  const candidates = listedModels
-    .filter((item) => {
-      const name = typeof item?.name === 'string' ? item.name : '';
-      const shortName = name.replace(/^models\//, '');
-      if (!shortName.toLowerCase().includes('gemini')) return false;
-      if (shortName === configuredModel) return false;
-      if (Array.isArray(item.supportedActions) && item.supportedActions.length > 0) {
-        return item.supportedActions.includes('generateContent');
-      }
-      return true;
-    })
-    .map((item) => String(item.name).replace(/^models\//, ''));
+): ListedModelInspection {
+  const configuredShort = configuredModel.replace(/^models\//, '').trim();
+  let configuredModelInList = false;
+  let configuredModelSupportsGenerate = false;
+  const generateCapable: string[] = [];
 
-  if (candidates.length === 0) return null;
-  const preferredOrder = [
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
-    'gemini-2.5-pro',
-  ];
-  for (const preferred of preferredOrder) {
-    if (candidates.includes(preferred)) return preferred;
+  if (Array.isArray(listedModels)) {
+    for (const item of listedModels) {
+      const rawName = typeof item?.name === 'string' ? item.name.trim() : '';
+      if (!rawName) continue;
+      const shortName = rawName.replace(/^models\//, '');
+      const supportsGenerate =
+        Array.isArray(item.supportedActions) &&
+        item.supportedActions.includes('generateContent');
+
+      if (shortName === configuredShort) {
+        configuredModelInList = true;
+        configuredModelSupportsGenerate = supportsGenerate;
+      }
+
+      const lower = shortName.toLowerCase();
+      if (!lower.includes('gemini')) continue;
+      if (EXCLUDED_MODEL_SUBSTRINGS.some((part) => lower.includes(part))) {
+        continue;
+      }
+      if (!supportsGenerate) continue;
+      if (!generateCapable.includes(shortName)) {
+        generateCapable.push(shortName);
+      }
+    }
   }
-  return candidates[0];
+
+  generateCapable.sort((a, b) => {
+    const ia = PREFERRED_TEXT_MODEL_ORDER.indexOf(a);
+    const ib = PREFERRED_TEXT_MODEL_ORDER.indexOf(b);
+    if (ia >= 0 && ib >= 0) return ia - ib;
+    if (ia >= 0) return -1;
+    if (ib >= 0) return 1;
+    return a.localeCompare(b);
+  });
+
+  const recommendedFallbackModel =
+    generateCapable.find((name) => name !== configuredShort) ?? null;
+
+  return {
+    configuredModelInList,
+    configuredModelSupportsGenerate,
+    availableGenerateModels: generateCapable.slice(0, 8),
+    recommendedFallbackModel,
+  };
+}
+
+/**
+ * Verifies only API key authentication (via 0-token models.list) before saving.
+ * Does NOT execute generateContent so saving a key consumes zero generation tokens.
+ */
+export async function verifyGeminiKeyAuthOnly(
+  apiKey: string,
+  signal?: AbortSignal,
+  clientOverride?: GeminiTestClientLike,
+): Promise<{ keyType: GeminiApiKeyType; availableGenerateModels: string[] }> {
+  const cleanKey = normalizeGeminiApiKeyInput(apiKey);
+  if (!cleanKey) {
+    throw new GeminiServiceError(
+      403,
+      'personal_key_required',
+      '개인 Gemini API 키가 등록되어 있지 않습니다.',
+    );
+  }
+  const keyType = detectGeminiApiKeyType(cleanKey);
+  const configuredModel = getGeminiModelName();
+  const ai = clientOverride ?? createGeminiClient(cleanKey);
+
+  try {
+    const pager = await runWithTimeoutAndAbort(
+      () => ai.models.list({ config: { pageSize: 50 } }),
+      7000,
+      signal,
+    );
+    const inspection = inspectListedGeminiModels(pager?.page, configuredModel);
+    return {
+      keyType,
+      availableGenerateModels: inspection.availableGenerateModels,
+    };
+  } catch (err) {
+    if (err instanceof GeminiServiceError) throw err;
+    throw toServiceError(mapGeminiError(err, configuredModel));
+  }
 }
 
 export async function testGeminiPersonalKey(
@@ -349,125 +510,258 @@ export async function testGeminiPersonalKey(
   const deadlineMs = Date.now() + 9000;
   const remainingMs = () => Math.max(1500, deadlineMs - Date.now());
 
-  // 1. Verify actual Gemini API authentication via GET /models (x-goog-api-key)
-  let listedModels: Array<{ name?: string; supportedActions?: string[] }> | undefined;
+  // 1. Check API key authentication & list generateContent-capable models
+  let inspection: ListedModelInspection;
   try {
     const pager = await runWithTimeoutAndAbort(
-      () => ai.models.list({ config: { pageSize: 20 } }),
+      () => ai.models.list({ config: { pageSize: 50 } }),
       remainingMs(),
       signal,
     );
-    listedModels = pager?.page;
+    inspection = inspectListedGeminiModels(pager?.page, configuredModel);
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
-    const mapped = mapGeminiError(err);
-    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
+    const mapped = mapGeminiError(err, configuredModel);
+    throw toServiceError(mapped);
   }
 
-  // 2. Probe text generation on configured model (auth already verified above)
+  // Note: If configured model is explicitly listed WITHOUT generateContent support,
+  // report modelAccessible=false and generateContentOk=false clearly (do not falsely pass on models.list).
+  if (
+    inspection.configuredModelInList &&
+    !inspection.configuredModelSupportsGenerate
+  ) {
+    const verifiedAlt = await probeFallbackModelIfPresent(
+      ai,
+      inspection.recommendedFallbackModel,
+      remainingMs(),
+      signal,
+    );
+    return {
+      ok: false,
+      model: configuredModel,
+      configuredModel,
+      apiKeyAuthOk: true,
+      modelAccessible: false,
+      generateContentOk: false,
+      usage: ZERO_USAGE,
+      keyType,
+      diagnosticCategory: 'model_generate_unsupported',
+      errorCode: 'model_generate_unsupported',
+      availableGenerateModels: inspection.availableGenerateModels,
+      recommendedModel: verifiedAlt,
+      message: `API 키 인증은 정상이나 설정된 모델(${configuredModel})이 generateContent 생성 기능을 지원하지 않습니다.`,
+      warning: verifiedAlt
+        ? `대체 사용 가능한 모델(${verifiedAlt})은 generateContent 호출이 가능했습니다. Vercel GEMINI_MODEL 변경을 권장합니다.`
+        : undefined,
+    };
+  }
+
+  // 2. Run actual minimal generateContent probe against the configured model
   try {
+    const thinkingConfig = buildThinkingConfigForModel(configuredModel, 'probe');
+    const config: Record<string, unknown> = {
+      maxOutputTokens: 16,
+      ...(thinkingConfig ? { thinkingConfig } : {}),
+    };
     const response = await runWithTimeoutAndAbort(
       () =>
         ai.models.generateContent({
           model: configuredModel,
           contents: 'Reply with OK.',
-          config: {
-            maxOutputTokens: 16,
-            thinkingConfig: {
-              thinkingLevel: ThinkingLevel.MINIMAL,
-            },
-          },
+          config,
         }),
       remainingMs(),
       signal,
     );
     return {
+      ok: true,
       model: configuredModel,
+      configuredModel,
+      apiKeyAuthOk: true,
+      modelAccessible: true,
+      generateContentOk: true,
       usage: extractUsageMetadata(response),
-      authVerified: true,
       keyType,
+      availableGenerateModels: inspection.availableGenerateModels,
+      recommendedModel: null,
+      message: `API 키 인증 및 모델(${configuredModel}) generateContent 호출이 정상 확인되었습니다.`,
     };
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
-    const mapped = mapGeminiError(err);
+    const mapped = mapGeminiError(err, configuredModel);
 
+    // Key-level auth rejection even during generateContent -> treat as auth error
     if (
-      mapped.code === 'invalid_api_key' ||
-      mapped.code === 'api_key_permission_denied' ||
-      mapped.code === 'gemini_auth_header_error' ||
-      mapped.code === 'ai_aborted' ||
-      mapped.code === 'ai_timeout' ||
-      mapped.code === 'upstream_network_error'
+      mapped.diagnosticCategory === 'auth_failed' ||
+      mapped.diagnosticCategory === 'auth_header_error'
     ) {
-      throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
+      throw toServiceError(mapped);
     }
 
-    if (mapped.code === 'model_not_found') {
-      const fallbackModel = pickFallbackGenerateContentModel(
-        listedModels,
-        configuredModel,
+    const modelAccessible =
+      mapped.diagnosticCategory === 'model_not_supported' ||
+      mapped.diagnosticCategory === 'model_generate_unsupported' ||
+      mapped.diagnosticCategory === 'model_permission_denied'
+        ? false
+        : inspection.configuredModelSupportsGenerate;
+
+    let verifiedFallback: string | null = null;
+    if (
+      (mapped.diagnosticCategory === 'model_not_supported' ||
+        mapped.diagnosticCategory === 'model_generate_unsupported') &&
+      inspection.recommendedFallbackModel
+    ) {
+      verifiedFallback = await probeFallbackModelIfPresent(
+        ai,
+        inspection.recommendedFallbackModel,
+        remainingMs(),
+        signal,
       );
-      if (fallbackModel) {
-        try {
-          const fallbackRes = await runWithTimeoutAndAbort(
-            () =>
-              ai.models.generateContent({
-                model: fallbackModel,
-                contents: 'Reply with OK.',
-                config: {
-                  maxOutputTokens: 16,
-                  thinkingConfig: {
-                    thinkingLevel: ThinkingLevel.MINIMAL,
-                  },
-                },
-              }),
-            remainingMs(),
-            signal,
-          );
-          return {
+    }
+
+    return {
+      ok: false,
+      model: configuredModel,
+      configuredModel,
+      apiKeyAuthOk: true,
+      modelAccessible,
+      generateContentOk: false,
+      usage: ZERO_USAGE,
+      keyType,
+      diagnosticCategory: mapped.diagnosticCategory,
+      upstreamHttpStatus: mapped.upstreamHttpStatus,
+      upstreamApiStatus: mapped.upstreamApiStatus,
+      errorCode: mapped.code,
+      availableGenerateModels: inspection.availableGenerateModels,
+      recommendedModel: verifiedFallback ?? inspection.recommendedFallbackModel,
+      message: mapped.message,
+      warning: verifiedFallback
+        ? `API 키 인증은 정상입니다. 현재 설정 모델(${configuredModel})은 실패했으나, 계정 내 다른 모델(${verifiedFallback})은 실제 generateContent 호출이 가능했습니다. Vercel GEMINI_MODEL=${verifiedFallback} 설정 또는 재실행을 권장합니다.`
+        : undefined,
+    };
+  }
+}
+
+async function probeFallbackModelIfPresent(
+  ai: GeminiTestClientLike,
+  fallbackModel: string | null,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (!fallbackModel || timeoutMs < 1500) return null;
+  try {
+    const thinkingConfig = buildThinkingConfigForModel(fallbackModel, 'probe');
+    await runWithTimeoutAndAbort(
+      () =>
+        ai.models.generateContent({
+          model: fallbackModel,
+          contents: 'Reply with OK.',
+          config: {
+            maxOutputTokens: 16,
+            ...(thinkingConfig ? { thinkingConfig } : {}),
+          },
+        }),
+      timeoutMs,
+      signal,
+    );
+    return fallbackModel;
+  } catch {
+    return null;
+  }
+}
+
+async function generateContentWithModelResolution(params: {
+  ai: GeminiTestClientLike;
+  configuredModel: string;
+  contents: string;
+  baseConfig: Record<string, unknown>;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): Promise<{
+  model: string;
+  response: {
+    text?: string;
+    usageMetadata?: {
+      promptTokenCount?: number;
+      candidatesTokenCount?: number;
+      thoughtsTokenCount?: number;
+      totalTokenCount?: number;
+    };
+  };
+}> {
+  const buildConfigFor = (targetModel: string): Record<string, unknown> => {
+    const thinkingConfig = buildThinkingConfigForModel(
+      targetModel,
+      'low_reasoning',
+    );
+    return {
+      ...params.baseConfig,
+      ...(thinkingConfig ? { thinkingConfig } : {}),
+    };
+  };
+
+  try {
+    const response = await runWithTimeoutAndAbort(
+      () =>
+        params.ai.models.generateContent({
+          model: params.configuredModel,
+          contents: params.contents,
+          config: buildConfigFor(params.configuredModel),
+        }),
+      params.timeoutMs,
+      params.signal,
+    );
+    return { model: params.configuredModel, response };
+  } catch (err) {
+    if (err instanceof GeminiServiceError) throw err;
+    const mapped = mapGeminiError(err, params.configuredModel);
+
+    // Only attempt account model-list fallback when the specific model ID is missing or unsupported.
+    // Never mask permission, quota, invalid request format, auth, or timeout errors.
+    if (
+      mapped.code !== 'model_not_found' &&
+      mapped.code !== 'model_generate_unsupported'
+    ) {
+      throw toServiceError(mapped);
+    }
+
+    let inspection: ListedModelInspection;
+    try {
+      const pager = await runWithTimeoutAndAbort(
+        () => params.ai.models.list({ config: { pageSize: 50 } }),
+        Math.min(5000, params.timeoutMs),
+        params.signal,
+      );
+      inspection = inspectListedGeminiModels(
+        pager?.page,
+        params.configuredModel,
+      );
+    } catch {
+      throw toServiceError(mapped);
+    }
+
+    const fallbackModel = inspection.recommendedFallbackModel;
+    if (!fallbackModel) {
+      throw toServiceError(mapped);
+    }
+
+    try {
+      const fallbackResponse = await runWithTimeoutAndAbort(
+        () =>
+          params.ai.models.generateContent({
             model: fallbackModel,
-            usage: extractUsageMetadata(fallbackRes),
-            authVerified: true,
-            keyType,
-            warning: `API 키 인증은 정상입니다. 다만 서버 기본 모델(${configuredModel}) 대신 사용 가능한 모델(${fallbackModel})로 연결되었습니다. Vercel 환경변수 GEMINI_MODEL=${fallbackModel} 설정을 권장합니다.`,
-          };
-        } catch (fallbackErr) {
-          const fallbackMapped = mapGeminiError(fallbackErr);
-          if (
-            fallbackMapped.code === 'invalid_api_key' ||
-            fallbackMapped.code === 'api_key_permission_denied' ||
-            fallbackMapped.code === 'gemini_auth_header_error'
-          ) {
-            throw new GeminiServiceError(
-              fallbackMapped.status,
-              fallbackMapped.code,
-              fallbackMapped.message,
-            );
-          }
-        }
-      }
-
-      return {
-        model: fallbackModel ?? configuredModel,
-        usage: ZERO_USAGE,
-        authVerified: true,
-        keyType,
-        warning: `API 키 인증은 정상 확인되었습니다. 다만 설정된 모델(${configuredModel})을 사용할 수 없어 Vercel 환경변수 GEMINI_MODEL(${fallbackModel ?? 'gemini-2.5-flash'} 등) 설정 확인이 필요합니다.`,
-      };
+            contents: params.contents,
+            config: buildConfigFor(fallbackModel),
+          }),
+        params.timeoutMs,
+        params.signal,
+      );
+      return { model: fallbackModel, response: fallbackResponse };
+    } catch (fallbackErr) {
+      if (fallbackErr instanceof GeminiServiceError) throw fallbackErr;
+      throw toServiceError(mapGeminiError(fallbackErr, fallbackModel));
     }
-
-    if (mapped.code === 'ai_quota_exceeded') {
-      return {
-        model: configuredModel,
-        usage: ZERO_USAGE,
-        authVerified: true,
-        keyType,
-        warning:
-          'API 키 인증은 정상 확인되었습니다. 다만 현재 해당 키의 Gemini 생성 호출 한도(429)에 도달한 상태입니다. 할당량 초기화 후 AI 기능을 실행해 주세요.',
-      };
-    }
-
-    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
   }
 }
 
@@ -475,9 +769,10 @@ export async function analyzeNoticeWithGemini(
   apiKey: string,
   input: AiAnalyzeNoticeRequest,
   signal?: AbortSignal,
+  clientOverride?: GeminiTestClientLike,
 ): Promise<AiAnalyzeNoticeResponse> {
-  const model = getGeminiModelName();
-  const ai = createGeminiClient(apiKey);
+  const configuredModel = getGeminiModelName();
+  const ai = clientOverride ?? createGeminiClient(apiKey);
   const todayKey = input.todayKey || new Date().toISOString().slice(0, 10);
 
   const existingList = (input.existingItems ?? [])
@@ -504,54 +799,48 @@ export async function analyzeNoticeWithGemini(
     .filter(Boolean)
     .join('\n');
 
-  try {
-    const response = await runWithTimeoutAndAbort(
-      () =>
-        ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: NOTICE_RESPONSE_SCHEMA,
-            thinkingConfig: {
-              thinkingLevel: ThinkingLevel.LOW,
-            },
-          },
-        }),
-      AI_LIMITS.REQUEST_TIMEOUT_MS,
-      signal,
+  const { model, response } = await generateContentWithModelResolution({
+    ai,
+    configuredModel,
+    contents: prompt,
+    baseConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: NOTICE_RESPONSE_SCHEMA,
+    },
+    timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+    signal,
+  });
+
+  const text = response.text;
+  if (!text) {
+    throw new GeminiServiceError(
+      502,
+      'ai_empty_response',
+      'AI 모델이 빈 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
     );
-
-    const text = response.text;
-    if (!text) {
-      throw new Error('Empty JSON response from Gemini');
-    }
-
-    const parsed = JSON.parse(text) as AiRawNoticeOutput;
-    return {
-      model,
-      rawOutput: {
-        candidates: Array.isArray(parsed.candidates) ? parsed.candidates : [],
-        unparsedSummary: Array.isArray(parsed.unparsedSummary)
-          ? parsed.unparsedSummary
-          : [],
-      },
-      usage: extractUsageMetadata(response),
-    };
-  } catch (err) {
-    if (err instanceof GeminiServiceError) throw err;
-    const mapped = mapGeminiError(err);
-    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
   }
+
+  const parsed = JSON.parse(text) as AiRawNoticeOutput;
+  return {
+    model,
+    rawOutput: {
+      candidates: Array.isArray(parsed.candidates) ? parsed.candidates : [],
+      unparsedSummary: Array.isArray(parsed.unparsedSummary)
+        ? parsed.unparsedSummary
+        : [],
+    },
+    usage: extractUsageMetadata(response),
+  };
 }
 
 export async function generateBriefingWithGemini(
   apiKey: string,
   input: AiBriefingRequest,
   signal?: AbortSignal,
+  clientOverride?: GeminiTestClientLike,
 ): Promise<AiBriefingResponse> {
-  const model = getGeminiModelName();
-  const ai = createGeminiClient(apiKey);
+  const configuredModel = getGeminiModelName();
+  const ai = clientOverride ?? createGeminiClient(apiKey);
 
   const tasksText =
     input.tasks.length > 0
@@ -590,50 +879,44 @@ export async function generateBriefingWithGemini(
     `[오늘 및 다가오는 일정 요약]\n${eventsText}`,
   ].join('\n');
 
-  try {
-    const response = await runWithTimeoutAndAbort(
-      () =>
-        ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: BRIEFING_RESPONSE_SCHEMA,
-            thinkingConfig: {
-              thinkingLevel: ThinkingLevel.LOW,
-            },
-          },
-        }),
-      AI_LIMITS.REQUEST_TIMEOUT_MS,
-      signal,
+  const { model, response } = await generateContentWithModelResolution({
+    ai,
+    configuredModel,
+    contents: prompt,
+    baseConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: BRIEFING_RESPONSE_SCHEMA,
+    },
+    timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+    signal,
+  });
+
+  const text = response.text;
+  if (!text) {
+    throw new GeminiServiceError(
+      502,
+      'ai_empty_response',
+      'AI 모델이 빈 브리핑 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
     );
-
-    const text = response.text;
-    if (!text) {
-      throw new Error('Empty JSON briefing response from Gemini');
-    }
-
-    const parsed = JSON.parse(text) as AiBriefingResult;
-    return {
-      model,
-      generatedAtIso: new Date().toISOString(),
-      briefing: parsed,
-      usage: extractUsageMetadata(response),
-    };
-  } catch (err) {
-    if (err instanceof GeminiServiceError) throw err;
-    const mapped = mapGeminiError(err);
-    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
   }
+
+  const parsed = JSON.parse(text) as AiBriefingResult;
+  return {
+    model,
+    generatedAtIso: new Date().toISOString(),
+    briefing: parsed,
+    usage: extractUsageMetadata(response),
+  };
 }
 
 export async function generateDayPlanWithGemini(
   apiKey: string,
   input: AiPlannerRequest,
   signal?: AbortSignal,
+  clientOverride?: GeminiTestClientLike,
 ): Promise<AiPlannerResponse> {
-  const model = getGeminiModelName();
-  const ai = createGeminiClient(apiKey);
+  const configuredModel = getGeminiModelName();
+  const ai = clientOverride ?? createGeminiClient(apiKey);
 
   const compactInput = {
     today: input.todayKey,
@@ -663,51 +946,44 @@ export async function generateDayPlanWithGemini(
     `입력JSON:${JSON.stringify(compactInput)}`,
   ].join('\n');
 
-  try {
-    const response = await runWithTimeoutAndAbort(
-      () =>
-        ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: {
-            maxOutputTokens: 1200,
-            responseMimeType: 'application/json',
-            responseSchema: PLANNER_RESPONSE_SCHEMA,
-            thinkingConfig: {
-              thinkingLevel: ThinkingLevel.LOW,
-            },
-          },
-        }),
-      AI_LIMITS.REQUEST_TIMEOUT_MS,
-      signal,
+  const { model, response } = await generateContentWithModelResolution({
+    ai,
+    configuredModel,
+    contents: prompt,
+    baseConfig: {
+      maxOutputTokens: 1200,
+      responseMimeType: 'application/json',
+      responseSchema: PLANNER_RESPONSE_SCHEMA,
+    },
+    timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+    signal,
+  });
+
+  const text = response.text;
+  if (!text) {
+    throw new GeminiServiceError(
+      502,
+      'ai_empty_response',
+      'AI 모델이 빈 업무 계획 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
     );
-
-    const text = response.text;
-    if (!text) {
-      throw new Error('Empty JSON planner response from Gemini');
-    }
-
-    const parsed = JSON.parse(text) as AiPlannerRawResult;
-    return {
-      model,
-      generatedAtIso: new Date().toISOString(),
-      rawPlan: {
-        coreAdvice: typeof parsed.coreAdvice === 'string' ? parsed.coreAdvice : '',
-        recommendations: Array.isArray(parsed.recommendations)
-          ? parsed.recommendations.slice(0, AI_LIMITS.MAX_PLANNER_RECOMMENDATIONS)
-          : [],
-        attentionTasks: Array.isArray(parsed.attentionTasks)
-          ? parsed.attentionTasks.slice(0, 6)
-          : [],
-        deferredTasks: Array.isArray(parsed.deferredTasks)
-          ? parsed.deferredTasks.slice(0, 6)
-          : [],
-      },
-      usage: extractUsageMetadata(response),
-    };
-  } catch (err) {
-    if (err instanceof GeminiServiceError) throw err;
-    const mapped = mapGeminiError(err);
-    throw new GeminiServiceError(mapped.status, mapped.code, mapped.message);
   }
+
+  const parsed = JSON.parse(text) as AiPlannerRawResult;
+  return {
+    model,
+    generatedAtIso: new Date().toISOString(),
+    rawPlan: {
+      coreAdvice: typeof parsed.coreAdvice === 'string' ? parsed.coreAdvice : '',
+      recommendations: Array.isArray(parsed.recommendations)
+        ? parsed.recommendations.slice(0, AI_LIMITS.MAX_PLANNER_RECOMMENDATIONS)
+        : [],
+      attentionTasks: Array.isArray(parsed.attentionTasks)
+        ? parsed.attentionTasks.slice(0, 6)
+        : [],
+      deferredTasks: Array.isArray(parsed.deferredTasks)
+        ? parsed.deferredTasks.slice(0, 6)
+        : [],
+    },
+    usage: extractUsageMetadata(response),
+  };
 }
