@@ -22,6 +22,7 @@ import {
   decryptApiKeyForUid,
   encryptApiKeyForUid,
   maskGeminiApiKey,
+  normalizeGeminiApiKeyInput,
   sealByokCookieValue,
   unsealByokCookieValue,
   validateGeminiApiKeyFormat,
@@ -30,6 +31,7 @@ import {
 import {
   handleAiPlannerRequest,
   handleSaveByokKeyRequest,
+  handleTestByokKeyRequest,
 } from '../server/aiRoutes.ts';
 import { ServerAuthError } from '../server/firebaseServerAuth.ts';
 import { SlidingWindowRateLimiter } from '../server/rateLimiter.ts';
@@ -612,3 +614,159 @@ test('taskOperations supports optional nullable estimatedMinutes and rejects out
     TaskValidationError,
   );
 });
+
+test('validateGeminiApiKeyFormat allows valid keys with A-Z a-z 0-9 _ - and strips edge whitespace/invisible chars', () => {
+  const validCases = [
+    'AIzaSyAbCdEfGhIjKlMnOpQrStUvWxYz_01-234',
+    'AIzaSy9876543210-_abcdefghijklmnopqrstuvwxyz',
+    'A'.repeat(20),
+    'Ab_0-9'.repeat(42) + '1234', // 256 chars max boundary
+  ];
+
+  for (const key of validCases) {
+    const res = validateGeminiApiKeyFormat(key);
+    assert.equal(res.valid, true, `Expected valid for key length ${key.length}`);
+    assert.equal(res.apiKey, key);
+  }
+
+  const cleanKey = 'AIzaSyTest_Copy-Paste_1234567890ABCDEFG';
+  const copyPasteArtifacts = [
+    `  ${cleanKey}  `,
+    `\r\n${cleanKey}\n`,
+    `\t\u00A0\u3000${cleanKey}\u00A0\t`,
+    `\uFEFF\u200B${cleanKey}\u200C\u200D`,
+    `\u200E\u202A\u2060\u00AD${cleanKey}\u202E\u200F\u2060`,
+    `\r\n \u200B\uFEFF${cleanKey}\u200B \n\r`,
+  ];
+
+  for (const noisy of copyPasteArtifacts) {
+    assert.equal(normalizeGeminiApiKeyInput(noisy), cleanKey);
+    const res = validateGeminiApiKeyFormat(noisy);
+    assert.equal(res.valid, true);
+    assert.equal(res.apiKey, cleanKey);
+  }
+});
+
+test('validateGeminiApiKeyFormat rejects internal whitespace, invalid chars, and bad lengths without leaking raw key', () => {
+  const invalidFormatCases = [
+    'AIzaSyFakeKey 123456789012345', // internal space
+    'AIzaSyFakeKey\n123456789012345', // internal newline
+    'AIzaSyFakeKey\t123456789012345', // internal tab
+    'AIzaSyFakeKey\u200B123456789012345', // internal zero-width char
+    'AIzaSyFakeKey!123456789012345',
+    'AIzaSyFakeKey@123456789012345',
+    'AIzaSyFakeKey+123456789012345=',
+    'AIzaSyFakeKey/123456789012345',
+    '"AIzaSyFakeKey1234567890123456"',
+    'AIzaSy한글포함키테스트1234567890',
+  ];
+
+  for (const bad of invalidFormatCases) {
+    const res = validateGeminiApiKeyFormat(bad);
+    assert.equal(res.valid, false);
+    assert.equal(
+      res.message,
+      'API 키에 허용되지 않는 공백이나 특수문자가 포함되어 있습니다.',
+    );
+    assert.ok(!res.message?.includes('AIzaSy'));
+    assert.ok(!res.message?.includes(bad));
+  }
+
+  const emptyCases = ['', '   ', '\r\n\t', '\u200B\uFEFF\u2060'];
+  for (const empty of emptyCases) {
+    const res = validateGeminiApiKeyFormat(empty);
+    assert.equal(res.valid, false);
+    assert.equal(res.message, 'Gemini API 키를 입력해 주세요.');
+  }
+
+  assert.equal(validateGeminiApiKeyFormat('A'.repeat(19)).valid, false);
+  assert.equal(validateGeminiApiKeyFormat('A'.repeat(257)).valid, false);
+  assert.equal(validateGeminiApiKeyFormat(null).valid, false);
+  assert.equal(validateGeminiApiKeyFormat(1234567890).valid, false);
+});
+
+test('BYOK save and test routes pass normalized key to server connection test and block internal invalid chars without leaking key', async () => {
+  const activeAuth = async () => ({
+    uid: 'teacher-byok-copy-test',
+    email: 'teacher@icedu.kr',
+    emailVerified: true,
+    accessStatus: 'active' as const,
+    role: 'teacher',
+  });
+
+  const cleanKey = 'AIzaSyRoute_Test-Key_1234567890ABCDEFGH';
+  const pastedFromUi = `\uFEFF\u200B \n${cleanKey}\r\n\u200C `;
+
+  const testedKeysOnSave: string[] = [];
+  const saveRes = await handleSaveByokKeyRequest(
+    {
+      authorizationHeader: 'Bearer test-token',
+      body: { apiKey: pastedFromUi, testBeforeSave: true },
+      isSecure: false,
+    },
+    {
+      verifyAuth: activeAuth,
+      testApiKey: async (apiKey) => {
+        testedKeysOnSave.push(apiKey);
+        return {
+          model: 'gemini-3.1-flash-lite-preview',
+          usage: {
+            inputTokens: 4,
+            outputTokens: 2,
+            thoughtTokens: 0,
+            totalTokens: 6,
+          },
+        };
+      },
+    },
+  );
+  assert.equal(saveRes.status, 200);
+  assert.deepEqual(testedKeysOnSave, [cleanKey]);
+  assert.ok(!JSON.stringify(saveRes.body).includes(cleanKey));
+
+  const testedKeysOnTestRoute: string[] = [];
+  const testRes = await handleTestByokKeyRequest(
+    {
+      authorizationHeader: 'Bearer test-token',
+      body: { apiKey: pastedFromUi },
+    },
+    {
+      verifyAuth: activeAuth,
+      testApiKey: async (apiKey) => {
+        testedKeysOnTestRoute.push(apiKey);
+        return {
+          model: 'gemini-3.1-flash-lite-preview',
+          usage: {
+            inputTokens: 4,
+            outputTokens: 2,
+            thoughtTokens: 0,
+            totalTokens: 6,
+          },
+        };
+      },
+    },
+  );
+  assert.equal(testRes.status, 200);
+  assert.deepEqual(testedKeysOnTestRoute, [cleanKey]);
+  assert.ok(!JSON.stringify(testRes.body).includes(cleanKey));
+
+  const badInternalKey = 'AIzaSyBad Key With$Special123456';
+  const badTestRes = await handleTestByokKeyRequest(
+    {
+      authorizationHeader: 'Bearer test-token',
+      body: { apiKey: badInternalKey },
+    },
+    {
+      verifyAuth: activeAuth,
+      testApiKey: async () => {
+        throw new Error('Should not reach testApiKey for invalid format');
+      },
+    },
+  );
+  assert.equal(badTestRes.status, 400);
+  const badBodyStr = JSON.stringify(badTestRes.body);
+  assert.ok(badBodyStr.includes('invalid_key_format'));
+  assert.ok(!badBodyStr.includes('AIzaSy'));
+  assert.ok(!badBodyStr.includes(badInternalKey));
+});
+

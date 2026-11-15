@@ -21,6 +21,7 @@ import {
   getPersistenceMode,
   loadUserAiState,
   maskGeminiApiKey,
+  normalizeGeminiApiKeyInput,
   releaseUidInFlightLock,
   resolvePersonalApiKeyForUid,
   savePersonalApiKeyForUid,
@@ -322,7 +323,10 @@ export async function handleTestByokKeyRequest(
     let targetKey: string | null = null;
     let keyHint: string | null = null;
 
-    if (typeof rawBody.apiKey === 'string' && rawBody.apiKey.trim().length > 0) {
+    if (
+      typeof rawBody.apiKey === 'string' &&
+      normalizeGeminiApiKeyInput(rawBody.apiKey).length > 0
+    ) {
       const validation = validateGeminiApiKeyFormat(rawBody.apiKey);
       if (!validation.valid || !validation.apiKey) {
         return {

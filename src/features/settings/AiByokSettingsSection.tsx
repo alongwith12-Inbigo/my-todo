@@ -11,6 +11,10 @@ import {
 } from 'lucide-react';
 import { setStoredAiEnabled } from '../../lib/aiPreferences';
 import {
+  normalizeGeminiApiKeyInput,
+  validateGeminiApiKeyFormat,
+} from '../../lib/byokKeyFormat';
+import {
   AI_LIMITS,
   type AiByokTestResponse,
   type AiStatusResponse,
@@ -83,11 +87,11 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
   async function handleSaveKey(e: FormEvent) {
     e.preventDefault();
     if (savingKey || testingKey) return;
-    const trimmed = apiKeyInput.trim();
-    if (!trimmed) {
+    const validation = validateGeminiApiKeyFormat(apiKeyInput);
+    if (!validation.valid || !validation.apiKey) {
       setSectionFeedback({
         type: 'error',
-        message: '등록할 개인 Gemini API 키를 입력해 주세요.',
+        message: validation.message || '올바른 Gemini API 키를 입력해 주세요.',
       });
       return;
     }
@@ -97,7 +101,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     setTestResult(null);
     try {
       const res = await saveByokApiKey({
-        apiKey: trimmed,
+        apiKey: validation.apiKey,
         testBeforeSave: true,
       });
       // Immediately clear key from component state after submission
@@ -127,8 +131,26 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     setSectionFeedback(null);
     setTestResult(null);
     try {
-      const trimmed = apiKeyInput.trim();
-      const res = await testByokApiKey(trimmed ? { apiKey: trimmed } : {});
+      const cleaned = normalizeGeminiApiKeyInput(apiKeyInput);
+      if (cleaned) {
+        const validation = validateGeminiApiKeyFormat(cleaned);
+        if (!validation.valid || !validation.apiKey) {
+          setSectionFeedback({
+            type: 'error',
+            message: validation.message || '올바른 Gemini API 키를 입력해 주세요.',
+          });
+          setTestingKey(false);
+          return;
+        }
+        const res = await testByokApiKey({ apiKey: validation.apiKey });
+        setTestResult(res);
+        setSectionFeedback({
+          type: 'success',
+          message: res.message,
+        });
+        return;
+      }
+      const res = await testByokApiKey({});
       setTestResult(res);
       setSectionFeedback({
         type: 'success',
@@ -369,6 +391,17 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                     spellCheck={false}
                     value={apiKeyInput}
                     onChange={(e) => setApiKeyInput(e.target.value)}
+                    onPaste={(e) => {
+                      const pasted = e.clipboardData?.getData('text');
+                      const el = e.currentTarget;
+                      const replacesAll =
+                        el.selectionStart === 0 &&
+                        el.selectionEnd === apiKeyInput.length;
+                      if (typeof pasted === 'string' && (!apiKeyInput || replacesAll)) {
+                        e.preventDefault();
+                        setApiKeyInput(normalizeGeminiApiKeyInput(pasted));
+                      }
+                    }}
                     placeholder="AIza... 형태의 본인 API 키 입력"
                     className="w-full pr-10 pl-3.5 py-2 text-sm font-mono border border-slate-300 rounded-lg focus:outline-none focus:border-teal-700"
                   />
@@ -386,14 +419,18 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                   </button>
                 </div>
                 <p className="mt-1 text-[11px] text-slate-500">
-                  입력한 키는 검증 후 브라우저 localStorage·sessionStorage에 남기지 않고 즉시 비워집니다.
+                  입력한 키는 검증 후 브라우저 localStorage·sessionStorage에 남기지 않고 즉시 비워집니다. 앞뒤 공백·줄바꿈은 자동 제거됩니다.
                 </p>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="submit"
-                  disabled={savingKey || testingKey || !apiKeyInput.trim()}
+                  disabled={
+                    savingKey ||
+                    testingKey ||
+                    !normalizeGeminiApiKeyInput(apiKeyInput)
+                  }
                   className="px-3.5 py-2 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {savingKey ? '검증 및 저장 중...' : hasPersonalKey ? '검증 후 키 변경' : '검증 후 저장'}
@@ -401,13 +438,17 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
 
                 <button
                   type="button"
-                  disabled={testingKey || savingKey || (!apiKeyInput.trim() && !hasPersonalKey)}
+                  disabled={
+                    testingKey ||
+                    savingKey ||
+                    (!normalizeGeminiApiKeyInput(apiKeyInput) && !hasPersonalKey)
+                  }
                   onClick={() => void handleTestKey()}
                   className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   {testingKey
                     ? '연결 확인 중...'
-                    : apiKeyInput.trim()
+                    : normalizeGeminiApiKeyInput(apiKeyInput)
                       ? '입력 키 테스트'
                       : '등록된 키 테스트'}
                 </button>

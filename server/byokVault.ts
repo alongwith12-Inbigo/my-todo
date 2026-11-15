@@ -9,9 +9,15 @@ import {
 } from '../src/lib/aiTypes.ts';
 import { getKstDateParts } from '../src/lib/dateKst.ts';
 
+import {
+  normalizeGeminiApiKeyInput,
+  validateGeminiApiKeyFormat,
+} from '../src/lib/byokKeyFormat.ts';
+
+export { normalizeGeminiApiKeyInput, validateGeminiApiKeyFormat };
+
 export const BYOK_COOKIE_NAME = 'sp_byok_key';
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
-const MAX_KEY_LEN = 128;
 
 // Random process secret used ONLY when BYOK_ENCRYPTION_SECRET is unset (session_memory_only mode).
 const EPHEMERAL_PROCESS_KEY = crypto.randomBytes(32);
@@ -86,30 +92,6 @@ function getCipherKey(): Buffer {
     return crypto.createHash('sha256').update(configured, 'utf8').digest();
   }
   return EPHEMERAL_PROCESS_KEY;
-}
-
-export function validateGeminiApiKeyFormat(raw: unknown): {
-  valid: boolean;
-  apiKey?: string;
-  message?: string;
-} {
-  if (typeof raw !== 'string') {
-    return { valid: false, message: 'API 키 문자열을 입력해 주세요.' };
-  }
-  const trimmed = raw.trim();
-  if (trimmed.length < 20 || trimmed.length > MAX_KEY_LEN) {
-    return {
-      valid: false,
-      message: '올바른 Gemini API 키 길이가 아닙니다. Google AI Studio에서 발급한 키를 확인해 주세요.',
-    };
-  }
-  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) {
-    return {
-      valid: false,
-      message: 'API 키에 허용되지 않는 공백이나 특수문자가 포함되어 있습니다.',
-    };
-  }
-  return { valid: true, apiKey: trimmed };
 }
 
 export function maskGeminiApiKey(apiKey: string): string {
