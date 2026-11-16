@@ -21,6 +21,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { AI_LIMITS } from '../../lib/aiTypes';
 import { timestampToDate } from '../../lib/briefing';
 import { getDefaultEventDraftForDate } from '../../lib/calendar';
 import {
@@ -522,50 +523,57 @@ export function EventModal({
                   </label>
                   <textarea
                     id="event-notice-text"
-                    rows={4}
-                    maxLength={10000}
+                    rows={Math.min(12, Math.max(5, noticeText.split(/\r?\n/).length + 1))}
+                    maxLength={AI_LIMITS.NOTICE_INPUT_MAX_CHARS}
                     value={noticeText}
                     onChange={(e) => {
                       setNoticeText(e.target.value);
                       if (noticeImport.parseError) noticeImport.setParseError(null);
                     }}
                     placeholder="여러 일정이나 업무가 담긴 공지·메신저 내용을 그대로 붙여넣으세요. (원문은 저장되지 않습니다)"
-                    className="w-full px-3 py-2 text-sm leading-relaxed border border-slate-300 rounded-lg bg-white focus:outline-none focus:border-teal-700"
+                    className="w-full px-3 py-2 text-sm leading-relaxed border border-slate-300 rounded-lg bg-white max-h-[360px] overflow-y-auto resize-y focus:outline-none focus:border-teal-700"
                   />
-                  <div className="flex flex-wrap items-center justify-end gap-2">
-                    {noticeText && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setNoticeText('');
-                          noticeImport.setParseError(null);
-                        }}
-                        className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
-                      >
-                        <Eraser className="w-3.5 h-3.5" aria-hidden="true" />
-                        <span>입력 지우기</span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      disabled={noticeImport.aiRunning}
-                      onClick={handleAnalyzeNoticeText}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap cursor-pointer"
-                    >
-                      <ScanText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
-                      <span>기본 분석</span>
-                    </button>
-                    {noticeImport.aiEnabled && (
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-500 tabular-nums">
+                      {noticeText.length.toLocaleString()}자 ·{' '}
+                      {(noticeText ? noticeText.split(/\r?\n/).length : 0)}줄 (최대{' '}
+                      {AI_LIMITS.NOTICE_INPUT_MAX_CHARS.toLocaleString()}자)
+                    </span>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      {noticeText && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNoticeText('');
+                            noticeImport.setParseError(null);
+                          }}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
+                        >
+                          <Eraser className="w-3.5 h-3.5" aria-hidden="true" />
+                          <span>입력 지우기</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         disabled={noticeImport.aiRunning}
-                        onClick={handleAnalyzeNoticeAi}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                        onClick={handleAnalyzeNoticeText}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap cursor-pointer"
                       >
-                        <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
-                        <span>{noticeImport.aiRunning ? 'AI 분석 중...' : 'AI로 분석'}</span>
+                        <ScanText className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
+                        <span>기본 분석</span>
                       </button>
-                    )}
+                      {noticeImport.aiEnabled && (
+                        <button
+                          type="button"
+                          disabled={noticeImport.aiRunning}
+                          onClick={handleAnalyzeNoticeAi}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-teal-700 text-white rounded-lg hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+                          <span>{noticeImport.aiRunning ? 'AI 분석 중...' : 'AI로 분석'}</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}

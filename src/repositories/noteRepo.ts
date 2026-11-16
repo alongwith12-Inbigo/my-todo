@@ -83,7 +83,7 @@ export async function updateNote(
   noteId: string,
   expectedVersion: number,
   patch: UpdateNotePatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   const path = `users/${uid}/notes/${noteId}`;
   try {
     return await updateNoteOp(db, uid, noteId, expectedVersion, patch);

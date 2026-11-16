@@ -25,6 +25,7 @@ import {
 } from '../../lib/timetableExcelParser';
 import {
   detectTimetableFileKind,
+  ensureImportPreviewPeriodCount,
   type TimetableCellStatus,
 } from '../../lib/timetableGridParser';
 import {
@@ -178,7 +179,9 @@ export function TimetableImportModal({
         const buffer = await file.arrayBuffer();
         const parsed = parseTimetableFromExcelBuffer(buffer);
         setExcelBuffer(buffer);
-        setPreview(parsed);
+        setPreview(
+          ensureImportPreviewPeriodCount(parsed, Math.max(parsed.periodCount, 7)),
+        );
       } catch (err) {
         setError(
           err instanceof Error
@@ -198,7 +201,9 @@ export function TimetableImportModal({
         const buffer = await file.arrayBuffer();
         const { tables, preview: parsed } = await parseTimetableFromHwpxBuffer(buffer);
         setHwpxTables(tables);
-        setPreview(parsed);
+        setPreview(
+          ensureImportPreviewPeriodCount(parsed, Math.max(parsed.periodCount, 7)),
+        );
       } catch (err) {
         setError(
           err instanceof Error
@@ -226,7 +231,9 @@ export function TimetableImportModal({
         });
         if (controller.signal.aborted) return;
         setPdfBuffer(buffer);
-        setPreview(parsed);
+        setPreview(
+          ensureImportPreviewPeriodCount(parsed, Math.max(parsed.periodCount, 7)),
+        );
       } catch (err) {
         if (controller.signal.aborted) return;
         setError(
@@ -270,7 +277,9 @@ export function TimetableImportModal({
         text: ocrResult.text,
         confidence: ocrResult.confidence,
       });
-      setPreview(parsed);
+      setPreview(
+        ensureImportPreviewPeriodCount(parsed, Math.max(parsed.periodCount, 7)),
+      );
     } catch (err) {
       if (controller.signal.aborted) return;
       setError(
@@ -291,7 +300,9 @@ export function TimetableImportModal({
     if (!excelBuffer) return;
     try {
       const parsed = parseTimetableFromExcelBuffer(excelBuffer, { sheetName });
-      setPreview(parsed);
+      setPreview(
+        ensureImportPreviewPeriodCount(parsed, Math.max(parsed.periodCount, 7)),
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : '시트를 전환하지 못했습니다.');
     }
@@ -301,7 +312,9 @@ export function TimetableImportModal({
     if (!hwpxTables) return;
     try {
       const parsed = buildHwpxPreviewFromTables(hwpxTables, tableId);
-      setPreview(parsed);
+      setPreview(
+        ensureImportPreviewPeriodCount(parsed, Math.max(parsed.periodCount, 7)),
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : '표를 전환하지 못했습니다.');
     }
@@ -322,7 +335,9 @@ export function TimetableImportModal({
         onProgress: setOcrProgress,
       });
       if (controller.signal.aborted) return;
-      setPreview(parsed);
+      setPreview(
+        ensureImportPreviewPeriodCount(parsed, Math.max(parsed.periodCount, 7)),
+      );
     } catch (err) {
       if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : 'PDF 페이지를 전환하지 못했습니다.');
@@ -559,6 +574,32 @@ export function TimetableImportModal({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <label
+                      htmlFor="import-period-count"
+                      className="text-xs font-medium text-slate-600"
+                    >
+                      교시 수:
+                    </label>
+                    <select
+                      id="import-period-count"
+                      value={preview.periodCount}
+                      onChange={(e) => {
+                        const nextCount = Number(e.target.value);
+                        setPreview((prev) =>
+                          prev ? ensureImportPreviewPeriodCount(prev, nextCount) : null,
+                        );
+                      }}
+                      className="px-2.5 py-1 text-xs font-semibold border border-slate-200 rounded-md bg-white tabular-nums"
+                    >
+                      {[5, 6, 7, 8, 9, 10, 11, 12].map((num) => (
+                        <option key={num} value={num}>
+                          {num}교시까지
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
                   {preview.sheetNames && preview.sheetNames.length > 1 && (
                     <div className="flex items-center gap-1.5">
                       <label

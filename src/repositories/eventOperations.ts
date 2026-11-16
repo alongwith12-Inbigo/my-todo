@@ -229,7 +229,7 @@ export async function updateEvent(
   eventId: string,
   expectedVersion: number,
   patch: UpdateEventPatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   assertValidOwnerAndEventId(uid, eventId);
   assertValidVersion(expectedVersion);
 
@@ -274,6 +274,18 @@ export async function updateEvent(
       patch.relatedTaskId !== undefined
         ? assertValidRelatedTaskId(patch.relatedTaskId)
         : current.relatedTaskId;
+
+    if (
+      nextTitle === current.title &&
+      nextStartsAt.toMillis() === current.startsAt.toMillis() &&
+      nextEndsAt.toMillis() === current.endsAt.toMillis() &&
+      nextAllDay === Boolean(current.allDay) &&
+      nextLocation === (current.location ?? '') &&
+      nextDescription === (current.description ?? '') &&
+      (nextRelatedTaskId ?? null) === (current.relatedTaskId ?? null)
+    ) {
+      return { id: eventId, version: current.version, unchanged: true };
+    }
 
     const nextVersion = current.version + 1;
     tx.update(eventRef, {

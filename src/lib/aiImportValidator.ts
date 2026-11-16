@@ -275,7 +275,7 @@ export function normalizeAiNoticeCandidates(
   const unparsedLines = Array.isArray(rawOutput?.unparsedSummary)
     ? rawOutput.unparsedSummary
         .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-        .slice(0, 10)
+        .slice(0, 25)
         .map((line) => sanitizeSingleLine(line, 200))
     : [];
 

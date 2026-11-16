@@ -299,6 +299,116 @@ export function validateTimetableDraft(draft: TimetableDraft): string | null {
   return null;
 }
 
+function getTimestampMs(ts: TimetableRecord['updatedAt'] | undefined): number {
+  return ts && typeof ts.toMillis === 'function' ? ts.toMillis() : 0;
+}
+
+export function timetableRecordToDraft(record: TimetableRecord): TimetableDraft {
+  return {
+    name: record.name,
+    semesterLabel: record.semesterLabel,
+    effectiveFrom: record.effectiveFrom,
+    effectiveTo: record.effectiveTo,
+    workStart: record.workStart,
+    workEnd: record.workEnd,
+    lunchStart: record.lunchStart,
+    lunchEnd: record.lunchEnd,
+    periodCount: record.periodCount,
+    periodTimes: { ...record.periodTimes },
+    slots: { ...record.slots },
+    isActive: record.isActive,
+    sourceType: record.sourceType,
+  };
+}
+
+export function getEffectiveTimetablePeriodCount(
+  timetable: Pick<TimetableRecord, 'periodCount' | 'slots'>,
+): number {
+  let maxPopulatedSlotPeriod = 0;
+  for (const [key, slot] of Object.entries(timetable.slots ?? {})) {
+    if (!slot) continue;
+    const isPopulated =
+      slot.kind !== 'free' ||
+      Boolean(
+        slot.subject ||
+          slot.className ||
+          slot.classroom ||
+          slot.note ||
+          slot.workAvailable,
+      );
+    if (!isPopulated) continue;
+    const parsedFromKey = Number(key.split('_')[1]);
+    const periodNum = Number.isInteger(slot.period) ? slot.period : parsedFromKey;
+    if (
+      Number.isInteger(periodNum) &&
+      periodNum >= 1 &&
+      periodNum <= VALIDATION_LIMITS.TIMETABLE_PERIOD_MAX
+    ) {
+      maxPopulatedSlotPeriod = Math.max(maxPopulatedSlotPeriod, periodNum);
+    }
+  }
+  const declared = Number.isInteger(timetable.periodCount)
+    ? timetable.periodCount
+    : 7;
+  return Math.max(
+    1,
+    Math.min(
+      VALIDATION_LIMITS.TIMETABLE_PERIOD_MAX,
+      Math.max(declared, maxPopulatedSlotPeriod),
+    ),
+  );
+}
+
+export function expandTimetableDraftPeriods(
+  draft: TimetableDraft,
+  minPeriodCount: number,
+): TimetableDraft {
+  const safeTarget = Math.max(
+    1,
+    Math.min(
+      VALIDATION_LIMITS.TIMETABLE_PERIOD_MAX,
+      Math.max(draft.periodCount || 1, minPeriodCount),
+    ),
+  );
+  const defaults = createDefaultPeriodTimes(safeTarget);
+  const nextPeriodTimes = { ...draft.periodTimes };
+  for (let p = 1; p <= safeTarget; p++) {
+    if (!nextPeriodTimes[String(p)]) {
+      nextPeriodTimes[String(p)] = defaults[String(p)];
+    }
+  }
+  const nextSlots = { ...draft.slots };
+  for (const w of TIMETABLE_WEEKDAYS) {
+    for (let p = 1; p <= safeTarget; p++) {
+      const key = makeSlotKey(w.day, p);
+      if (!nextSlots[key]) {
+        nextSlots[key] = createDefaultSlot(w.day, p);
+      }
+    }
+  }
+  return {
+    ...draft,
+    periodCount: safeTarget,
+    periodTimes: nextPeriodTimes,
+    slots: nextSlots,
+  };
+}
+
+export function pickPrimaryTimetableForManagement(
+  timetables: TimetableRecord[],
+): TimetableRecord | null {
+  if (timetables.length === 0) return null;
+  const sorted = [...timetables].sort((a, b) => {
+    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    const updatedDiff = getTimestampMs(b.updatedAt) - getTimestampMs(a.updatedAt);
+    if (updatedDiff !== 0) return updatedDiff;
+    const createdDiff = getTimestampMs(b.createdAt) - getTimestampMs(a.createdAt);
+    if (createdDiff !== 0) return createdDiff;
+    return b.effectiveFrom.localeCompare(a.effectiveFrom);
+  });
+  return sorted[0] ?? null;
+}
+
 export function selectActiveTimetableForDate(
   timetables: TimetableRecord[],
   dateKey: string,
@@ -314,12 +424,16 @@ export function selectActiveTimetableForDate(
 
   const sorted = [...inRange].sort((a, b) => {
     if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    if (a.isActive && b.isActive) {
+      const updatedDiff = getTimestampMs(b.updatedAt) - getTimestampMs(a.updatedAt);
+      if (updatedDiff !== 0) return updatedDiff;
+      const createdDiff = getTimestampMs(b.createdAt) - getTimestampMs(a.createdAt);
+      if (createdDiff !== 0) return createdDiff;
+    }
     if (a.effectiveFrom !== b.effectiveFrom) {
       return b.effectiveFrom.localeCompare(a.effectiveFrom);
     }
-    const aMs = a.updatedAt?.toMillis?.() ?? 0;
-    const bMs = b.updatedAt?.toMillis?.() ?? 0;
-    return bMs - aMs;
+    return getTimestampMs(b.updatedAt) - getTimestampMs(a.updatedAt);
   });
 
   return sorted[0] ?? null;
@@ -346,7 +460,9 @@ export function resolveTimetableForDate(
   const lunchEnd =
     effectiveOverride?.lunchEnd || activeTimetable?.lunchEnd || '13:20';
 
-  const basePeriodCount = activeTimetable?.periodCount ?? 0;
+  const basePeriodCount = activeTimetable
+    ? getEffectiveTimetablePeriodCount(activeTimetable)
+    : 0;
   const overridePeriodNums = Object.keys(effectiveOverride?.slots ?? {}).map(Number);
   const maxPeriod = Math.max(
     basePeriodCount,

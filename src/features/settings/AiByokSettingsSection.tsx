@@ -10,7 +10,6 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react';
-import { setStoredAiEnabled } from '../../lib/aiPreferences';
 import {
   normalizeGeminiApiKeyInput,
   validateGeminiApiKeyFormat,
@@ -19,17 +18,16 @@ import {
   AI_LIMITS,
   type AiByokTestResponse,
   type AiErrorCategory,
-  type AiStatusResponse,
   type GeminiDiagnosticErrorCategory,
 } from '../../lib/aiTypes';
 import {
   AiClientError,
   deleteByokApiKey,
-  fetchAiServerStatus,
   saveByokApiKey,
   testByokApiKey,
   updateAiServerPreferences,
 } from '../../services/aiClient';
+import { useAiWorkspace } from '../tasks/AiWorkspaceContext';
 
 interface AiByokSettingsSectionProps {
   uid: string;
@@ -38,9 +36,15 @@ interface AiByokSettingsSectionProps {
 const TOKEN_NUM_FMT = new Intl.NumberFormat('ko-KR');
 
 export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
-  const [aiStatus, setAiStatus] = useState<AiStatusResponse | null>(null);
-  const [statusLoading, setStatusLoading] = useState(false);
-  const [statusError, setStatusError] = useState<string | null>(null);
+  const {
+    aiStatus,
+    aiStatusLoaded,
+    aiStatusLoading: statusLoading,
+    aiStatusError: statusError,
+    refreshAiStatus,
+    patchAiStatus,
+    setLocalAiEnabled,
+  } = useAiWorkspace();
 
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [showKeyInput, setShowKeyInput] = useState(false);
@@ -132,30 +136,21 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     };
   }
 
+  useEffect(() => {
+    if (!aiStatus) return;
+    setDailyPlanLimitInput(aiStatus.dailyPlanLimit);
+    setDailyTotalLimitInput(aiStatus.dailyTotalLimit);
+  }, [aiStatus]);
+
   async function loadStatus() {
-    setStatusLoading(true);
-    setStatusError(null);
-    try {
-      const next = await fetchAiServerStatus();
-      setAiStatus(next);
-      setDailyPlanLimitInput(next.dailyPlanLimit);
-      setDailyTotalLimitInput(next.dailyTotalLimit);
-      setStoredAiEnabled(uid, next.aiEnabled);
-    } catch (err) {
-      setStatusError(
-        err instanceof Error
-          ? err.message
-          : 'AI 설정 및 사용량 상태를 불러오지 못했습니다.',
-      );
-    } finally {
-      setStatusLoading(false);
-    }
+    await refreshAiStatus(true);
   }
 
   useEffect(() => {
-    void loadStatus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [uid]);
+    if (!aiStatusLoaded) {
+      void refreshAiStatus(false);
+    }
+  }, [uid, aiStatusLoaded, refreshAiStatus]);
 
   async function handleSaveKey(e: FormEvent) {
     e.preventDefault();
@@ -283,10 +278,10 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     if (savingPrefs) return;
     setSavingPrefs(true);
     setSectionFeedback(null);
-    setStoredAiEnabled(uid, nextEnabled);
+    setLocalAiEnabled(nextEnabled);
     try {
       const res = await updateAiServerPreferences({ aiEnabled: nextEnabled });
-      setAiStatus((prev) =>
+      patchAiStatus((prev) =>
         prev
           ? {
               ...prev,
@@ -336,7 +331,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       });
       setDailyPlanLimitInput(res.dailyPlanLimit);
       setDailyTotalLimitInput(res.dailyTotalLimit);
-      setAiStatus((prev) =>
+      patchAiStatus((prev) =>
         prev
           ? {
               ...prev,

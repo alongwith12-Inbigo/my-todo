@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CalendarClock,
@@ -14,9 +14,13 @@ import {
   createDefaultPeriodTimes,
   createDefaultSlot,
   createEmptyTimetableDraft,
+  expandTimetableDraftPeriods,
+  getEffectiveTimetablePeriodCount,
   makeSlotKey,
+  pickPrimaryTimetableForManagement,
   SLOT_KIND_LABELS,
   TIMETABLE_WEEKDAYS,
+  timetableRecordToDraft,
   validateTimetableDraft,
   type TimetableDraft,
 } from '../../lib/timetable';
@@ -37,21 +41,10 @@ interface TimetableManagementViewProps {
 }
 
 function recordToDraft(record: TimetableRecord): TimetableDraft {
-  return {
-    name: record.name,
-    semesterLabel: record.semesterLabel,
-    effectiveFrom: record.effectiveFrom,
-    effectiveTo: record.effectiveTo,
-    workStart: record.workStart,
-    workEnd: record.workEnd,
-    lunchStart: record.lunchStart,
-    lunchEnd: record.lunchEnd,
-    periodCount: record.periodCount,
-    periodTimes: { ...record.periodTimes },
-    slots: { ...record.slots },
-    isActive: record.isActive,
-    sourceType: record.sourceType,
-  };
+  return expandTimetableDraftPeriods(
+    timetableRecordToDraft(record),
+    getEffectiveTimetablePeriodCount(record),
+  );
 }
 
 export function TimetableManagementView({
@@ -68,6 +61,7 @@ export function TimetableManagementView({
   } = useTimetableData();
 
   const [selectedId, setSelectedId] = useState<string | 'new' | null>(null);
+  const userManuallySelectedRef = useRef(false);
   const [draft, setDraft] = useState<TimetableDraft>(() =>
     createEmptyTimetableDraft(todayKey),
   );
@@ -91,19 +85,24 @@ export function TimetableManagementView({
 
   // Sync initial selection once timetables load
   useEffect(() => {
-    if (selectedId !== null) return;
+    const canAutoSelect =
+      selectedId === null ||
+      (selectedId === 'new' && !userManuallySelectedRef.current && !dirty);
+    if (!canAutoSelect) return;
+
     if (timetables.length > 0) {
-      const active =
-        timetables.find((t) => t.isActive) ?? timetables[0];
-      setSelectedId(active.id);
-      setDraft(recordToDraft(active));
-      setDirty(false);
-    } else if (!timetablesLoading) {
+      const primary = pickPrimaryTimetableForManagement(timetables);
+      if (primary) {
+        setSelectedId(primary.id);
+        setDraft(recordToDraft(primary));
+        setDirty(false);
+      }
+    } else if (!timetablesLoading && selectedId === null) {
       setSelectedId('new');
       setDraft(createEmptyTimetableDraft(todayKey));
       setDirty(false);
     }
-  }, [selectedId, timetables, timetablesLoading, todayKey]);
+  }, [selectedId, dirty, timetables, timetablesLoading, todayKey]);
 
   const currentRecord = useMemo(
     () =>
@@ -114,6 +113,7 @@ export function TimetableManagementView({
   );
 
   function handleSelectTimetable(targetId: string | 'new') {
+    userManuallySelectedRef.current = true;
     setFeedback(null);
     setConfirmSaveOverwrite(false);
     setConfirmDelete(false);
@@ -199,23 +199,34 @@ export function TimetableManagementView({
     setConfirmDelete(false);
 
     if (mode === 'create_new' || !currentRecord) {
+      userManuallySelectedRef.current = true;
       const base = createEmptyTimetableDraft(todayKey);
+      const nextDraft = expandTimetableDraftPeriods(
+        {
+          ...base,
+          periodCount: preview.periodCount,
+          periodTimes: preview.periodTimes,
+          slots: preview.slots,
+          sourceType: preview.sourceType,
+        },
+        preview.periodCount,
+      );
       setSelectedId('new');
-      setDraft({
-        ...base,
-        periodCount: preview.periodCount,
-        periodTimes: preview.periodTimes,
-        slots: preview.slots,
-        sourceType: preview.sourceType,
-      });
+      setDraft(nextDraft);
     } else {
-      setDraft((prev) => ({
-        ...prev,
-        periodCount: preview.periodCount,
-        periodTimes: preview.periodTimes,
-        slots: preview.slots,
-        sourceType: preview.sourceType,
-      }));
+      setDraft((prev) => {
+        const targetCount = Math.max(prev.periodCount, preview.periodCount);
+        return expandTimetableDraftPeriods(
+          {
+            ...prev,
+            periodCount: preview.periodCount,
+            periodTimes: preview.periodTimes,
+            slots: preview.slots,
+            sourceType: preview.sourceType,
+          },
+          targetCount,
+        );
+      });
     }
     setDirty(true);
     setFeedback({
@@ -645,19 +656,33 @@ export function TimetableManagementView({
           </div>
 
           <div className="space-y-1">
-            <label
-              htmlFor="tt-period-count"
-              className="block text-xs font-semibold text-slate-700"
-            >
-              하루 교시 수
-            </label>
+            <div className="flex items-center justify-between gap-2">
+              <label
+                htmlFor="tt-period-count"
+                className="block text-xs font-semibold text-slate-700"
+              >
+                하루 교시 수
+              </label>
+              {draft.periodCount < 7 && (
+                <button
+                  type="button"
+                  onClick={() => handlePeriodCountChange(7)}
+                  className="text-[11px] font-semibold text-teal-700 hover:text-teal-900 underline underline-offset-2 cursor-pointer"
+                >
+                  7교시까지로 확장
+                </button>
+              )}
+            </div>
             <select
               id="tt-period-count"
               value={draft.periodCount}
               onChange={(e) => handlePeriodCountChange(Number(e.target.value))}
               className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg bg-white tabular-nums"
             >
-              {[5, 6, 7, 8, 9, 10, 11, 12].map((num) => (
+              {(draft.periodCount < 5
+                ? [draft.periodCount, 5, 6, 7, 8, 9, 10, 11, 12]
+                : [5, 6, 7, 8, 9, 10, 11, 12]
+              ).map((num) => (
                 <option key={num} value={num}>
                   {num}교시까지
                 </option>

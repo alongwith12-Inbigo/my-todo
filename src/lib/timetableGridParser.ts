@@ -1,4 +1,9 @@
-import { createDefaultPeriodTimes, makeSlotKey, TIMETABLE_WEEKDAYS } from './timetable';
+import {
+  createDefaultPeriodTimes,
+  createDefaultSlot,
+  makeSlotKey,
+  TIMETABLE_WEEKDAYS,
+} from './timetable';
 import { sanitizeSingleLine } from './dateKst';
 import {
   VALIDATION_LIMITS,
@@ -141,14 +146,50 @@ export function detectWeekdayFromHeader(raw: string): TimetableWeekday | null {
   return null;
 }
 
+const CIRCLED_PERIOD_MAP: Record<string, number> = {
+  '①': 1,
+  '②': 2,
+  '③': 3,
+  '④': 4,
+  '⑤': 5,
+  '⑥': 6,
+  '⑦': 7,
+  '⑧': 8,
+  '⑨': 9,
+  '⑩': 10,
+  '⑪': 11,
+  '⑫': 12,
+};
+
 export function detectPeriodFromLabel(raw: string): number | null {
-  const cleaned = raw.replace(/\r\n/g, ' ').replace(/\s+/g, '');
+  const trimmed = raw.replace(/\r\n/g, ' ').trim();
+  if (!trimmed) return null;
+
+  if (CIRCLED_PERIOD_MAP[trimmed]) {
+    return CIRCLED_PERIOD_MAP[trimmed];
+  }
+
+  const cleaned = trimmed.replace(/\s+/g, '');
   if (!cleaned) return null;
 
-  // Handle "1교시(09:00~09:45)" or "1교시09:00~09:45"
-  const gyoMatch = /^(\d{1,2})교시/.exec(cleaned);
+  if (CIRCLED_PERIOD_MAP[cleaned[0]]) {
+    const rest = cleaned.slice(1);
+    if (!rest || /^(?:교시|차시|\(|[01]?\d:[0-5]\d)/.test(rest)) {
+      return CIRCLED_PERIOD_MAP[cleaned[0]];
+    }
+  }
+
+  // Handle "1교시", "제6교시", "1교시(09:00~09:45)", "6교시14:15~15:00"
+  const gyoMatch = /^제?(\d{1,2})(?:교시|차시)/.exec(cleaned);
   if (gyoMatch) {
     const num = Number(gyoMatch[1]);
+    return num >= 1 && num <= VALIDATION_LIMITS.TIMETABLE_PERIOD_MAX ? num : null;
+  }
+
+  // Handle "6 14:15~15:00", "6\n14:15~15:00", "6. 14:15~15:00" without matching "14:15~15:00"
+  const numWithTime = /^(\d{1,2})\.?\s+([01]?\d|2[0-3]):([0-5]\d)/.exec(trimmed);
+  if (numWithTime) {
+    const num = Number(numWithTime[1]);
     return num >= 1 && num <= VALIDATION_LIMITS.TIMETABLE_PERIOD_MAX ? num : null;
   }
 
@@ -558,5 +599,50 @@ export function analyzeTimetableMatrix(params: {
     warnings,
     needsConfirmationCount,
     recognitionFailedCount,
+  };
+}
+
+export function ensureImportPreviewPeriodCount(
+  preview: TimetableImportPreview,
+  targetPeriodCount: number,
+): TimetableImportPreview {
+  const safeTarget = Math.max(
+    1,
+    Math.min(VALIDATION_LIMITS.TIMETABLE_PERIOD_MAX, targetPeriodCount),
+  );
+  const defaults = createDefaultPeriodTimes(safeTarget);
+  const nextPeriodTimes = { ...preview.periodTimes };
+  for (let p = 1; p <= safeTarget; p++) {
+    const key = String(p);
+    if (!nextPeriodTimes[key]) {
+      nextPeriodTimes[key] = defaults[key];
+    }
+  }
+
+  const nextSlots = { ...preview.slots };
+  const nextCellMeta = { ...preview.cellMeta };
+  for (const w of TIMETABLE_WEEKDAYS) {
+    for (let p = 1; p <= safeTarget; p++) {
+      const sKey = makeSlotKey(w.day, p);
+      if (!nextSlots[sKey]) {
+        nextSlots[sKey] = createDefaultSlot(w.day, p);
+      }
+      if (!nextCellMeta[sKey]) {
+        nextCellMeta[sKey] = {
+          status: 'empty',
+          needsConfirmation: false,
+          reasons: [],
+          rawText: '',
+        };
+      }
+    }
+  }
+
+  return {
+    ...preview,
+    periodCount: safeTarget,
+    periodTimes: nextPeriodTimes,
+    slots: nextSlots,
+    cellMeta: nextCellMeta,
   };
 }

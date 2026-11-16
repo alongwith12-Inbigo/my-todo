@@ -139,6 +139,8 @@ const PLANNER_RESPONSE_SCHEMA: Schema = {
           recommendedEnd: { type: Type.STRING, nullable: true },
           estimatedMinutes: { type: Type.INTEGER },
           reason: { type: Type.STRING },
+          tier: { type: Type.STRING, enum: ['must', 'optional'] },
+          strategy: { type: Type.STRING, nullable: true },
         },
         required: ['taskId', 'order', 'estimatedMinutes', 'reason'],
       },
@@ -1110,13 +1112,14 @@ export async function generateDayPlanWithGemini(
   };
 
   const prompt = [
-    `당신은 한국 교사의 '오늘의 업무 실행 플래너'입니다.`,
+    `당신은 한국 교사의 '오늘의 업무 실행 전략 플래너'입니다.`,
     `규칙:`,
-    `1. 제공된 tasks의 id만 사용하세요(최대 5건 추천). 없는 id/업무 금지.`,
-    `2. recommendedStart/End(HH:MM)는 반드시 slots 구간 내부에만 겹치지 않게 배치하세요. slots가 비어 있으면 null로 두세요.`,
+    `1. 제공된 tasks의 id만 사용(최대 5건). 입력에 없는 업무·일정·의존성·근무시간은 절대 만들어내지 마세요.`,
+    `2. recommendedStart/End(HH:MM)는 반드시 slots 구간 내부에만 겹치지 않게 배치하세요. slots가 비어 있거나 시간이 부족하면 null로 두세요.`,
     `3. estimatedMinutes는 task.m 값이 있으면 그대로 사용하고, null일 때만 15~90 사이 합리적 정수(5단위)로 추정하세요.`,
-    `4. 마감(ov/dd), 중요도(p: u>h>n>l), 남은 시간, 집중 블록/짧은 공강 적합성을 판단해 우선순위를 정하고 큰 업무는 분할 제안하세요.`,
-    `5. reason은 1문장(35자 내외), coreAdvice는 1~2문장(90자 내외)으로 간결히 작성하세요.`,
+    `4. 단순 마감순이 아니라 긴급·공문 마감, 오늘 일정 전 준비(ev:true), 짧은 공강 vs 연속 집중 블록 적합성을 고려해 순서를 정하세요.`,
+    `5. tier는 'must'(오늘 반드시 할 업무)와 'optional'(시간이 남으면 할 업무)로 구분하고, 여력이 없으면 deferredTasks(다음 일정으로 미룰 업무)로 보내세요.`,
+    `6. reason(우선순위/배치 이유 35자 내외), strategy(입력 사실에 근거한 구체적 실행·분할 방법 45자 내외), coreAdvice(전체 전략 1~2문장 95자 내외)를 간결히 작성하세요.`,
     `입력JSON:${JSON.stringify(compactInput)}`,
   ].join('\n');
 
@@ -1127,7 +1130,7 @@ export async function generateDayPlanWithGemini(
     configuredModel,
     contents: prompt,
     baseConfig: {
-      maxOutputTokens: 1200,
+      maxOutputTokens: 1400,
       responseMimeType: 'application/json',
       responseSchema: PLANNER_RESPONSE_SCHEMA,
     },

@@ -17,6 +17,7 @@ import {
   ScanText,
   Sparkles,
 } from 'lucide-react';
+import { AI_LIMITS } from '../../lib/aiTypes';
 import {
   addKstDaysToDateKey,
   getKstDateParts,
@@ -72,7 +73,10 @@ export function TaskQuickAddBar({
 
   const todayKey = getKstDateParts().dateKey;
   const hasNewlines = title.includes('\n');
-  const isMultilineOrLong = hasNewlines || title.trim().length >= 80;
+  const trimmedTitleLength = title.trim().length;
+  const isTooLongForSingleTask = trimmedTitleLength > VALIDATION_LIMITS.TITLE_MAX_LEN;
+  const isMultilineOrLong = hasNewlines || trimmedTitleLength >= 80;
+  const lineCount = title ? title.split(/\r?\n/).length : 1;
   const combinedTextSource = [title.trim(), description.trim()]
     .filter(Boolean)
     .join('\n');
@@ -85,6 +89,13 @@ export function TaskQuickAddBar({
     const trimmedTitle = title.trim();
     if (!trimmedTitle) {
       setFeedback({ type: 'error', message: '업무 제목을 입력해 주세요.' });
+      return;
+    }
+    if (trimmedTitle.length > VALIDATION_LIMITS.TITLE_MAX_LEN) {
+      setFeedback({
+        type: 'error',
+        message: `단일 업무 제목은 ${VALIDATION_LIMITS.TITLE_MAX_LEN}자까지 등록할 수 있습니다. 긴 목록이나 여러 줄 공지는 [기본 분석] 또는 [AI로 분석]을 이용해 주세요.`,
+      });
       return;
     }
 
@@ -210,17 +221,19 @@ export function TaskQuickAddBar({
             </label>
             <textarea
               id="quick-task-title"
-              rows={isMultilineOrLong ? 5 : 1}
-              maxLength={isMultilineOrLong ? 10000 : VALIDATION_LIMITS.TITLE_MAX_LEN}
+              rows={isMultilineOrLong ? Math.min(14, Math.max(6, lineCount + 1)) : 1}
+              maxLength={AI_LIMITS.NOTICE_INPUT_MAX_CHARS}
               value={title}
               onChange={(e) => {
                 setTitle(e.target.value);
                 if (noticeImport.parseError) noticeImport.setParseError(null);
               }}
               onKeyDown={handleTitleKeyDown}
-              placeholder="업무 제목을 입력해 바로 등록하거나, 긴 쪽지·공지·캡처 이미지(Ctrl+V)를 붙여넣으세요"
+              placeholder="업무 제목을 입력해 바로 등록하거나, 긴 쪽지·공지·업무 목록·캡처 이미지(Ctrl+V)를 붙여넣으세요"
               className={`w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg bg-white text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-teal-700 leading-relaxed ${
-                isMultilineOrLong ? 'resize-y' : 'resize-none overflow-hidden'
+                isMultilineOrLong
+                  ? 'max-h-[420px] overflow-y-auto resize-y'
+                  : 'resize-none overflow-hidden'
               }`}
             />
           </div>
@@ -311,7 +324,7 @@ export function TaskQuickAddBar({
               </>
             )}
 
-            {!hasNewlines && (
+            {!hasNewlines && !isTooLongForSingleTask && (
               <button
                 type="submit"
                 disabled={createSubmitting}
@@ -327,10 +340,19 @@ export function TaskQuickAddBar({
         {/* Helpful strip when user pastes a long / multi-line notice */}
         {isMultilineOrLong && (
           <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600">
-            <span>
-              긴 문장이나 여러 줄 공지가 입력되었습니다. <strong>기본 분석</strong> 또는{' '}
-              <strong>AI로 분석</strong>을 선택해 업무와 일정을 나누어 검토할 수 있습니다. (원문은 저장되지 않습니다)
-            </span>
+            <div className="space-y-0.5">
+              <p>
+                긴 문장이나 여러 줄 공지가 입력되었습니다. <strong>기본 분석</strong> 또는{' '}
+                <strong>AI로 분석</strong>을 선택해 업무와 일정을 나누어 검토할 수 있습니다. (원문은 저장되지 않습니다)
+              </p>
+              <p className="text-[11px] text-slate-500 tabular-nums">
+                현재 {title.length.toLocaleString()}자 · {lineCount}줄 (입력 최대{' '}
+                {AI_LIMITS.NOTICE_INPUT_MAX_CHARS.toLocaleString()}자 · AI 분석{' '}
+                {AI_LIMITS.MAX_NOTICE_CHARS.toLocaleString()}자)
+                {combinedTextSource.length > AI_LIMITS.MAX_NOTICE_CHARS &&
+                  ' · AI 분석 한도를 넘어 기본 분석을 권장합니다.'}
+              </p>
+            </div>
             <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"

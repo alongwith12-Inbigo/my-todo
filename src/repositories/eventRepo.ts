@@ -79,7 +79,7 @@ export async function updateEvent(
   eventId: string,
   expectedVersion: number,
   patch: UpdateEventPatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   const path = `users/${uid}/events/${eventId}`;
   try {
     return await updateEventOp(db, uid, eventId, expectedVersion, patch);

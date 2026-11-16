@@ -1561,3 +1561,102 @@ test('SDK wire inspection, upstream 404 redaction/classification, single-probe t
   }
 });
 
+test('planner supports must/optional tiers, execution strategy, and linked-today-event signal without leaking descriptions', () => {
+  const now = new Date('2026-11-16T08:30:00+09:00');
+  const todayKey = '2026-11-16';
+  const timetable = makeTimetable();
+  const meeting: CalendarEventRecord = {
+    id: 'ev-today-meeting',
+    title: '교과 협의회',
+    startsAt: Timestamp.fromDate(new Date('2026-11-16T14:20:00+09:00')),
+    endsAt: Timestamp.fromDate(new Date('2026-11-16T15:10:00+09:00')),
+    allDay: false,
+    location: '회의실',
+    description: '비공개 회의 안건 상세',
+    relatedTaskId: null,
+    version: 1,
+    createdAt: Timestamp.fromDate(now),
+    updatedAt: Timestamp.fromDate(now),
+    schemaVersion: 1,
+  };
+
+  const tasks = [
+    makeTask({
+      id: 't-must',
+      title: '협의회 안건 자료 준비',
+      priority: 'high',
+      dueAt: Timestamp.fromDate(new Date('2026-11-16T23:59:59+09:00')),
+      relatedEventId: 'ev-today-meeting',
+      estimatedMinutes: 30,
+      description: '민감 메모 절대 전송 금지',
+    }),
+    makeTask({
+      id: 't-opt',
+      title: '교구 목록 정비',
+      priority: 'low',
+      estimatedMinutes: 25,
+      description: '민감 메모2',
+    }),
+  ];
+
+  const ctx = buildAiPlannerContext({
+    uid: 'teacher-strategy',
+    todayKey,
+    now,
+    tasks,
+    events: [meeting],
+    timetables: [timetable],
+    overridesByDate: {},
+    academicEvents: [],
+  });
+
+  const mustCompact = ctx.compressedRequest.tasks.find((t) => t.id === 't-must');
+  assert.equal(mustCompact?.ev, true);
+  assert.ok(!JSON.stringify(ctx.compressedRequest).includes('민감 메모'));
+
+  const detPlan = buildDeterministicDayPlan(ctx);
+  assert.equal(detPlan.recommendations[0].tier, 'must');
+  assert.ok(detPlan.recommendations[0].strategy?.includes('일정'));
+  assert.equal(detPlan.recommendations[1].tier, 'optional');
+
+  const validated = validateAndRepairAiPlan(
+    {
+      coreAdvice: '오전 공강에 회의 자료를 먼저 준비하세요.',
+      recommendations: [
+        {
+          taskId: 't-must',
+          order: 1,
+          recommendedStart: '10:00',
+          recommendedEnd: '10:30',
+          estimatedMinutes: 30,
+          tier: 'must',
+          reason: '오후 협의회 전에 마쳐야 합니다.',
+          strategy: '자료 핵심 항목 3가지만 먼저 정리 후 출력하세요.',
+        },
+        {
+          taskId: 't-opt',
+          order: 2,
+          recommendedStart: '13:20',
+          recommendedEnd: '13:45',
+          estimatedMinutes: 25,
+          tier: 'optional',
+          reason: '여유 시간대에 처리 가능합니다.',
+          strategy: '목록 시트 기준 누락 품목만 우선 확인하세요.',
+        },
+      ],
+      attentionTasks: [],
+      deferredTasks: [],
+    },
+    ctx,
+    { model: 'gemini-2.5-flash', generatedAtIso: '2026-11-16T00:00:00Z' },
+  );
+
+  assert.equal(validated.recommendations[0].tier, 'must');
+  assert.equal(
+    validated.recommendations[0].strategy,
+    '자료 핵심 항목 3가지만 먼저 정리 후 출력하세요.',
+  );
+  assert.equal(validated.recommendations[1].tier, 'optional');
+});
+
+

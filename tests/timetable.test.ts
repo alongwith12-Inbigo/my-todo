@@ -6,12 +6,19 @@ import { Timestamp } from 'firebase/firestore';
 import {
   computeDayTimeAvailability,
   createEmptyTimetableDraft,
+  expandTimetableDraftPeriods,
+  getEffectiveTimetablePeriodCount,
   makeSlotKey,
+  pickPrimaryTimetableForManagement,
   resolveTimetableForDate,
+  selectActiveTimetableForDate,
 } from '../src/lib/timetable';
 import { parseTimetableFromExcelBuffer } from '../src/lib/timetableExcelParser';
 import {
+  analyzeTimetableMatrix,
+  detectPeriodFromLabel,
   detectTimetableFileKind,
+  ensureImportPreviewPeriodCount,
   parseTimetableCellText,
 } from '../src/lib/timetableGridParser';
 import {
@@ -600,3 +607,171 @@ test('Repository payload builders accept hwpx/pdf sources and enforce valid date
     TimetableValidationError,
   );
 });
+
+test('selectActiveTimetableForDate & pickPrimaryTimetableForManagement prefer the most recently updated active 7-period timetable', () => {
+  const draftOld5 = createEmptyTimetableDraft('2026-11-16');
+  draftOld5.name = '이전 5교시 시간표';
+  draftOld5.effectiveFrom = '2026-09-01';
+  draftOld5.effectiveTo = '2027-02-28';
+  draftOld5.periodCount = 5;
+  draftOld5.isActive = true;
+
+  const draftNew7 = createEmptyTimetableDraft('2026-11-16');
+  draftNew7.name = '최신 7교시 시간표';
+  draftNew7.effectiveFrom = '2026-08-15';
+  draftNew7.effectiveTo = '2027-02-28';
+  draftNew7.periodCount = 7;
+  draftNew7.isActive = true;
+
+  const old5Record: TimetableRecord = {
+    id: 'tt_old_5',
+    ...draftOld5,
+    version: 1,
+    createdAt: makeTs('2026-09-01T00:00:00Z'),
+    updatedAt: makeTs('2026-09-01T00:00:00Z'),
+    schemaVersion: SCHEMA_VERSION,
+  };
+
+  const new7Record: TimetableRecord = {
+    id: 'tt_new_7',
+    ...draftNew7,
+    version: 2,
+    createdAt: makeTs('2026-11-15T00:00:00Z'),
+    updatedAt: makeTs('2026-11-16T01:00:00Z'),
+    schemaVersion: SCHEMA_VERSION,
+  };
+
+  const pickedMgmt = pickPrimaryTimetableForManagement([old5Record, new7Record]);
+  assert.equal(pickedMgmt?.id, 'tt_new_7');
+
+  const pickedForDate = selectActiveTimetableForDate(
+    [old5Record, new7Record],
+    '2026-11-16',
+  );
+  assert.equal(pickedForDate?.id, 'tt_new_7');
+
+  const resolved = resolveTimetableForDate(
+    '2026-11-16',
+    [old5Record, new7Record],
+    null,
+  );
+  assert.equal(resolved.timetableId, 'tt_new_7');
+  assert.equal(resolved.periods.length, 7);
+});
+
+test('getEffectiveTimetablePeriodCount & expandTimetableDraftPeriods recover populated 6-7 periods and cleanly pad 5-period drafts to 7', () => {
+  const draft = createEmptyTimetableDraft('2026-11-16');
+  draft.periodCount = 5;
+  draft.slots[makeSlotKey(1, 7)] = {
+    day: 1,
+    period: 7,
+    kind: 'class',
+    subject: '창체',
+    className: '3-1',
+    classroom: '교실',
+    note: '',
+    workAvailable: false,
+  };
+
+  const recordWithHidden7: TimetableRecord = {
+    id: 'tt_hidden_7',
+    ...draft,
+    version: 1,
+    createdAt: makeTs('2026-11-15T00:00:00Z'),
+    updatedAt: makeTs('2026-11-15T00:00:00Z'),
+    schemaVersion: SCHEMA_VERSION,
+  };
+
+  assert.equal(getEffectiveTimetablePeriodCount(recordWithHidden7), 7);
+  const resolved = resolveTimetableForDate('2026-11-16', [recordWithHidden7], null);
+  assert.equal(resolved.periods.length, 7);
+  assert.equal(resolved.periods[6].subject, '창체');
+
+  // Expanding an explicit 5-period draft to 7 fills 6~7 periodTimes & slots cleanly
+  const pure5 = createEmptyTimetableDraft('2026-11-16');
+  pure5.periodCount = 5;
+  pure5.slots[makeSlotKey(1, 1)] = {
+    day: 1,
+    period: 1,
+    kind: 'class',
+    subject: '수학',
+    className: '2-1',
+    classroom: '201호',
+    note: '',
+    workAvailable: false,
+  };
+  delete pure5.periodTimes['6'];
+  delete pure5.periodTimes['7'];
+  delete pure5.slots[makeSlotKey(1, 6)];
+  delete pure5.slots[makeSlotKey(1, 7)];
+
+  const expanded7 = expandTimetableDraftPeriods(pure5, 7);
+  assert.equal(expanded7.periodCount, 7);
+  assert.ok(expanded7.periodTimes['6']);
+  assert.ok(expanded7.periodTimes['7']);
+  assert.equal(expanded7.slots[makeSlotKey(1, 1)].subject, '수학');
+  assert.equal(expanded7.slots[makeSlotKey(1, 6)].kind, 'free');
+  assert.equal(expanded7.slots[makeSlotKey(1, 7)].kind, 'free');
+});
+
+test('Parsers recognize 6-7 period labels, handle lunch gaps in 7-period PDFs, and ensureImportPreviewPeriodCount preserves 1-5 while padding to 7', () => {
+  assert.equal(detectPeriodFromLabel('6 14:15~15:00'), 6);
+  assert.equal(detectPeriodFromLabel('제7교시'), 7);
+  assert.equal(detectPeriodFromLabel('⑥'), 6);
+  assert.equal(detectPeriodFromLabel('⑦'), 7);
+  assert.equal(detectPeriodFromLabel('14:15~15:00'), null);
+
+  // 7-period PDF with large vertical gap (lunch) between 4교시 and 5~7교시
+  const pdf7 = parseTimetableFromPdfPageTokens({
+    pageNumber: 1,
+    width: 600,
+    height: 800,
+    tokens: [
+      { text: '월', x: 140, topY: 40, width: 20, height: 14 },
+      { text: '화', x: 220, topY: 40, width: 20, height: 14 },
+      { text: '수', x: 300, topY: 40, width: 20, height: 14 },
+      { text: '목', x: 380, topY: 40, width: 20, height: 14 },
+      { text: '금', x: 460, topY: 40, width: 20, height: 14 },
+      { text: '1교시', x: 40, topY: 90, width: 35, height: 14 },
+      { text: '3-1', x: 138, topY: 90, width: 24, height: 14 },
+      { text: '2교시', x: 40, topY: 135, width: 35, height: 14 },
+      { text: '3-2', x: 138, topY: 135, width: 24, height: 14 },
+      { text: '3교시', x: 40, topY: 180, width: 35, height: 14 },
+      { text: '3-3', x: 138, topY: 180, width: 24, height: 14 },
+      { text: '4교시', x: 40, topY: 225, width: 35, height: 14 },
+      { text: '3-4', x: 138, topY: 225, width: 24, height: 14 },
+      // Vertical gap (~110px lunch break)
+      { text: '5교시', x: 40, topY: 340, width: 35, height: 14 },
+      { text: '3-1', x: 138, topY: 340, width: 24, height: 14 },
+      { text: '⑥', x: 40, topY: 390, width: 20, height: 14 },
+      { text: '국어 3-2', x: 138, topY: 390, width: 45, height: 14 },
+      { text: '제7교시', x: 40, topY: 440, width: 42, height: 14 },
+      { text: '동아리', x: 458, topY: 440, width: 36, height: 14 },
+    ],
+  });
+  assert.equal(pdf7.periodCount, 7);
+  assert.equal(pdf7.slots[makeSlotKey(1, 6)].subject, '국어');
+  assert.equal(pdf7.slots[makeSlotKey(1, 6)].className, '3-2');
+  assert.equal(pdf7.slots[makeSlotKey(5, 7)].subject, '동아리');
+
+  // 5-period matrix padded to 7 via ensureImportPreviewPeriodCount keeps 1~5 intact
+  const matrix5 = analyzeTimetableMatrix({
+    sourceType: 'excel',
+    extractionMode: 'excel',
+    grid: [
+      ['교시', '월', '화', '수', '목', '금'],
+      ['1교시', '국어 3-1', '', '', '', ''],
+      ['5교시', '', '', '', '', '수학 3-2'],
+    ],
+  });
+  assert.equal(matrix5.periodCount, 5);
+  const padded7 = ensureImportPreviewPeriodCount(matrix5, 7);
+  assert.equal(padded7.periodCount, 7);
+  assert.equal(padded7.slots[makeSlotKey(1, 1)].subject, '국어');
+  assert.equal(padded7.slots[makeSlotKey(5, 5)].subject, '수학');
+  assert.equal(padded7.slots[makeSlotKey(1, 7)].kind, 'free');
+  assert.equal(padded7.cellMeta[makeSlotKey(1, 7)].status, 'empty');
+  assert.ok(padded7.periodTimes['6']);
+  assert.ok(padded7.periodTimes['7']);
+});
+

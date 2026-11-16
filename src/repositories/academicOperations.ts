@@ -318,7 +318,7 @@ export async function updateAcademicEvent(
   eventId: string,
   expectedVersion: number,
   draft: AcademicEventDraft,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   if (!isValidFirestoreId(uid) || !isValidFirestoreId(eventId)) {
     throw new AcademicEventValidationError('유효하지 않은 학사일정 식별자입니다.');
   }
@@ -335,6 +335,23 @@ export async function updateAcademicEvent(
     if (current.version !== expectedVersion) {
       throw new AcademicEventConcurrencyError(expectedVersion, current.version);
     }
+
+    if (
+      previewFields.title === current.title &&
+      previewFields.category === current.category &&
+      previewFields.startDate === current.startDate &&
+      previewFields.endDate === current.endDate &&
+      (previewFields.startTime ?? null) === (current.startTime ?? null) &&
+      (previewFields.endTime ?? null) === (current.endTime ?? null) &&
+      previewFields.location === (current.location ?? '') &&
+      previewFields.schoolYear === current.schoolYear &&
+      previewFields.timetableImpact === current.timetableImpact &&
+      (previewFields.overrideDateKey ?? null) === (current.overrideDateKey ?? null) &&
+      previewFields.dedupeKey === current.dedupeKey
+    ) {
+      return { id: eventId, version: current.version, unchanged: true };
+    }
+
     const nextVersion = current.version + 1;
     tx.update(ref, {
       ...previewFields,

@@ -1,5 +1,6 @@
 import { useId, useRef } from 'react';
 import { Image as ImageIcon, RefreshCw, ScanText, Sparkles, X } from 'lucide-react';
+import { AI_LIMITS } from '../../lib/aiTypes';
 import type { BrowserOcrProgress } from '../../lib/ocrProcessor';
 
 interface ImportImageOcrBoxProps {
@@ -181,7 +182,7 @@ export function ImportImageOcrBox({
           <textarea
             id={textareaId}
             rows={7}
-            maxLength={10000}
+            maxLength={AI_LIMITS.NOTICE_INPUT_MAX_CHARS}
             value={ocrEditedText}
             onChange={(e) => onChangeText(e.target.value)}
             placeholder={

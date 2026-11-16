@@ -44,6 +44,15 @@ export interface PlanAdjustmentFilter {
   constraintText?: string;
 }
 
+export type AvailabilityStatusReason =
+  | 'available'
+  | 'weekend_or_holiday'
+  | 'no_timetable'
+  | 'unconfirmed_academic'
+  | 'no_workable_free_periods'
+  | 'after_work_hours'
+  | 'blocked_by_events';
+
 export interface PlannerContextResult {
   todayKey: string;
   currentTimeHhMm: string;
@@ -53,12 +62,15 @@ export interface PlannerContextResult {
   fullDayAvailability: DayTimeAvailability;
   remainingWorkableIntervals: MinuteInterval[];
   remainingWorkableMinutes: number;
+  availabilityReason: AvailabilityStatusReason;
+  availabilityReasonDetail: string;
   unconfirmedAcademicWarnings: string[];
   todayAcademicEvents: AcademicEventRecord[];
   activeIncompleteTasks: TaskRecord[];
   rankedTasks: TaskRecord[];
   compressedRequest: AiPlannerRequest;
   fingerprint: string;
+  dataFingerprint: string;
 }
 
 export interface ValidatedPlanItem {
@@ -73,7 +85,9 @@ export interface ValidatedPlanItem {
   slotStart: string | null;
   slotEnd: string | null;
   slotStatus: 'scheduled' | 'repaired' | 'unscheduled_overflow';
+  tier: 'must' | 'optional';
   reason: string;
+  strategy: string | null;
   validationNote: string | null;
 }
 
@@ -97,11 +111,53 @@ export interface ValidatedDayPlan {
   totalPlannedMinutes: number;
   remainingWorkableMinutes: number;
   remainingSpareMinutes: number;
+  availabilityReason?: AvailabilityStatusReason;
+  availabilityReasonDetail?: string;
   overloadWarning: string | null;
   academicWarnings: string[];
   validationRepairs: string[];
   fromCache?: boolean;
   usage?: AiTokenUsage;
+}
+
+export function getDefaultUnscheduledNote(reason: AvailabilityStatusReason): string {
+  switch (reason) {
+    case 'weekend_or_holiday':
+      return '주말·휴일에는 근무 시간을 임의로 배정하지 않아 시간대 미배정';
+    case 'no_timetable':
+      return '주간 시간표가 미등록되어 시간대 미배정 (우선순위 참고용)';
+    case 'unconfirmed_academic':
+      return '학사일정 시간표 임시 변경이 미확정되어 시간대 미배정';
+    case 'no_workable_free_periods':
+      return '시간표상 업무 가능 공강·여유 시간이 설정되지 않아 시간대 미배정';
+    case 'after_work_hours':
+      return '오늘 업무 가능 시각이 지나 시간대 미배정';
+    case 'blocked_by_events':
+      return '수업·개인 일정·학사일정과 겹쳐 남은 가용 시간 부족';
+    default:
+      return '오늘 확보된 가용 시간대 부족 (시간 확인 또는 내일로 조정 권장)';
+  }
+}
+
+export function getAvailabilityReasonShortLabel(
+  reason?: AvailabilityStatusReason,
+): string {
+  switch (reason) {
+    case 'weekend_or_holiday':
+      return '주말·휴일 (미지정)';
+    case 'no_timetable':
+      return '시간표 미등록';
+    case 'unconfirmed_academic':
+      return '학사일정 미확정';
+    case 'no_workable_free_periods':
+      return '가능 공강 미설정';
+    case 'after_work_hours':
+      return '근무 시간 경과';
+    case 'blocked_by_events':
+      return '일정·행사 겹침';
+    default:
+      return '가용 시간 없음';
+  }
 }
 
 const PRIORITY_CODE_MAP: Record<TaskPriority, MinimalPlannerTask['p']> = {
@@ -420,13 +476,77 @@ export function buildAiPlannerContext(params: {
           dDay === 0 ||
           schedKey === params.todayKey ||
           (remindKey !== null && remindKey <= params.todayKey),
+        ...(task.relatedEventId && todayEventIds.has(task.relatedEventId)
+          ? { ev: true }
+          : {}),
       };
     });
 
-  const workableSlots: MinimalPlannerSlot[] = (
+  const effectiveRemainingIntervals =
+    hasUnconfirmedDisruption && !override ? [] : remainingWorkableIntervals;
+  const effectiveRemainingMinutes =
+    hasUnconfirmedDisruption && !override ? 0 : remainingWorkableMinutes;
+
+  let availabilityReason: AvailabilityStatusReason = 'available';
+  let availabilityReasonDetail = '';
+
+  if (hasUnconfirmedDisruption && !override) {
+    availabilityReason = 'unconfirmed_academic';
+    availabilityReasonDetail =
+      '오늘 학사일정의 시간표 임시 변경 여부가 확정되지 않아 수업 외 가용 시간을 비워 두었습니다. 시간표 임시 변경으로 확정하면 가용 시간이 반영됩니다.';
+  } else if (effectiveRemainingMinutes > 0) {
+    availabilityReason = 'available';
+  } else if (!resolvedDay.isWeekday && !override) {
+    availabilityReason = 'weekend_or_holiday';
+    availabilityReasonDetail =
+      '주말·휴일에는 임의의 근무시간을 만들지 않습니다. 실제 근무·출근 일정이 있다면 해당 날짜에 시간표 임시 변경을 등록해 주세요.';
+  } else if (!fullDayAvailability.hasTimetable) {
+    availabilityReason = 'no_timetable';
+    availabilityReasonDetail =
+      '오늘 적용되는 주간 시간표가 아직 등록되지 않았습니다. 시간표를 등록하면 수업 외 가용 시간대에 업무를 배치할 수 있습니다.';
+  } else if (fullDayAvailability.workableConfiguredMinutes === 0) {
+    availabilityReason = 'no_workable_free_periods';
+    availabilityReasonDetail =
+      '오늘 시간표에 수업 외 "업무 가능"으로 지정된 공강·여유 시간이 없습니다. 시간표에서 공강 교시에 업무 가능 표시를 켜거나 비수업 근무 구간을 확인해 주세요.';
+  } else if (
+    fullDayAvailability.netAvailableMinutes === 0 &&
+    fullDayAvailability.overlappingEventMinutes > 0
+  ) {
+    availabilityReason = 'blocked_by_events';
+    availabilityReasonDetail =
+      '오늘 업무 가능 시간이 개인 일정과 모두 겹쳐 남은 가용 시간이 없습니다.';
+  } else {
+    const clippedBeforeAcademic = clipIntervalsToCurrentTime(
+      fullDayAvailability.netAvailableIntervals,
+      currentMinOfDay,
+    );
+    if (clippedBeforeAcademic.length === 0 && fullDayAvailability.netAvailableMinutes > 0) {
+      availabilityReason = 'after_work_hours';
+      availabilityReasonDetail = `현재 시각(${currentTimeHhMm}) 기준으로 오늘 설정된 업무 가능 시간(${resolvedDay.workStart}~${resolvedDay.workEnd})이 모두 지났습니다.`;
+    } else if (academicTimeBlocks.length > 0) {
+      availabilityReason = 'blocked_by_events';
+      availabilityReasonDetail =
+        '오늘 업무 가능 시간이 개인 일정 또는 학사일정 시간대와 모두 겹쳐 남은 가용 시간이 없습니다.';
+    } else {
+      availabilityReason = 'no_workable_free_periods';
+      availabilityReasonDetail =
+        '오늘 남은 가용 시간이 확보되지 않아 우선순위만 정리했습니다.';
+    }
+  }
+
+  const workableSlots: MinimalPlannerSlot[] = effectiveRemainingIntervals
+    .slice(0, AI_LIMITS.MAX_PLANNER_SLOTS)
+    .map((seg) => ({
+      st: seg.startTime,
+      et: seg.endTime,
+      min: seg.minutes,
+      lb: sanitizeSingleLine(seg.label || '업무 가능 시간', 24),
+    }));
+
+  const fullDaySlotsForSignature: MinimalPlannerSlot[] = (
     hasUnconfirmedDisruption && !override
       ? []
-      : remainingWorkableIntervals
+      : fullDayAvailability.netAvailableIntervals
   )
     .slice(0, AI_LIMITS.MAX_PLANNER_SLOTS)
     .map((seg) => ({
@@ -450,8 +570,7 @@ export function buildAiPlannerContext(params: {
     overdueCount: briefingCounts.overdue.length,
     dueTodayCount: briefingCounts.dueToday.length,
     timetableConfigured: fullDayAvailability.hasTimetable,
-    remainingWorkableMinutes:
-      hasUnconfirmedDisruption && !override ? 0 : remainingWorkableMinutes,
+    remainingWorkableMinutes: effectiveRemainingMinutes,
     workableSlots,
     blockedEventsSummary,
     academicAlertsSummary,
@@ -469,6 +588,16 @@ export function buildAiPlannerContext(params: {
     constraint,
   });
 
+  const dataFingerprint = computePlannerFingerprint({
+    uid: params.uid,
+    todayKey: params.todayKey,
+    workableSlots: fullDaySlotsForSignature,
+    tasks: compressedTasks,
+    blockedEventsSummary,
+    academicAlertsSummary,
+    constraint,
+  });
+
   return {
     todayKey: params.todayKey,
     currentTimeHhMm,
@@ -476,16 +605,17 @@ export function buildAiPlannerContext(params: {
     timetableConfigured: fullDayAvailability.hasTimetable,
     hasConfirmedOverride: Boolean(override),
     fullDayAvailability,
-    remainingWorkableIntervals:
-      hasUnconfirmedDisruption && !override ? [] : remainingWorkableIntervals,
-    remainingWorkableMinutes:
-      hasUnconfirmedDisruption && !override ? 0 : remainingWorkableMinutes,
+    remainingWorkableIntervals: effectiveRemainingIntervals,
+    remainingWorkableMinutes: effectiveRemainingMinutes,
+    availabilityReason,
+    availabilityReasonDetail,
     unconfirmedAcademicWarnings,
     todayAcademicEvents,
     activeIncompleteTasks,
     rankedTasks,
     compressedRequest,
     fingerprint,
+    dataFingerprint,
   };
 }
 
@@ -651,8 +781,12 @@ export function validateAndRepairAiPlan(
   context: PlannerContextResult,
   meta: { model: string; generatedAtIso: string; usage?: AiTokenUsage },
 ): ValidatedDayPlan {
-  const taskById = new Map<string, TaskRecord>();
+  const activeTaskById = new Map<string, TaskRecord>();
   for (const t of context.activeIncompleteTasks) {
+    activeTaskById.set(t.id, t);
+  }
+  const taskById = new Map<string, TaskRecord>();
+  for (const t of context.rankedTasks) {
     taskById.set(t.id, t);
   }
 
@@ -672,7 +806,9 @@ export function validateAndRepairAiPlan(
     const taskId = raw.taskId.trim();
     const task = taskById.get(taskId);
     if (!task) {
-      validationRepairs.push('목록에 없거나 이미 완료된 업무 ID가 제외되었습니다.');
+      if (!activeTaskById.has(taskId)) {
+        validationRepairs.push('목록에 없거나 이미 완료된 업무 ID가 제외되었습니다.');
+      }
       continue;
     }
     if (seenIds.has(taskId)) continue;
@@ -723,7 +859,7 @@ export function validateAndRepairAiPlan(
             `"${task.title}" 시간대가 가용 시간 기준(${slotStart}~${slotEnd})으로 보정되었습니다.`,
           );
         } else {
-          validationNote = '오늘 확보된 가용 시간대 부족 (시간 확인 또는 내일로 조정 권장)';
+          validationNote = getDefaultUnscheduledNote(context.availabilityReason);
         }
       }
     } else if (freeWindows.length > 0) {
@@ -733,8 +869,31 @@ export function validateAndRepairAiPlan(
         slotEnd = minutesToHhMm(allocated.endMin);
         slotStatus = 'repaired';
         freeWindows = allocated.updatedFree;
+      } else {
+        validationNote = getDefaultUnscheduledNote(context.availabilityReason);
       }
+    } else {
+      validationNote = getDefaultUnscheduledNote(context.availabilityReason);
     }
+
+    const tier: ValidatedPlanItem['tier'] =
+      raw.tier === 'optional'
+        ? 'optional'
+        : raw.tier === 'must'
+          ? 'must'
+          : isOverdue ||
+              dueKey === context.todayKey ||
+              task.priority === 'urgent' ||
+              task.priority === 'high' ||
+              task.status === 'doing' ||
+              recommendations.length < 2
+            ? 'must'
+            : 'optional';
+
+    const strategy =
+      typeof raw.strategy === 'string' && raw.strategy.trim()
+        ? sanitizeSingleLine(raw.strategy, 140)
+        : null;
 
     recommendations.push({
       taskId,
@@ -748,7 +907,9 @@ export function validateAndRepairAiPlan(
       slotStart,
       slotEnd,
       slotStatus,
+      tier,
       reason: sanitizeSingleLine(raw.reason || '마감과 중요도를 반영해 우선 추천합니다.', 180),
+      strategy,
       validationNote,
     });
   }
@@ -799,6 +960,8 @@ export function validateAndRepairAiPlan(
     totalPlannedMinutes: 0,
     remainingWorkableMinutes: context.remainingWorkableMinutes,
     remainingSpareMinutes: 0,
+    availabilityReason: context.availabilityReason,
+    availabilityReasonDetail: context.availabilityReasonDetail,
     overloadWarning: null,
     academicWarnings: context.unconfirmedAcademicWarnings,
     validationRepairs: Array.from(new Set(validationRepairs)),
@@ -842,6 +1005,32 @@ export function buildDeterministicDayPlan(
       else if (task.priority === 'urgent' || task.priority === 'high') reasonParts.push('중요도 높음');
       if (task.status === 'doing') reasonParts.push('현재 진행 중');
 
+      const compressedMatch = context.compressedRequest.tasks.find(
+        (c) => c.id === task.id,
+      );
+      const maxRemainingWindow =
+        context.remainingWorkableIntervals.length > 0
+          ? Math.max(...context.remainingWorkableIntervals.map((s) => s.minutes))
+          : 0;
+      const tier: ValidatedPlanItem['tier'] =
+        isOverdue ||
+        dueKey === context.todayKey ||
+        task.priority === 'urgent' ||
+        task.priority === 'high' ||
+        task.status === 'doing'
+          ? 'must'
+          : 'optional';
+
+      let strategy: string | null = null;
+      if (compressedMatch?.ev) {
+        strategy = '오늘 연결된 일정 시작 전 관련 자료·안건을 먼저 점검하세요.';
+      } else if (
+        maxRemainingWindow > 0 &&
+        estimatedMinutes > maxRemainingWindow
+      ) {
+        strategy = '연속 공강이 짧아 자료 확인·초안 작성·최종 점검으로 분할 진행을 권장합니다.';
+      }
+
       recommendations.push({
         taskId: task.id,
         title: task.title,
@@ -854,10 +1043,12 @@ export function buildDeterministicDayPlan(
         slotStart,
         slotEnd,
         slotStatus: allocated ? 'scheduled' : 'unscheduled_overflow',
+        tier,
         reason: reasonParts.length > 0 ? `${reasonParts.join(' · ')} 항목입니다.` : '우선순위에 따라 배치했습니다.',
+        strategy,
         validationNote: allocated
           ? null
-          : '오늘 확보된 가용 시간이 부족하여 시간대 미배정',
+          : getDefaultUnscheduledNote(context.availabilityReason),
       });
 
       if (isOverdue || dueKey === context.todayKey) {
@@ -887,7 +1078,7 @@ export function buildDeterministicDayPlan(
         ? `남은 업무 가능 시간 ${formatMinutesKorean(
             context.remainingWorkableMinutes,
           )} 안에 마감·중요도 순으로 ${recommendations.length}건을 배치했습니다.`
-        : `확정된 수업 외 가용 시간이 부족하거나 시간표가 미설정되어 우선순위 ${recommendations.length}건만 정리했습니다.`;
+        : `${context.availabilityReasonDetail || '오늘 가용 시간이 확보되지 않아'} 우선순위 ${recommendations.length}건만 정리했습니다.`;
 
   return recomputePlanTotals({
     mode: 'deterministic',
@@ -901,6 +1092,8 @@ export function buildDeterministicDayPlan(
     totalPlannedMinutes: 0,
     remainingWorkableMinutes: context.remainingWorkableMinutes,
     remainingSpareMinutes: 0,
+    availabilityReason: context.availabilityReason,
+    availabilityReasonDetail: context.availabilityReasonDetail,
     overloadWarning: null,
     academicWarnings: context.unconfirmedAcademicWarnings,
     validationRepairs: [],

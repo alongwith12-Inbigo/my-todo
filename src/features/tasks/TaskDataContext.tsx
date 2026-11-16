@@ -10,10 +10,17 @@ import {
 } from 'react';
 import type { DocumentData, QueryDocumentSnapshot } from 'firebase/firestore';
 import {
+  makeTaskPageCacheKey,
+  patchCachedTaskPages,
+  removeTaskFromCachedPages,
+  type CachedTaskPage,
+} from '../../lib/taskCache';
+import {
   createTask,
   fetchBriefingTaskSet,
   fetchMoreUndatedTasks,
   fetchSingleTask,
+  fetchTasksPage,
   permanentlyDeleteTask,
   postponeTask,
   restoreTask,
@@ -22,6 +29,8 @@ import {
   updateTaskDetails,
   type CreateTaskInput,
   type PostponeTaskPatch,
+  type TaskFilterTab,
+  type TaskQuerySortField,
   type UpdateTaskDetailsPatch,
 } from '../../repositories/taskRepo';
 import type { TaskRecord, TaskStatus } from '../../types/domain';
@@ -30,6 +39,7 @@ import { formatTaskErrorMessage } from './taskErrors';
 
 interface TaskDataContextValue {
   briefingTasks: TaskRecord[];
+  cachedDoneTasks: TaskRecord[];
   briefingLoading: boolean;
   briefingError: string | null;
   hasMoreUndated: boolean;
@@ -38,6 +48,25 @@ interface TaskDataContextValue {
   createSubmitting: boolean;
   isTaskPending: (taskId: string) => boolean;
   listVersion: number;
+  taskPagesByKey: Record<string, CachedTaskPage>;
+  taskPageLoadingKey: string | null;
+  taskPageLoadingMoreKey: string | null;
+  taskPageError: string | null;
+  ensureTasksPageLoaded: (
+    filter: TaskFilterTab,
+    sortField: TaskQuerySortField,
+    pageSize?: number,
+  ) => Promise<void>;
+  refreshTasksPage: (
+    filter: TaskFilterTab,
+    sortField: TaskQuerySortField,
+    pageSize?: number,
+  ) => Promise<void>;
+  loadMoreTasksPage: (
+    filter: TaskFilterTab,
+    sortField: TaskQuerySortField,
+    pageSize?: number,
+  ) => Promise<void>;
   refreshBriefing: () => Promise<void>;
   loadMoreUndated: () => Promise<void>;
   refreshSingleTask: (taskId: string) => Promise<TaskRecord | null>;
@@ -87,6 +116,7 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
   const imminentDays = workspace?.preferences.imminentDays ?? 3;
 
   const [briefingTasks, setBriefingTasks] = useState<TaskRecord[]>([]);
+  const [sessionCompletedTasks, setSessionCompletedTasks] = useState<TaskRecord[]>([]);
   const [briefingLoading, setBriefingLoading] = useState(false);
   const [briefingError, setBriefingError] = useState<string | null>(null);
   const [hasMoreUndated, setHasMoreUndated] = useState(false);
@@ -95,11 +125,24 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
   const [createSubmitting, setCreateSubmitting] = useState(false);
   const [pendingIds, setPendingIds] = useState<string[]>([]);
   const [listVersion, setListVersion] = useState(0);
+  const [taskPagesByKey, setTaskPagesByKey] = useState<
+    Record<string, CachedTaskPage>
+  >({});
+  const [taskPageLoadingKey, setTaskPageLoadingKey] = useState<string | null>(null);
+  const [taskPageLoadingMoreKey, setTaskPageLoadingMoreKey] = useState<string | null>(
+    null,
+  );
+  const [taskPageError, setTaskPageError] = useState<string | null>(null);
 
   const undatedCursorRef = useRef<QueryDocumentSnapshot<DocumentData> | null>(null);
   const loadedKeyRef = useRef<string | null>(null);
   const inFlightSetRef = useRef<Set<string>>(new Set());
   const createInFlightRef = useRef(false);
+  const inFlightPageKeysRef = useRef<Set<string>>(new Set());
+  const taskPagesRef = useRef<Record<string, CachedTaskPage>>({});
+  taskPagesRef.current = taskPagesByKey;
+  const briefingTasksRef = useRef<TaskRecord[]>([]);
+  briefingTasksRef.current = briefingTasks;
 
   const markPending = useCallback((taskId: string, active: boolean) => {
     if (active) {
@@ -139,10 +182,16 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!uid || !isActive || !workspace) {
       setBriefingTasks([]);
+      setSessionCompletedTasks([]);
       setBriefingError(null);
       setHasMoreUndated(false);
+      setTaskPagesByKey({});
+      setTaskPageError(null);
+      setTaskPageLoadingKey(null);
+      setTaskPageLoadingMoreKey(null);
       undatedCursorRef.current = null;
       loadedKeyRef.current = null;
+      inFlightPageKeysRef.current.clear();
       return;
     }
 
@@ -150,8 +199,120 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
     if (loadedKeyRef.current === loadKey) {
       return;
     }
+    setTaskPagesByKey({});
     void refreshBriefing();
   }, [uid, isActive, workspace, imminentDays, refreshBriefing]);
+
+  const loadTasksPageInternal = useCallback(
+    async (
+      filter: TaskFilterTab,
+      sortField: TaskQuerySortField,
+      pageSize = 25,
+      forceRefresh = false,
+    ) => {
+      if (!uid || !isActive) return;
+      const key = makeTaskPageCacheKey(filter, sortField);
+      if (!forceRefresh && taskPagesRef.current[key]) {
+        return;
+      }
+      if (inFlightPageKeysRef.current.has(key)) {
+        return;
+      }
+
+      inFlightPageKeysRef.current.add(key);
+      setTaskPageLoadingKey(key);
+      setTaskPageError(null);
+      try {
+        const result = await fetchTasksPage(uid, {
+          filter,
+          sortField,
+          pageSize,
+        });
+        setTaskPagesByKey((prev) => ({
+          ...prev,
+          [key]: {
+            tasks: result.tasks,
+            hasMore: result.hasMore,
+            nextCursor: result.nextCursor,
+            usedIndexFallback: result.usedIndexFallback,
+          },
+        }));
+      } catch (err) {
+        setTaskPageError(formatTaskErrorMessage(err));
+      } finally {
+        inFlightPageKeysRef.current.delete(key);
+        setTaskPageLoadingKey((cur) => (cur === key ? null : cur));
+      }
+    },
+    [uid, isActive],
+  );
+
+  const ensureTasksPageLoaded = useCallback(
+    (
+      filter: TaskFilterTab,
+      sortField: TaskQuerySortField,
+      pageSize = 25,
+    ) => loadTasksPageInternal(filter, sortField, pageSize, false),
+    [loadTasksPageInternal],
+  );
+
+  const refreshTasksPage = useCallback(
+    (
+      filter: TaskFilterTab,
+      sortField: TaskQuerySortField,
+      pageSize = 25,
+    ) => loadTasksPageInternal(filter, sortField, pageSize, true),
+    [loadTasksPageInternal],
+  );
+
+  const loadMoreTasksPage = useCallback(
+    async (
+      filter: TaskFilterTab,
+      sortField: TaskQuerySortField,
+      pageSize = 25,
+    ) => {
+      if (!uid || !isActive) return;
+      const key = makeTaskPageCacheKey(filter, sortField);
+      const existing = taskPagesRef.current[key];
+      if (!existing?.nextCursor || inFlightPageKeysRef.current.has(key)) {
+        return;
+      }
+
+      inFlightPageKeysRef.current.add(key);
+      setTaskPageLoadingMoreKey(key);
+      setTaskPageError(null);
+      try {
+        const next = await fetchTasksPage(uid, {
+          filter,
+          sortField,
+          pageSize,
+          cursor: existing.nextCursor,
+        });
+        setTaskPagesByKey((prev) => {
+          const cur = prev[key];
+          if (!cur) return prev;
+          const merged = new Map<string, TaskRecord>();
+          for (const item of cur.tasks) merged.set(item.id, item);
+          for (const item of next.tasks) merged.set(item.id, item);
+          return {
+            ...prev,
+            [key]: {
+              tasks: Array.from(merged.values()),
+              hasMore: next.hasMore,
+              nextCursor: next.nextCursor,
+              usedIndexFallback: cur.usedIndexFallback || next.usedIndexFallback,
+            },
+          };
+        });
+      } catch (err) {
+        setTaskPageError(formatTaskErrorMessage(err));
+      } finally {
+        inFlightPageKeysRef.current.delete(key);
+        setTaskPageLoadingMoreKey((cur) => (cur === key ? null : cur));
+      }
+    },
+    [uid, isActive],
+  );
 
   const loadMoreUndated = useCallback(async () => {
     if (!uid || !isActive || !undatedCursorRef.current || loadingMoreUndated) return;
@@ -180,8 +341,19 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
       const fresh = await fetchSingleTask(uid, taskId);
       if (fresh && !fresh.isDeleted && fresh.status !== 'done') {
         setBriefingTasks((prev) => upsertTaskInList(prev, fresh));
+        setSessionCompletedTasks((prev) => prev.filter((item) => item.id !== taskId));
       } else {
         setBriefingTasks((prev) => prev.filter((item) => item.id !== taskId));
+        if (fresh && !fresh.isDeleted && fresh.status === 'done') {
+          setSessionCompletedTasks((prev) => upsertTaskInList(prev, fresh));
+        } else {
+          setSessionCompletedTasks((prev) => prev.filter((item) => item.id !== taskId));
+        }
+      }
+      if (fresh) {
+        setTaskPagesByKey((prev) => patchCachedTaskPages(prev, fresh));
+      } else {
+        setTaskPagesByKey((prev) => removeTaskFromCachedPages(prev, taskId));
       }
       setListVersion((v) => v + 1);
       return fresh;
@@ -205,7 +377,10 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
         if (!fresh) {
           throw new Error('등록된 업무를 불러오지 못했습니다.');
         }
-        setBriefingTasks((prev) => upsertTaskInList(prev, fresh));
+        if (!fresh.isDeleted && fresh.status !== 'done') {
+          setBriefingTasks((prev) => upsertTaskInList(prev, fresh));
+        }
+        setTaskPagesByKey((prev) => patchCachedTaskPages(prev, fresh));
         setListVersion((v) => v + 1);
         return fresh;
       } finally {
@@ -216,10 +391,20 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
     [uid, isActive],
   );
 
+  const findCachedTaskById = useCallback((taskId: string): TaskRecord | null => {
+    const inBriefing = briefingTasksRef.current.find((t) => t.id === taskId);
+    if (inBriefing) return inBriefing;
+    for (const page of Object.values(taskPagesRef.current)) {
+      const found = page.tasks.find((t) => t.id === taskId);
+      if (found) return found;
+    }
+    return null;
+  }, []);
+
   const runTaskMutation = useCallback(
     async (
       taskId: string,
-      action: () => Promise<unknown>,
+      action: () => Promise<{ unchanged?: boolean } | unknown>,
     ): Promise<TaskRecord | null> => {
       if (!uid || !isActive) {
         throw new Error('활성화된 교사 계정만 업무를 변경할 수 있습니다.');
@@ -229,13 +414,24 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
       }
       markPending(taskId, true);
       try {
-        await action();
+        const res = await action();
+        if (
+          res &&
+          typeof res === 'object' &&
+          'unchanged' in res &&
+          (res as { unchanged?: boolean }).unchanged === true
+        ) {
+          const cached = findCachedTaskById(taskId);
+          if (cached) {
+            return cached;
+          }
+        }
         return await refreshSingleTask(taskId);
       } finally {
         markPending(taskId, false);
       }
     },
-    [uid, isActive, markPending, refreshSingleTask],
+    [uid, isActive, markPending, findCachedTaskById, refreshSingleTask],
   );
 
   const saveTaskDetails = useCallback(
@@ -290,6 +486,8 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
       try {
         await permanentlyDeleteTask(uid, taskId);
         setBriefingTasks((prev) => prev.filter((item) => item.id !== taskId));
+        setSessionCompletedTasks((prev) => prev.filter((item) => item.id !== taskId));
+        setTaskPagesByKey((prev) => removeTaskFromCachedPages(prev, taskId));
         setListVersion((v) => v + 1);
       } finally {
         markPending(taskId, false);
@@ -298,9 +496,27 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
     [uid, isActive, markPending],
   );
 
+  const cachedDoneTasks = useMemo(() => {
+    const map = new Map<string, TaskRecord>();
+    for (const page of Object.values(taskPagesByKey)) {
+      for (const t of page.tasks) {
+        if (!t.isDeleted && t.status === 'done') {
+          map.set(t.id, t);
+        }
+      }
+    }
+    for (const t of sessionCompletedTasks) {
+      if (!t.isDeleted && t.status === 'done') {
+        map.set(t.id, t);
+      }
+    }
+    return Array.from(map.values());
+  }, [taskPagesByKey, sessionCompletedTasks]);
+
   const value = useMemo<TaskDataContextValue>(
     () => ({
       briefingTasks,
+      cachedDoneTasks,
       briefingLoading,
       briefingError,
       hasMoreUndated,
@@ -309,6 +525,13 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
       createSubmitting,
       isTaskPending,
       listVersion,
+      taskPagesByKey,
+      taskPageLoadingKey,
+      taskPageLoadingMoreKey,
+      taskPageError,
+      ensureTasksPageLoaded,
+      refreshTasksPage,
+      loadMoreTasksPage,
       refreshBriefing,
       loadMoreUndated,
       refreshSingleTask,
@@ -322,6 +545,7 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
     }),
     [
       briefingTasks,
+      cachedDoneTasks,
       briefingLoading,
       briefingError,
       hasMoreUndated,
@@ -330,6 +554,13 @@ export function TaskDataProvider({ children }: { children: ReactNode }) {
       createSubmitting,
       isTaskPending,
       listVersion,
+      taskPagesByKey,
+      taskPageLoadingKey,
+      taskPageLoadingMoreKey,
+      taskPageError,
+      ensureTasksPageLoaded,
+      refreshTasksPage,
+      loadMoreTasksPage,
       refreshBriefing,
       loadMoreUndated,
       refreshSingleTask,

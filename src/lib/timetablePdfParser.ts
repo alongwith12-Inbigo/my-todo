@@ -172,9 +172,14 @@ export function parseTimetableFromPdfPageTokens(
     if (tok.x > leftAreaMaxX) continue;
     const period = detectPeriodFromLabel(tok.text);
     if (period && !seenPeriods.has(period)) {
-      // Avoid picking up footer page numbers far below previous periods
+      // Avoid picking up footer page numbers at bottom margin far below previous periods
       const prevAnchor = rowAnchors[rowAnchors.length - 1];
-      if (prevAnchor && tokenCenterY(tok) - prevAnchor.centerY > 180) {
+      if (
+        prevAnchor &&
+        tokenCenterY(tok) - prevAnchor.centerY > 280 &&
+        tokenCenterY(tok) > page.height * 0.88 &&
+        !/교시|차시/.test(tok.text)
+      ) {
         continue;
       }
       seenPeriods.add(period);
@@ -218,7 +223,7 @@ export function parseTimetableFromPdfPageTokens(
       }
     }
     yBands.sort((a, b) => a - b);
-    yBands.slice(0, 8).forEach((cy, idx) => {
+    yBands.slice(0, VALIDATION_LIMITS.TIMETABLE_PERIOD_MAX).forEach((cy, idx) => {
       rowAnchors.push({ period: idx + 1, centerY: cy });
     });
   }

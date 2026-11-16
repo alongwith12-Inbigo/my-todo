@@ -96,6 +96,7 @@ export function CalendarView({
     overridesByDate,
     timetablesLoading,
     refreshTimetables,
+    extendTimetableToPeriodCount,
   } = useTimetableData();
   const {
     academicEvents,
@@ -126,6 +127,10 @@ export function CalendarView({
   const [editingAcademicEvent, setEditingAcademicEvent] =
     useState<AcademicEventRecord | null>(null);
   const [overrideModalOpen, setOverrideModalOpen] = useState(false);
+  const [extendingTimetable, setExtendingTimetable] = useState(false);
+  const [timetableExtendError, setTimetableExtendError] = useState<string | null>(
+    null,
+  );
   const [overrideTarget, setOverrideTarget] = useState<{
     dateKey: string;
     reason?: string;
@@ -1049,6 +1054,49 @@ export function CalendarView({
                     </div>
                   ))}
                 </div>
+
+                {selectedDaySchedule.isWeekday &&
+                  selectedDaySchedule.timetableId &&
+                  selectedDaySchedule.periods.length < 7 && (
+                    <div className="p-2.5 rounded-lg border border-amber-200 bg-amber-50/70 space-y-1.5 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-amber-950 font-medium">
+                          현재 시간표가 {selectedDaySchedule.periods.length}교시까지로 설정되어 있습니다.
+                        </span>
+                        <button
+                          type="button"
+                          disabled={extendingTimetable}
+                          onClick={() => {
+                            if (!selectedDaySchedule.timetableId) return;
+                            setExtendingTimetable(true);
+                            setTimetableExtendError(null);
+                            void extendTimetableToPeriodCount(
+                              selectedDaySchedule.timetableId,
+                              7,
+                            )
+                              .catch((err) => {
+                                setTimetableExtendError(
+                                  err instanceof Error
+                                    ? err.message
+                                    : '시간표를 7교시까지로 확장하는 중 오류가 발생했습니다.',
+                                );
+                              })
+                              .finally(() => {
+                                setExtendingTimetable(false);
+                              });
+                          }}
+                          className="px-2.5 py-1 text-[11px] font-semibold bg-teal-700 text-white rounded-md hover:bg-teal-800 disabled:opacity-60 shrink-0 cursor-pointer"
+                        >
+                          {extendingTimetable ? '확장 중...' : '7교시까지로 확장하기'}
+                        </button>
+                      </div>
+                      {timetableExtendError && (
+                        <p className="text-[11px] text-red-700">
+                          {timetableExtendError}
+                        </p>
+                      )}
+                    </div>
+                  )}
 
                 {selectedDayAvailability.hasTimetable && (
                   <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1 text-xs">

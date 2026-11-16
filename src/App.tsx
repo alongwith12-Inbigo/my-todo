@@ -12,6 +12,7 @@ import { NoteDataProvider } from './features/notes/NoteDataContext';
 import { NotesView } from './features/notes/NotesView';
 import { NotificationBell } from './features/notifications/NotificationBell';
 import { SettingsView } from './features/settings/SettingsView';
+import { AiWorkspaceProvider } from './features/tasks/AiWorkspaceContext';
 import { TaskDataProvider, useTaskData } from './features/tasks/TaskDataContext';
 import { TasksView } from './features/tasks/TasksView';
 import { TodayBriefingView } from './features/tasks/TodayBriefingView';
@@ -27,13 +28,16 @@ const NAV_ITEMS: { id: NavSection; label: string }[] = [
 ];
 
 function AuthenticatedWorkspace({
+  now,
+  todayKey,
   displayName,
   onSignOut,
 }: {
+  now: Date;
+  todayKey: string;
   displayName: string;
   onSignOut: () => void;
 }) {
-  const { now, todayKey } = useKstClock();
   const { refreshBriefing } = useTaskData();
   const { refreshEvents } = useEventData();
 
@@ -226,6 +230,7 @@ function AuthenticatedWorkspace({
 }
 
 function WorkspaceShell() {
+  const { now, todayKey } = useKstClock();
   const {
     firebaseUser,
     authReady,
@@ -274,10 +279,14 @@ function WorkspaceShell() {
         <NoteDataProvider>
           <TimetableDataProvider>
             <AcademicEventDataProvider>
-              <AuthenticatedWorkspace
-                displayName={workspace.profile.displayName}
-                onSignOut={signOutUser}
-              />
+              <AiWorkspaceProvider todayKey={todayKey}>
+                <AuthenticatedWorkspace
+                  now={now}
+                  todayKey={todayKey}
+                  displayName={workspace.profile.displayName}
+                  onSignOut={signOutUser}
+                />
+              </AiWorkspaceProvider>
             </AcademicEventDataProvider>
           </TimetableDataProvider>
         </NoteDataProvider>

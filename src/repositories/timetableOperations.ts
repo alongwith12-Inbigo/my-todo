@@ -497,6 +497,19 @@ export async function fetchAllTimetableOverrides(
   return snap.docs.map(mapOverrideDoc);
 }
 
+export async function fetchSingleTimetableOverride(
+  db: Firestore,
+  uid: string,
+  dateKey: string,
+): Promise<TimetableOverrideRecord | null> {
+  if (!isValidFirestoreId(uid) || !isValidDateInputString(dateKey)) {
+    throw new TimetableValidationError('유효하지 않은 사용자 또는 날짜 식별자입니다.');
+  }
+  const snap = await getDoc(doc(db, 'users', uid, 'timetableOverrides', dateKey));
+  if (!snap.exists()) return null;
+  return mapOverrideDoc(snap as QueryDocumentSnapshot<DocumentData>);
+}
+
 export async function upsertTimetableOverride(
   db: Firestore,
   uid: string,

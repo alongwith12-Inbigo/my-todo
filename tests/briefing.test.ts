@@ -1,17 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildTodaySituationBriefing,
   classifyTodayBriefing,
   compareTasksByPriority,
   sortTasks,
 } from '../src/lib/briefing';
+import { detectTodayEventOverlaps } from '../src/lib/calendar';
 import {
   addKstDaysToDateKey,
   getKstDateInputValue,
   getKstDayBounds,
   parseKstDateInput,
 } from '../src/lib/dateKst';
-import type { TaskRecord } from '../src/types/domain';
+import type { CalendarEventRecord, TaskRecord } from '../src/types/domain';
 
 function ts(iso: string) {
   const date = new Date(iso);
@@ -192,4 +194,114 @@ test('priority and dueAt sorting places urgent tasks and earliest deadlines firs
   );
 
   assert.ok(compareTasksByPriority(urgentLater, lowEarly) < 0);
+});
+
+test('buildTodaySituationBriefing summarizes deadlines, status breakdown, attention items, and completed tasks with 0 AI', () => {
+  const overdueTask = makeTask('s-over', {
+    title: '교육청 공문 회신',
+    priority: 'urgent',
+    dueAt: ts('2026-05-14T14:59:59Z'),
+  });
+  const dueTodayTask = makeTask('s-today', {
+    title: '가정통신문 결재',
+    priority: 'high',
+    dueAt: ts('2026-05-15T14:59:59Z'),
+  });
+  const dueTomorrowTask = makeTask('s-tomorrow', {
+    title: '성적 처리 계획안 제출',
+    priority: 'normal',
+    dueAt: ts('2026-05-16T14:59:59Z'),
+  });
+  const laterImminentTask = makeTask('s-later', {
+    title: '교과 협의회 자료',
+    priority: 'normal',
+    dueAt: ts('2026-05-18T14:59:59Z'),
+  });
+  const onHoldTask = makeTask('s-hold', {
+    title: '예산 품의 보류건',
+    status: 'on_hold',
+  });
+  const doneTodayTask = makeTask('s-done-today', {
+    title: '아침 조례 공지',
+    status: 'done',
+    completedAt: ts('2026-05-15T00:30:00Z'),
+  });
+  const doneEarlierTask = makeTask('s-done-old', {
+    title: '지난주 보고',
+    status: 'done',
+    completedAt: ts('2026-05-10T01:00:00Z'),
+  });
+
+  const situation = buildTodaySituationBriefing({
+    tasks: [overdueTask, dueTodayTask, dueTomorrowTask, laterImminentTask, onHoldTask],
+    completedTasks: [doneTodayTask, doneEarlierTask],
+    todayEventsCount: 3,
+    scheduleConflictCount: 1,
+    eventOverlapCount: 1,
+    now: NOW,
+    imminentDays: 3,
+  });
+
+  assert.equal(situation.tomorrowKey, '2026-05-16');
+  assert.deepEqual(
+    situation.dueTomorrow.map((t) => t.id),
+    ['s-tomorrow'],
+  );
+  assert.deepEqual(
+    situation.laterImminent.map((t) => t.id),
+    ['s-later'],
+  );
+  assert.deepEqual(
+    situation.onHoldTasks.map((t) => t.id),
+    ['s-hold'],
+  );
+  assert.deepEqual(
+    situation.importantTasks.map((t) => t.id),
+    ['s-over', 's-today'],
+  );
+  assert.equal(situation.incompleteCount, 5);
+  assert.equal(situation.onHoldCount, 1);
+  assert.equal(situation.completedCount, 2);
+  assert.equal(situation.completedTodayCount, 1);
+  assert.ok(situation.headlineSummary.includes('오늘 일정 3건'));
+  assert.ok(situation.headlineSummary.includes('오늘 마감 업무 1건'));
+  assert.ok(situation.headlineSummary.includes('미완료 업무 5건'));
+  assert.ok(situation.headlineSummary.includes('내일 마감 예정 1건'));
+  assert.ok(situation.attentionReasons.some((r) => r.includes('일정 시간 중복·충돌 2건')));
+  assert.ok(situation.officialTasks.some((t) => t.id === 's-over'));
+});
+
+test('detectTodayEventOverlaps detects overlapping timed events and ignores non-overlapping or all-day events', () => {
+  const mkEvent = (
+    id: string,
+    title: string,
+    startIso: string,
+    endIso: string,
+    allDay = false,
+  ): CalendarEventRecord => ({
+    id,
+    title,
+    startsAt: ts(startIso)!,
+    endsAt: ts(endIso)!,
+    allDay,
+    location: '',
+    description: '',
+    relatedTaskId: null,
+    version: 1,
+    createdAt: ts('2026-05-01T00:00:00Z')!,
+    updatedAt: ts('2026-05-01T00:00:00Z')!,
+    schemaVersion: 1,
+  });
+
+  const overlaps = detectTodayEventOverlaps([
+    mkEvent('all-day', '학교 축제', '2026-05-15T00:00:00+09:00', '2026-05-15T23:59:59+09:00', true),
+    mkEvent('ev-1', '교직원 회의', '2026-05-15T14:00:00+09:00', '2026-05-15T15:00:00+09:00'),
+    mkEvent('ev-2', '학부모 상담', '2026-05-15T14:30:00+09:00', '2026-05-15T15:30:00+09:00'),
+    mkEvent('ev-3', '연수', '2026-05-15T15:30:00+09:00', '2026-05-15T16:30:00+09:00'),
+  ]);
+
+  assert.equal(overlaps.length, 1);
+  assert.equal(overlaps[0].eventAId, 'ev-1');
+  assert.equal(overlaps[0].eventBId, 'ev-2');
+  assert.equal(overlaps[0].overlapLabel, '14:30~15:00');
 });

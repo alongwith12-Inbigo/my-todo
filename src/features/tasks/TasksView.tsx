@@ -1,15 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { DocumentData, QueryDocumentSnapshot } from 'firebase/firestore';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw, Search } from 'lucide-react';
 import { sortTasks, type TaskSortMode } from '../../lib/briefing';
 import { formatKstTodayHeader } from '../../lib/dateKst';
-import {
-  fetchTasksPage,
-  type TaskFilterTab,
-  type TaskQuerySortField,
-} from '../../repositories/taskRepo';
+import { makeTaskPageCacheKey } from '../../lib/taskCache';
+import type { TaskFilterTab, TaskQuerySortField } from '../../repositories/taskRepo';
 import type { TaskRecord } from '../../types/domain';
-import { useAuth } from '../auth/AuthContext';
 import { useTaskData } from './TaskDataContext';
 import { TaskDetailModal } from './TaskDetailModal';
 import { TaskQuickAddBar } from './TaskQuickAddBar';
@@ -41,23 +36,36 @@ export function TasksView({
   onClearFocusedTask,
   onOpenEvent,
 }: TasksViewProps) {
-  const { firebaseUser } = useAuth();
-  const { listVersion, briefingTasks, refreshSingleTask } = useTaskData();
-  const uid = firebaseUser?.uid ?? null;
+  const {
+    briefingTasks,
+    refreshSingleTask,
+    taskPagesByKey,
+    taskPageLoadingKey,
+    taskPageLoadingMoreKey,
+    taskPageError,
+    ensureTasksPageLoaded,
+    refreshTasksPage,
+    loadMoreTasksPage,
+  } = useTaskData();
 
   const [filterTab, setFilterTab] = useState<TaskFilterTab>(initialFilter);
   const [sortMode, setSortMode] = useState<TaskSortMode>('priority');
   const [searchTerm, setSearchTerm] = useState('');
 
-  const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState(false);
-  const [usedIndexFallback, setUsedIndexFallback] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<TaskRecord | null>(null);
 
-  const cursorRef = useRef<QueryDocumentSnapshot<DocumentData> | null>(null);
+  const querySortField: TaskQuerySortField =
+    sortMode === 'dueAt' ? 'dueAt' : 'updatedAt';
+  const pageCacheKey = makeTaskPageCacheKey(filterTab, querySortField);
+  const cachedPage = taskPagesByKey[pageCacheKey];
+  const tasks = cachedPage?.tasks ?? [];
+  const hasMore = cachedPage?.hasMore ?? false;
+  const usedIndexFallback = cachedPage?.usedIndexFallback ?? false;
+  const loading = taskPageLoadingKey === pageCacheKey;
+  const loadingMore = taskPageLoadingMoreKey === pageCacheKey;
+  const error = localError ?? taskPageError;
+
   const tasksRef = useRef<TaskRecord[]>([]);
   const briefingTasksRef = useRef<TaskRecord[]>([]);
   tasksRef.current = tasks;
@@ -95,13 +103,13 @@ export function TasksView({
             setFilterTab('done');
           }
         } else {
-          setError('연결된 업무를 찾을 수 없습니다. 이미 영구 삭제되었을 수 있습니다.');
+          setLocalError('연결된 업무를 찾을 수 없습니다. 이미 영구 삭제되었을 수 있습니다.');
         }
         onClearFocusedTask?.();
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(formatTaskErrorMessage(err));
+        setLocalError(formatTaskErrorMessage(err));
         onClearFocusedTask?.();
       });
 
@@ -110,60 +118,9 @@ export function TasksView({
     };
   }, [focusedTaskId, refreshSingleTask, onClearFocusedTask]);
 
-  const querySortField: TaskQuerySortField =
-    sortMode === 'dueAt' ? 'dueAt' : 'updatedAt';
-
-  const loadFirstPage = useCallback(async () => {
-    if (!uid) return;
-    setLoading(true);
-    setError(null);
-    cursorRef.current = null;
-    try {
-      const result = await fetchTasksPage(uid, {
-        filter: filterTab,
-        sortField: querySortField,
-        pageSize: PAGE_SIZE,
-      });
-      setTasks(result.tasks);
-      setHasMore(result.hasMore);
-      setUsedIndexFallback(result.usedIndexFallback);
-      cursorRef.current = result.nextCursor;
-    } catch (err) {
-      setError(formatTaskErrorMessage(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [uid, filterTab, querySortField]);
-
   useEffect(() => {
-    void loadFirstPage();
-  }, [loadFirstPage, listVersion]);
-
-  async function handleLoadMore() {
-    if (!uid || !cursorRef.current || loadingMore) return;
-    setLoadingMore(true);
-    setError(null);
-    try {
-      const next = await fetchTasksPage(uid, {
-        filter: filterTab,
-        sortField: querySortField,
-        pageSize: PAGE_SIZE,
-        cursor: cursorRef.current,
-      });
-      cursorRef.current = next.nextCursor;
-      setHasMore(next.hasMore);
-      setTasks((prev) => {
-        const merged = new Map<string, TaskRecord>();
-        for (const item of prev) merged.set(item.id, item);
-        for (const item of next.tasks) merged.set(item.id, item);
-        return Array.from(merged.values());
-      });
-    } catch (err) {
-      setError(formatTaskErrorMessage(err));
-    } finally {
-      setLoadingMore(false);
-    }
-  }
+    void ensureTasksPageLoaded(filterTab, querySortField, PAGE_SIZE);
+  }, [filterTab, querySortField, ensureTasksPageLoaded]);
 
   const displayedTasks = useMemo(() => {
     const q = searchTerm.trim().toLowerCase();
@@ -196,7 +153,10 @@ export function TasksView({
         <button
           type="button"
           disabled={loading}
-          onClick={() => void loadFirstPage()}
+          onClick={() => {
+            setLocalError(null);
+            void refreshTasksPage(filterTab, querySortField, PAGE_SIZE);
+          }}
           className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
         >
           <RefreshCw
@@ -244,8 +204,8 @@ export function TasksView({
           <button
             type="button"
             onClick={() => {
-              setError(null);
-              void loadFirstPage();
+              setLocalError(null);
+              void refreshTasksPage(filterTab, querySortField, PAGE_SIZE);
             }}
             className="px-3 py-1 text-xs font-semibold bg-white border border-red-200 rounded-md hover:bg-red-100 whitespace-nowrap shrink-0 cursor-pointer"
           >
@@ -360,7 +320,7 @@ export function TasksView({
                 key={task.id}
                 task={task}
                 onSelect={setSelectedTask}
-                onError={setError}
+                onError={setLocalError}
               />
             ))}
           </div>
@@ -371,7 +331,7 @@ export function TasksView({
             <button
               type="button"
               disabled={loadingMore}
-              onClick={() => void handleLoadMore()}
+              onClick={() => void loadMoreTasksPage(filterTab, querySortField, PAGE_SIZE)}
               className="px-5 py-2 text-xs font-semibold text-teal-800 border border-teal-200 rounded-lg hover:bg-teal-50 disabled:opacity-60 cursor-pointer"
             >
               {loadingMore ? '불러오는 중...' : '이전 업무 더 불러오기'}

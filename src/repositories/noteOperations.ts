@@ -221,7 +221,7 @@ export async function updateNote(
   noteId: string,
   expectedVersion: number,
   patch: UpdateNotePatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   assertValidOwnerAndNoteId(uid, noteId);
   assertValidVersion(expectedVersion);
 
@@ -254,6 +254,15 @@ export async function updateNote(
       patch.sortOrder !== undefined
         ? assertValidSortOrder(patch.sortOrder)
         : current.sortOrder;
+
+    if (
+      nextContent === current.content &&
+      nextColor === current.color &&
+      nextPinned === Boolean(current.isPinned) &&
+      nextSortOrder === Number(current.sortOrder ?? 0)
+    ) {
+      return { id: noteId, version: current.version, unchanged: true };
+    }
 
     const nextVersion = current.version + 1;
     tx.update(noteRef, {

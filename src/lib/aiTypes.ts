@@ -1,9 +1,10 @@
 export const AI_LIMITS = {
-  MAX_NOTICE_CHARS: 8000,
+  MAX_NOTICE_CHARS: 20000,
+  NOTICE_INPUT_MAX_CHARS: 30000,
   MAX_EXISTING_CONTEXT_ITEMS: 40,
   MAX_BRIEFING_TASKS: 30,
   MAX_BRIEFING_EVENTS: 20,
-  MAX_CANDIDATES: 25,
+  MAX_CANDIDATES: 50,
   MAX_PLANNER_TASKS: 15,
   MAX_PLANNER_SLOTS: 8,
   MAX_PLANNER_RECOMMENDATIONS: 5,
@@ -241,6 +242,7 @@ export interface MinimalPlannerTask {
   s: 'td' | 'dg' | 'oh'; // todo | doing | on_hold
   m: number | null; // user-supplied estimatedMinutes (nullable)
   tdy: boolean; // due/scheduled/reminded today
+  ev?: boolean; // linked to an event scheduled today
 }
 
 export interface MinimalPlannerSlot {
@@ -272,6 +274,8 @@ export interface AiPlannerRawRecommendation {
   recommendedEnd: string | null; // HH:MM
   estimatedMinutes: number;
   reason: string;
+  tier?: 'must' | 'optional';
+  strategy?: string | null;
 }
 
 export interface AiPlannerRawAttentionItem {

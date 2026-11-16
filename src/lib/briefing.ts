@@ -1,4 +1,4 @@
-import { getKstDayBounds } from './dateKst';
+import { addKstDaysToDateKey, getKstDateInputValue, getKstDayBounds } from './dateKst';
 import type { TaskPriority, TaskRecord, TaskStatus } from '../types/domain';
 
 export type TaskSortMode = 'briefing' | 'priority' | 'dueAt' | 'updatedAt';
@@ -214,5 +214,202 @@ export function classifyTodayBriefing(
     unreminded,
     uniqueFocusCount,
     totalActiveCount: uniqueActive.size,
+  };
+}
+
+export interface TodaySituationBriefing {
+  summary: TodayBriefingSummary;
+  tomorrowKey: string;
+  dueTomorrow: TaskRecord[];
+  laterImminent: TaskRecord[];
+  onHoldTasks: TaskRecord[];
+  importantTasks: TaskRecord[];
+  officialTasks: TaskRecord[];
+  completedCount: number;
+  completedTodayCount: number;
+  incompleteCount: number;
+  todoCount: number;
+  doingCount: number;
+  onHoldCount: number;
+  todayActionableCount: number;
+  attentionReasons: string[];
+  headlineSummary: string;
+}
+
+const OFFICIAL_TASK_KEYWORD_RE = /(공문|결재|기안|품의|보고|제출|회신)/;
+
+/**
+ * Rule-based Zero-AI summary of today's tasks and schedules using already-loaded records.
+ * Performs 0 Gemini calls and 0 extra Firestore queries.
+ */
+export function buildTodaySituationBriefing(params: {
+  tasks: TaskRecord[];
+  completedTasks?: TaskRecord[];
+  todayEventsCount: number;
+  scheduleConflictCount: number;
+  eventOverlapCount: number;
+  now?: Date;
+  imminentDays?: number;
+}): TodaySituationBriefing {
+  const now = params.now ?? new Date();
+  const imminentDays = params.imminentDays ?? 3;
+  const bounds = getKstDayBounds(now, imminentDays);
+  const tomorrowKey = addKstDaysToDateKey(bounds.todayKey, 1);
+
+  const summary = classifyTodayBriefing(params.tasks, { now, imminentDays });
+
+  const uniqueActive = new Map<string, TaskRecord>();
+  const uniqueDone = new Map<string, TaskRecord>();
+
+  for (const task of [...params.tasks, ...(params.completedTasks ?? [])]) {
+    if (task.isDeleted) continue;
+    if (task.status === 'done') {
+      uniqueDone.set(task.id, task);
+    } else {
+      uniqueActive.set(task.id, task);
+    }
+  }
+
+  let todoCount = 0;
+  let doingCount = 0;
+  let onHoldCount = 0;
+  const onHoldTasks: TaskRecord[] = [];
+  const importantTasks: TaskRecord[] = [];
+  const officialTasks: TaskRecord[] = [];
+  const todayActionableIds = new Set<string>();
+
+  for (const t of summary.overdue) todayActionableIds.add(t.id);
+  for (const t of summary.dueToday) todayActionableIds.add(t.id);
+  for (const t of summary.remindDue) todayActionableIds.add(t.id);
+  for (const t of summary.doing) todayActionableIds.add(t.id);
+
+  for (const task of uniqueActive.values()) {
+    if (task.status === 'todo') todoCount += 1;
+    else if (task.status === 'doing') doingCount += 1;
+    else if (task.status === 'on_hold') {
+      onHoldCount += 1;
+      onHoldTasks.push(task);
+    }
+
+    const schedKey = getKstDateInputValue(timestampToDate(task.scheduledAt));
+    if (schedKey === bounds.todayKey) {
+      todayActionableIds.add(task.id);
+    }
+
+    if (task.priority === 'urgent' || task.priority === 'high') {
+      importantTasks.push(task);
+    }
+
+    const dueMs = timestampToMillis(task.dueAt);
+    const isNearDeadline =
+      dueMs !== null && dueMs <= bounds.endOfImminentMs;
+    if (
+      OFFICIAL_TASK_KEYWORD_RE.test(task.title) &&
+      (isNearDeadline || task.priority === 'urgent' || task.priority === 'high')
+    ) {
+      officialTasks.push(task);
+    }
+  }
+
+  // Split imminent into tomorrow vs later imminent without duplicating dueToday/overdue/remindDue
+  const alreadyFeaturedIds = new Set<string>([
+    ...summary.overdue.map((t) => t.id),
+    ...summary.dueToday.map((t) => t.id),
+    ...summary.remindDue.map((t) => t.id),
+  ]);
+
+  const dueTomorrow: TaskRecord[] = [];
+  const laterImminent: TaskRecord[] = [];
+  for (const task of uniqueActive.values()) {
+    if (alreadyFeaturedIds.has(task.id)) continue;
+    const dueKey = getKstDateInputValue(timestampToDate(task.dueAt));
+    if (dueKey === tomorrowKey) {
+      dueTomorrow.push(task);
+    }
+  }
+  const dueTomorrowIds = new Set(dueTomorrow.map((t) => t.id));
+  for (const task of summary.imminent) {
+    if (!dueTomorrowIds.has(task.id)) {
+      laterImminent.push(task);
+    }
+  }
+
+  dueTomorrow.sort(compareTasksByPriority);
+  onHoldTasks.sort(compareTasksByPriority);
+  importantTasks.sort(compareTasksByPriority);
+  officialTasks.sort(compareTasksByDueAt);
+
+  let completedTodayCount = 0;
+  for (const task of uniqueDone.values()) {
+    const compMs =
+      timestampToMillis(task.completedAt) ?? timestampToMillis(task.updatedAt);
+    if (
+      compMs !== null &&
+      compMs >= bounds.startOfTodayMs &&
+      compMs <= bounds.endOfTodayMs
+    ) {
+      completedTodayCount += 1;
+    }
+  }
+
+  const totalConflicts = params.scheduleConflictCount + params.eventOverlapCount;
+  const attentionReasons: string[] = [];
+  if (totalConflicts > 0) {
+    attentionReasons.push(`일정 시간 중복·충돌 ${totalConflicts}건 확인 필요`);
+  }
+  if (summary.overdue.length > 0) {
+    attentionReasons.push(`마감 기한 초과 업무 ${summary.overdue.length}건`);
+  }
+  if (importantTasks.length > 0) {
+    attentionReasons.push(`중요(긴급·높음) 표시 업무 ${importantTasks.length}건`);
+  }
+  if (summary.dueToday.length > 0 || dueTomorrow.length > 0) {
+    const parts: string[] = [];
+    if (summary.dueToday.length > 0) parts.push(`오늘 마감 ${summary.dueToday.length}건`);
+    if (dueTomorrow.length > 0) parts.push(`내일 마감 ${dueTomorrow.length}건`);
+    attentionReasons.push(parts.join(' · '));
+  }
+  if (officialTasks.length > 0) {
+    attentionReasons.push(`공문·제출 확인 대상 ${officialTasks.length}건`);
+  }
+
+  const primaryParts: string[] = [
+    `오늘 일정 ${params.todayEventsCount}건`,
+    `오늘 마감 업무 ${summary.dueToday.length}건`,
+    `미완료 업무 ${uniqueActive.size}건`,
+  ];
+  const secondaryNotes: string[] = [];
+  if (summary.overdue.length > 0) {
+    secondaryNotes.push(`기한 초과 ${summary.overdue.length}건`);
+  }
+  if (dueTomorrow.length > 0) {
+    secondaryNotes.push(`내일 마감 예정 ${dueTomorrow.length}건`);
+  }
+  if (totalConflicts > 0) {
+    secondaryNotes.push(`일정 충돌 ${totalConflicts}건`);
+  }
+
+  const headlineSummary =
+    secondaryNotes.length > 0
+      ? `${primaryParts.join(', ')}이 있습니다. ${secondaryNotes.join(', ')}을 먼저 확인해 주세요.`
+      : `${primaryParts.join(', ')}이 있습니다.`;
+
+  return {
+    summary,
+    tomorrowKey,
+    dueTomorrow,
+    laterImminent,
+    onHoldTasks,
+    importantTasks,
+    officialTasks,
+    completedCount: uniqueDone.size,
+    completedTodayCount,
+    incompleteCount: uniqueActive.size,
+    todoCount,
+    doingCount,
+    onHoldCount,
+    todayActionableCount: todayActionableIds.size,
+    attentionReasons,
+    headlineSummary,
   };
 }

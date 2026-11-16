@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Timestamp } from 'firebase/firestore';
+import { normalizeAiNoticeCandidates } from '../src/lib/aiImportValidator';
+import { AI_LIMITS } from '../src/lib/aiTypes';
 import { parseKoreanDateTimeExpression } from '../src/lib/koreanDateParser';
 import {
   parseSchoolNoticeText,
@@ -175,3 +177,34 @@ test('parseSchoolNoticeText classifies contextually, applies yearless rule to ta
   );
   assert.equal(afterUpdate[0].duplicateWarnings.length, 0);
 });
+
+test('Long multi-line task lists (>10,000 chars and >25 items) are parsed and normalized without early clipping', () => {
+  assert.ok(AI_LIMITS.NOTICE_INPUT_MAX_CHARS >= 30000);
+  assert.ok(AI_LIMITS.MAX_NOTICE_CHARS >= 20000);
+  assert.ok(AI_LIMITS.MAX_CANDIDATES >= 50);
+
+  const longNotePadding = '세부 안내 사항 및 학급별 전달 내용을 빠짐없이 확인해 주시기 바랍니다. '.repeat(7);
+  const longLines = Array.from({ length: 40 }, (_, i) =>
+    `${i + 1}. 11월 20일까지 ${i + 1}번 학급 업무 보고서 제출 - ${longNotePadding}`,
+  );
+  const bulkText = longLines.join('\n');
+  assert.ok(bulkText.length > 10000);
+  assert.ok(bulkText.length <= AI_LIMITS.MAX_NOTICE_CHARS);
+
+  const parsed = parseSchoolNoticeText(bulkText, { now: FIXED_NOW });
+  assert.equal(parsed.candidates.length, 40);
+  assert.equal(parsed.candidates[39].kind, 'task');
+  assert.equal(parsed.candidates[39].dueDateStr, '2026-11-20');
+
+  const rawAiCandidates = Array.from({ length: 45 }, (_, i) => ({
+    kind: 'task' as const,
+    title: `대량 업무 ${i + 1} 제출`,
+    dueDate: '2026-11-20',
+  }));
+  const aiNormalized = normalizeAiNoticeCandidates(
+    { candidates: rawAiCandidates, unparsedSummary: [] },
+    { now: FIXED_NOW },
+  );
+  assert.equal(aiNormalized.candidates.length, 45);
+});
+

@@ -87,7 +87,7 @@ export async function updateAcademicEvent(
   eventId: string,
   expectedVersion: number,
   draft: AcademicEventDraft,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   const path = `users/${uid}/academicEvents/${eventId}`;
   try {
     return await updateAcademicEventOp(

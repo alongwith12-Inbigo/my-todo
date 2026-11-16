@@ -201,8 +201,22 @@ export function AcademicEventDataProvider({
       );
 
       const res = await createAcademicEventsBatch(uid, drafts, existingKeys);
-      for (const y of targetYears) {
-        await loadSchoolYearInternal(y, true);
+      if (res.createdIds.length > 0) {
+        const yearsWithNewEvents = Array.from(
+          new Set(
+            drafts
+              .filter(
+                (d) =>
+                  !existingKeys.has(
+                    buildAcademicDedupeKey(d.startDate, d.endDate, d.title),
+                  ),
+              )
+              .map((d) => d.schoolYear),
+          ),
+        );
+        for (const y of yearsWithNewEvents) {
+          await loadSchoolYearInternal(y, true);
+        }
       }
       return {
         createdCount: res.createdIds.length,
@@ -221,7 +235,10 @@ export function AcademicEventDataProvider({
       if (!uid || !isActive) {
         throw new Error('활성화된 교사 계정만 학사일정을 수정할 수 있습니다.');
       }
-      await updateAcademicEvent(uid, eventId, expectedVersion, draft);
+      const res = await updateAcademicEvent(uid, eventId, expectedVersion, draft);
+      if (res.unchanged) {
+        return academicEvents.find((item) => item.id === eventId) ?? null;
+      }
       const fresh = await fetchSingleAcademicEvent(uid, eventId);
       setAcademicEvents((prev) => {
         if (!fresh) return prev.filter((item) => item.id !== eventId);
@@ -232,7 +249,7 @@ export function AcademicEventDataProvider({
       });
       return fresh;
     },
-    [uid, isActive],
+    [uid, isActive, academicEvents],
   );
 
   const removeOne = useCallback(
@@ -250,6 +267,12 @@ export function AcademicEventDataProvider({
     async (eventId: string, dateKey: string) => {
       const target = academicEvents.find((ev) => ev.id === eventId);
       if (!target) return;
+      if (
+        target.timetableImpact === 'override_applied' &&
+        target.overrideDateKey === dateKey
+      ) {
+        return;
+      }
       await updateOne(eventId, target.version, {
         title: target.title,
         category: target.category,

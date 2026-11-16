@@ -16,6 +16,8 @@ import {
   X,
 } from 'lucide-react';
 import {
+  getAvailabilityReasonShortLabel,
+  type AvailabilityStatusReason,
   type PlanAdjustmentFilter,
   type ValidatedDayPlan,
 } from '../../lib/aiPlanner';
@@ -33,6 +35,9 @@ interface AiTodayPlannerCardProps {
   aiEnabled: boolean;
   availableIntervals: MinuteInterval[];
   activeFilter: PlanAdjustmentFilter;
+  isStaleInputs?: boolean;
+  availabilityReason?: AvailabilityStatusReason;
+  availabilityReasonDetail?: string;
   onCancel: () => void;
   onClose: () => void;
   onRunAiPlan: (forceRefresh?: boolean, constraintText?: string) => void;
@@ -60,6 +65,9 @@ export function AiTodayPlannerCard({
   aiEnabled,
   availableIntervals,
   activeFilter,
+  isStaleInputs = false,
+  availabilityReason,
+  availabilityReasonDetail,
   onCancel,
   onClose,
   onRunAiPlan,
@@ -76,9 +84,14 @@ export function AiTodayPlannerCard({
 }: AiTodayPlannerCardProps) {
   const [constraintInput, setConstraintInput] = useState('');
 
-  if (!visible && !loading && !error && !plan) {
+  if (!visible && !loading) {
     return null;
   }
+
+  const effectiveAvailabilityReason =
+    plan?.availabilityReason ?? availabilityReason;
+  const effectiveAvailabilityDetail =
+    plan?.availabilityReasonDetail ?? availabilityReasonDetail ?? '';
 
   function handleConstraintSubmit(e: FormEvent) {
     e.preventDefault();
@@ -120,7 +133,7 @@ export function AiTodayPlannerCard({
           )}
           {plan?.fromCache && (
             <span className="text-[11px] font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md">
-              세션 캐시 재사용 (추가 호출 0회)
+              저장된 계획 재사용 (추가 호출 0회)
             </span>
           )}
         </div>
@@ -260,7 +273,7 @@ export function AiTodayPlannerCard({
               <p className="mt-0.5 text-base font-bold text-slate-900">
                 {plan.remainingWorkableMinutes > 0
                   ? formatMinutesKorean(plan.remainingWorkableMinutes)
-                  : '미확보 / 미설정'}
+                  : getAvailabilityReasonShortLabel(effectiveAvailabilityReason)}
               </p>
             </div>
             <div className="p-3 rounded-lg border border-slate-200 bg-slate-50/70">
@@ -280,6 +293,57 @@ export function AiTodayPlannerCard({
               </p>
             </div>
           </div>
+
+          {/* Exact reason why no workable slots exist (never fabricating weekend/holiday hours) */}
+          {plan.remainingWorkableMinutes === 0 && effectiveAvailabilityDetail && (
+            <div className="p-3 rounded-lg border border-slate-200 bg-slate-50 text-xs text-slate-700 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-start gap-2 min-w-0 flex-1">
+                <Clock className="w-3.5 h-3.5 text-slate-500 mt-0.5 shrink-0" aria-hidden="true" />
+                <div className="space-y-0.5">
+                  <p className="font-semibold text-slate-900">
+                    시간대 미배정 사유 · {getAvailabilityReasonShortLabel(effectiveAvailabilityReason)}
+                  </p>
+                  <p className="leading-relaxed text-slate-600">
+                    {effectiveAvailabilityDetail}
+                  </p>
+                </div>
+              </div>
+              {onOpenTimetable &&
+                (effectiveAvailabilityReason === 'weekend_or_holiday' ||
+                  effectiveAvailabilityReason === 'no_timetable' ||
+                  effectiveAvailabilityReason === 'no_workable_free_periods') && (
+                  <button
+                    type="button"
+                    onClick={onOpenTimetable}
+                    className="px-2.5 py-1 text-[11px] font-semibold text-teal-800 bg-white border border-teal-200 rounded-md hover:bg-teal-50 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {effectiveAvailabilityReason === 'weekend_or_holiday'
+                      ? '오늘 임시 변경 등록'
+                      : effectiveAvailabilityReason === 'no_timetable'
+                        ? '주간 시간표 등록'
+                        : '공강 업무시간 설정'}
+                  </button>
+                )}
+            </div>
+          )}
+
+          {/* Stale inputs notice (never auto-calls Gemini until user clicks re-analyze) */}
+          {isStaleInputs && plan.mode === 'ai' && (
+            <div className="p-3 rounded-lg border border-teal-200 bg-teal-50/60 text-xs text-teal-950 flex flex-wrap items-center justify-between gap-2">
+              <span>
+                계획 생성 이후 업무·일정 또는 시간표가 변경되었습니다. 추가 비용 방지를 위해 자동으로 다시 호출하지 않았습니다.
+              </span>
+              {hasPersonalKey && aiEnabled && (
+                <button
+                  type="button"
+                  onClick={() => onRunAiPlan(true, constraintInput.trim() || undefined)}
+                  className="px-2.5 py-1 text-[11px] font-semibold text-teal-900 bg-white border border-teal-300 rounded-md hover:bg-teal-100 whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  변경 사항 반영해 다시 분석
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Academic Calendar / Timetable Unconfirmed Warnings */}
           {plan.academicWarnings.length > 0 && (
@@ -393,7 +457,7 @@ export function AiTodayPlannerCard({
           </div>
 
           {/* Recommendations */}
-          <div className="space-y-2.5">
+          <div className="space-y-3">
             <h3 className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
               <CheckCircle2 className="w-3.5 h-3.5 text-teal-700" aria-hidden="true" />
               <span>오늘 처리 추천 순서 ({plan.recommendations.length}건)</span>
@@ -404,140 +468,191 @@ export function AiTodayPlannerCard({
                 현재 조건에 맞는 추천 업무가 없습니다. 필터를 초기화하거나 아래 업무 목록을 확인해 주세요.
               </p>
             ) : (
-              <ol className="space-y-2">
-                {plan.recommendations.map((item, idx) => (
-                  <li
-                    key={item.taskId}
-                    className="p-3.5 rounded-lg border border-slate-200 bg-white space-y-2"
-                  >
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div className="flex items-start gap-2.5 min-w-0 flex-1">
-                        <span className="w-5 h-5 rounded-md bg-teal-700 text-white text-[11px] font-bold flex items-center justify-center shrink-0 tabular-nums mt-0.5">
-                          {idx + 1}
-                        </span>
-                        <div className="min-w-0 space-y-1">
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => onOpenTask(item.taskId)}
-                              className="text-sm font-semibold text-slate-900 hover:text-teal-700 text-left inline-flex items-center gap-1 cursor-pointer"
-                            >
-                              <span>{item.title}</span>
-                              <ExternalLink
-                                className="w-3 h-3 text-slate-400 shrink-0"
-                                aria-hidden="true"
-                              />
-                            </button>
-                            {(item.priority === 'urgent' ||
-                              item.priority === 'high') && (
+              (() => {
+                const indexed = plan.recommendations.map((item, idx) => ({
+                  item,
+                  idx,
+                }));
+                const mustGroup = indexed.filter((x) => x.item.tier !== 'optional');
+                const optionalGroup = indexed.filter((x) => x.item.tier === 'optional');
+
+                const renderItem = (
+                  entry: { item: (typeof plan.recommendations)[number]; idx: number },
+                ) => {
+                  const { item, idx } = entry;
+                  return (
+                    <li
+                      key={item.taskId}
+                      className="p-3.5 rounded-lg border border-slate-200 bg-white space-y-2"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                          <span
+                            className={`w-5 h-5 rounded-md text-white text-[11px] font-bold flex items-center justify-center shrink-0 tabular-nums mt-0.5 ${
+                              item.tier === 'optional' ? 'bg-slate-600' : 'bg-teal-700'
+                            }`}
+                          >
+                            {idx + 1}
+                          </span>
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => onOpenTask(item.taskId)}
+                                className="text-sm font-semibold text-slate-900 hover:text-teal-700 text-left inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                <span>{item.title}</span>
+                                <ExternalLink
+                                  className="w-3 h-3 text-slate-400 shrink-0"
+                                  aria-hidden="true"
+                                />
+                              </button>
                               <span
                                 className={`text-[11px] font-semibold px-1.5 py-0.5 rounded border ${
-                                  item.priority === 'urgent'
-                                    ? 'border-red-200 bg-red-50 text-red-700'
-                                    : 'border-amber-200 bg-amber-50 text-amber-800'
+                                  item.tier === 'optional'
+                                    ? 'border-slate-200 bg-slate-50 text-slate-700'
+                                    : 'border-teal-200 bg-teal-50 text-teal-800'
                                 }`}
                               >
-                                {PRIORITY_LABEL[item.priority]}
+                                {item.tier === 'optional' ? '여유 시 처리' : '오늘 필수'}
                               </span>
-                            )}
-                            {item.isOverdue && (
-                              <span className="text-[11px] font-semibold text-red-700">
-                                기한 초과
-                              </span>
-                            )}
-                          </div>
+                              {(item.priority === 'urgent' ||
+                                item.priority === 'high') && (
+                                <span
+                                  className={`text-[11px] font-semibold px-1.5 py-0.5 rounded border ${
+                                    item.priority === 'urgent'
+                                      ? 'border-red-200 bg-red-50 text-red-700'
+                                      : 'border-amber-200 bg-amber-50 text-amber-800'
+                                  }`}
+                                >
+                                  {PRIORITY_LABEL[item.priority]}
+                                </span>
+                              )}
+                              {item.isOverdue && (
+                                <span className="text-[11px] font-semibold text-red-700">
+                                  기한 초과
+                                </span>
+                              )}
+                            </div>
 
-                          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-slate-600 tabular-nums">
-                            <span className="inline-flex items-center gap-1 font-medium text-teal-800">
-                              <Clock className="w-3 h-3" aria-hidden="true" />
-                              {item.slotStart && item.slotEnd
-                                ? `${item.slotStart}~${item.slotEnd}`
-                                : '시간대 미배정'}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span>
-                              약 {formatMinutesKorean(item.estimatedMinutes)}{' '}
-                              <span className="text-[11px] text-slate-500">
-                                (
-                                {item.durationSource === 'user'
-                                  ? '직접 지정'
-                                  : '추정'}
-                                )
+                            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-slate-600 tabular-nums">
+                              <span className="inline-flex items-center gap-1 font-medium text-teal-800">
+                                <Clock className="w-3 h-3" aria-hidden="true" />
+                                {item.slotStart && item.slotEnd
+                                  ? `${item.slotStart}~${item.slotEnd}`
+                                  : '시간대 미배정'}
                               </span>
-                            </span>
-                            {item.dueDateKey && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span>마감 {item.dueDateKey}</span>
-                              </>
-                            )}
+                              <span aria-hidden="true">·</span>
+                              <span>
+                                약 {formatMinutesKorean(item.estimatedMinutes)}{' '}
+                                <span className="text-[11px] text-slate-500">
+                                  (
+                                  {item.durationSource === 'user'
+                                    ? '직접 지정'
+                                    : '추정'}
+                                  )
+                                </span>
+                              </span>
+                              {item.dueDateKey && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span>마감 {item.dueDateKey}</span>
+                                </>
+                              )}
+                            </div>
                           </div>
+                        </div>
+
+                        {/* Zero-AI Per-Item Local Controls */}
+                        <div className="flex flex-wrap items-center gap-1 shrink-0">
+                          {availableIntervals.length > 1 && (
+                            <select
+                              aria-label={`${item.title} 시간대 변경`}
+                              value=""
+                              onChange={(e) => {
+                                const nextIdx = Number(e.target.value);
+                                if (!Number.isNaN(nextIdx)) {
+                                  onReassignItemSlot(item.taskId, nextIdx);
+                                }
+                              }}
+                              className="px-2 py-1 text-[11px] border border-slate-200 rounded bg-white text-slate-700 cursor-pointer"
+                            >
+                              <option value="">시간대 이동</option>
+                              {availableIntervals.map((seg, segIdx) => (
+                                <option key={segIdx} value={segIdx}>
+                                  {seg.startTime}~{seg.endTime} ({seg.minutes}분)
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          <button
+                            type="button"
+                            disabled={idx === 0}
+                            onClick={() => onMoveItemOrder(item.taskId, 'up')}
+                            aria-label={`${item.title} 순서 위로`}
+                            className="p-1 text-slate-600 border border-slate-200 rounded hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                          >
+                            <ArrowUp className="w-3.5 h-3.5" aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={idx === plan.recommendations.length - 1}
+                            onClick={() => onMoveItemOrder(item.taskId, 'down')}
+                            aria-label={`${item.title} 순서 아래로`}
+                            className="p-1 text-slate-600 border border-slate-200 rounded hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                          >
+                            <ArrowDown className="w-3.5 h-3.5" aria-hidden="true" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onExcludeItem(item.taskId)}
+                            title="오늘 계획에서 제외 (실제 업무는 삭제되지 않습니다)"
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-600 border border-slate-200 rounded hover:bg-slate-50 whitespace-nowrap cursor-pointer"
+                          >
+                            <Ban className="w-3 h-3" aria-hidden="true" />
+                            <span>오늘 제외</span>
+                          </button>
                         </div>
                       </div>
 
-                      {/* Zero-AI Per-Item Local Controls */}
-                      <div className="flex flex-wrap items-center gap-1 shrink-0">
-                        {availableIntervals.length > 1 && (
-                          <select
-                            aria-label={`${item.title} 시간대 변경`}
-                            value=""
-                            onChange={(e) => {
-                              const nextIdx = Number(e.target.value);
-                              if (!Number.isNaN(nextIdx)) {
-                                onReassignItemSlot(item.taskId, nextIdx);
-                              }
-                            }}
-                            className="px-2 py-1 text-[11px] border border-slate-200 rounded bg-white text-slate-700 cursor-pointer"
-                          >
-                            <option value="">시간대 이동</option>
-                            {availableIntervals.map((seg, segIdx) => (
-                              <option key={segIdx} value={segIdx}>
-                                {seg.startTime}~{seg.endTime} ({seg.minutes}분)
-                              </option>
-                            ))}
-                          </select>
-                        )}
-                        <button
-                          type="button"
-                          disabled={idx === 0}
-                          onClick={() => onMoveItemOrder(item.taskId, 'up')}
-                          aria-label={`${item.title} 순서 위로`}
-                          className="p-1 text-slate-600 border border-slate-200 rounded hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
-                        >
-                          <ArrowUp className="w-3.5 h-3.5" aria-hidden="true" />
-                        </button>
-                        <button
-                          type="button"
-                          disabled={idx === plan.recommendations.length - 1}
-                          onClick={() => onMoveItemOrder(item.taskId, 'down')}
-                          aria-label={`${item.title} 순서 아래로`}
-                          className="p-1 text-slate-600 border border-slate-200 rounded hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
-                        >
-                          <ArrowDown className="w-3.5 h-3.5" aria-hidden="true" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onExcludeItem(item.taskId)}
-                          title="오늘 계획에서 제외 (실제 업무는 삭제되지 않습니다)"
-                          className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-600 border border-slate-200 rounded hover:bg-slate-50 whitespace-nowrap cursor-pointer"
-                        >
-                          <Ban className="w-3 h-3" aria-hidden="true" />
-                          <span>오늘 제외</span>
-                        </button>
-                      </div>
-                    </div>
-
-                    <p className="text-xs text-slate-700 leading-relaxed pl-7">
-                      {item.reason}
-                    </p>
-                    {item.validationNote && (
-                      <p className="text-[11px] text-amber-800 pl-7">
-                        참고: {item.validationNote}
+                      <p className="text-xs text-slate-700 leading-relaxed pl-7">
+                        {item.reason}
                       </p>
+                      {item.strategy && (
+                        <p className="text-xs text-teal-900 bg-teal-50/60 border border-teal-100 rounded-md px-2.5 py-1.5 ml-7 leading-relaxed">
+                          <span className="font-semibold">실행 전략:</span> {item.strategy}
+                        </p>
+                      )}
+                      {item.validationNote && (
+                        <p className="text-[11px] text-amber-800 pl-7">
+                          참고: {item.validationNote}
+                        </p>
+                      )}
+                    </li>
+                  );
+                };
+
+                return (
+                  <div className="space-y-3">
+                    {mustGroup.length > 0 && (
+                      <div className="space-y-1.5">
+                        <p className="text-[11px] font-bold text-teal-900">
+                          오늘 반드시 할 업무 ({mustGroup.length}건)
+                        </p>
+                        <ol className="space-y-2">{mustGroup.map(renderItem)}</ol>
+                      </div>
                     )}
-                  </li>
-                ))}
-              </ol>
+                    {optionalGroup.length > 0 && (
+                      <div className="space-y-1.5">
+                        <p className="text-[11px] font-bold text-slate-700">
+                          시간이 남으면 할 업무 ({optionalGroup.length}건)
+                        </p>
+                        <ol className="space-y-2">{optionalGroup.map(renderItem)}</ol>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()
             )}
           </div>
 

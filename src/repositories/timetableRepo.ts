@@ -11,6 +11,7 @@ import {
   fetchAllTimetableOverrides as fetchAllTimetableOverridesOp,
   fetchAllTimetables as fetchAllTimetablesOp,
   fetchSingleTimetable as fetchSingleTimetableOp,
+  fetchSingleTimetableOverride as fetchSingleTimetableOverrideOp,
   TimetableConcurrencyError,
   TimetableValidationError,
   updateTimetable as updateTimetableOp,
@@ -105,6 +106,18 @@ export async function fetchAllTimetableOverrides(
     return await fetchAllTimetableOverridesOp(db, uid);
   } catch (error) {
     rethrowTimetableError(error, OperationType.LIST, path);
+  }
+}
+
+export async function fetchSingleTimetableOverride(
+  uid: string,
+  dateKey: string,
+): Promise<TimetableOverrideRecord | null> {
+  const path = `users/${uid}/timetableOverrides/${dateKey}`;
+  try {
+    return await fetchSingleTimetableOverrideOp(db, uid, dateKey);
+  } catch (error) {
+    rethrowTimetableError(error, OperationType.GET, path);
   }
 }
 

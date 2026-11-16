@@ -298,13 +298,84 @@ export async function createTask(
   return { id: taskRef.id, version: 1 };
 }
 
+function sameNullableTimestamp(
+  a: Timestamp | null | undefined,
+  b: Timestamp | null | undefined,
+): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.toMillis() === b.toMillis();
+}
+
+export function areTaskDetailsUnchanged(
+  existing: Pick<
+    TaskRecord,
+    | 'title'
+    | 'description'
+    | 'priority'
+    | 'dueAt'
+    | 'scheduledAt'
+    | 'remindAt'
+    | 'estimatedMinutes'
+    | 'relatedEventId'
+  >,
+  nextPayload: Record<string, unknown>,
+): boolean {
+  if ('title' in nextPayload && nextPayload.title !== existing.title) {
+    return false;
+  }
+  if ('description' in nextPayload && nextPayload.description !== existing.description) {
+    return false;
+  }
+  if ('priority' in nextPayload && nextPayload.priority !== existing.priority) {
+    return false;
+  }
+  if (
+    'dueAt' in nextPayload &&
+    !sameNullableTimestamp(nextPayload.dueAt as Timestamp | null, existing.dueAt)
+  ) {
+    return false;
+  }
+  if (
+    'scheduledAt' in nextPayload &&
+    !sameNullableTimestamp(
+      nextPayload.scheduledAt as Timestamp | null,
+      existing.scheduledAt,
+    )
+  ) {
+    return false;
+  }
+  if (
+    'remindAt' in nextPayload &&
+    !sameNullableTimestamp(
+      nextPayload.remindAt as Timestamp | null,
+      existing.remindAt,
+    )
+  ) {
+    return false;
+  }
+  if (
+    'estimatedMinutes' in nextPayload &&
+    (nextPayload.estimatedMinutes ?? null) !== (existing.estimatedMinutes ?? null)
+  ) {
+    return false;
+  }
+  if (
+    'relatedEventId' in nextPayload &&
+    (nextPayload.relatedEventId ?? null) !== (existing.relatedEventId ?? null)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export async function updateTaskDetails(
   db: Firestore,
   uid: string,
   taskId: string,
   expectedVersion: number,
   patch: UpdateTaskDetailsPatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   assertValidOwnerAndTaskId(uid, taskId);
   assertValidVersion(expectedVersion);
 
@@ -323,6 +394,9 @@ export async function updateTaskDetails(
     }
 
     const nextPayload = buildTaskDetailsPatch(existing.version, patch);
+    if (areTaskDetailsUnchanged(existing, nextPayload)) {
+      return { id: taskId, version: existing.version, unchanged: true };
+    }
     tx.update(taskRef, nextPayload);
     return { id: taskId, version: existing.version + 1 };
   });
@@ -334,7 +408,7 @@ export async function postponeTask(
   taskId: string,
   expectedVersion: number,
   datesPatch: PostponeTaskPatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   if (
     datesPatch.dueAt === undefined &&
     datesPatch.scheduledAt === undefined &&

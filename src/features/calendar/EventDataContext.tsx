@@ -221,13 +221,16 @@ export function EventDataProvider({ children }: { children: ReactNode }) {
       }
       markPending(eventId, true);
       try {
-        await updateEvent(uid, eventId, expectedVersion, patch);
+        const res = await updateEvent(uid, eventId, expectedVersion, patch);
+        if (res.unchanged) {
+          return eventsMap.get(eventId) ?? null;
+        }
         return await refreshSingleEvent(eventId);
       } finally {
         markPending(eventId, false);
       }
     },
-    [uid, isActive, markPending, refreshSingleEvent],
+    [uid, isActive, eventsMap, markPending, refreshSingleEvent],
   );
 
   const removeEvent = useCallback(

@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   Calendar,
   ChevronDown,
   ChevronUp,
@@ -15,26 +16,17 @@ import {
   ACADEMIC_CATEGORY_META,
   getAcademicEventsForDateKey,
 } from '../../lib/academicCalendar';
-import { buildMinimalBriefingPayload } from '../../lib/aiBriefing';
-import { normalizeAiBriefingResult } from '../../lib/aiImportValidator';
+import { buildAiPlannerContext } from '../../lib/aiPlanner';
 import {
-  buildAiPlannerContext,
-  buildDeterministicDayPlan,
-  excludePlanItemFromToday,
-  movePlanItemOrder,
-  reassignPlanItemSlot,
-  validateAndRepairAiPlan,
-  type PlanAdjustmentFilter,
-  type ValidatedDayPlan,
-} from '../../lib/aiPlanner';
+  buildTodaySituationBriefing,
+  timestampToDate,
+} from '../../lib/briefing';
 import {
-  getStoredAiEnabled,
-  setStoredAiEnabled,
-  subscribeAiEnabledChange,
-} from '../../lib/aiPreferences';
-import type { AiBriefingResponse, AiPlannerRawResult } from '../../lib/aiTypes';
-import { classifyTodayBriefing, timestampToDate } from '../../lib/briefing';
-import { classifyTodayEvents, getMinutesUntilEventStart } from '../../lib/calendar';
+  classifyTodayEvents,
+  detectTodayEventOverlaps,
+  getEventsForDateKey,
+  getMinutesUntilEventStart,
+} from '../../lib/calendar';
 import {
   formatKstEventTimeRange,
   formatKstTodayHeader,
@@ -47,20 +39,14 @@ import {
   SLOT_KIND_LABELS,
 } from '../../lib/timetable';
 import type { TaskFilterTab } from '../../repositories/taskRepo';
-import {
-  AiClientError,
-  fetchAiServerStatus,
-  requestAiDayPlan,
-  requestAiTodayBriefing,
-} from '../../services/aiClient';
 import type { CalendarEventRecord, TaskRecord } from '../../types/domain';
 import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
 import { EventModal } from '../calendar/EventModal';
 import { useAcademicEventData } from '../academic/AcademicEventDataContext';
 import { useTimetableData } from '../timetable/TimetableDataContext';
-import { AiTodayBriefingCard } from './AiTodayBriefingCard';
 import { AiTodayPlannerCard } from './AiTodayPlannerCard';
+import { useAiWorkspace } from './AiWorkspaceContext';
 import { useTaskData } from './TaskDataContext';
 import { TaskDetailModal } from './TaskDetailModal';
 import { TaskQuickAddBar } from './TaskQuickAddBar';
@@ -194,6 +180,7 @@ export function TodayBriefingView({
   const { firebaseUser, workspace } = useAuth();
   const {
     briefingTasks,
+    cachedDoneTasks,
     briefingLoading,
     briefingError,
     hasMoreUndated,
@@ -204,7 +191,8 @@ export function TodayBriefingView({
     loadMoreUndated,
   } = useTaskData();
   const { events, eventsLoading, refreshEvents } = useEventData();
-  const { timetables, overridesByDate } = useTimetableData();
+  const { timetables, overridesByDate, extendTimetableToPeriodCount } =
+    useTimetableData();
   const { academicEvents } = useAcademicEventData();
 
   const [selectedTask, setSelectedTask] = useState<TaskRecord | null>(null);
@@ -212,89 +200,52 @@ export function TodayBriefingView({
   const [selectedEvent, setSelectedEvent] =
     useState<CalendarEventRecord | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [extendingTimetable, setExtendingTimetable] = useState(false);
+  const [onHoldOpen, setOnHoldOpen] = useState(false);
   const [undatedOpen, setUndatedOpen] = useState(false);
   const [unremindedOpen, setUnremindedOpen] = useState(false);
 
-  const [aiEnabled, setAiEnabled] = useState(() =>
-    getStoredAiEnabled(firebaseUser?.uid),
-  );
-  const [hasPersonalKey, setHasPersonalKey] = useState<boolean>(false);
-  const [aiStatusFetched, setAiStatusFetched] = useState<boolean>(false);
-
-  const [aiBriefingLoading, setAiBriefingLoading] = useState(false);
-  const [aiBriefingError, setAiBriefingError] = useState<string | null>(null);
-  const [aiBriefingData, setAiBriefingData] =
-    useState<AiBriefingResponse | null>(null);
-  const aiBriefingAbortRef = useRef<AbortController | null>(null);
-
-  // Stage 5C: AI Today Work Planner state & session fingerprint cache
-  const [plannerVisible, setPlannerVisible] = useState(false);
-  const [plannerLoading, setPlannerLoading] = useState(false);
-  const [plannerError, setPlannerError] = useState<string | null>(null);
-  const [plannerErrorCode, setPlannerErrorCode] = useState<string | null>(null);
-  const [plannerPlan, setPlannerPlan] = useState<ValidatedDayPlan | null>(null);
-  const [plannerFilter, setPlannerFilter] = useState<PlanAdjustmentFilter>({});
-  const plannerAbortRef = useRef<AbortController | null>(null);
-  const plannerCacheRef = useRef<Map<string, ValidatedDayPlan>>(new Map());
-  const rawAiPlanRef = useRef<{
-    raw: AiPlannerRawResult;
-    model: string;
-    generatedAtIso: string;
-    usage?: ValidatedDayPlan['usage'];
-  } | null>(null);
+  const {
+    aiEnabled,
+    hasPersonalKey,
+    plannerVisible,
+    plannerLoading,
+    plannerError,
+    plannerErrorCode,
+    plannerPlan,
+    plannerFilter,
+    generatedDataFingerprint,
+    ensureTodayKeySynced,
+    runAiPlanner,
+    runDeterministicPlan,
+    cancelAiPlanner,
+    closeAiPlanner,
+    applyQuickFilter,
+    movePlanItem,
+    excludePlanItem,
+    reassignPlanSlot,
+    resetLocalAdjustments,
+  } = useAiWorkspace();
 
   useEffect(() => {
-    setAiEnabled(getStoredAiEnabled(firebaseUser?.uid));
-    return subscribeAiEnabledChange(firebaseUser?.uid, setAiEnabled);
-  }, [firebaseUser?.uid]);
-
-  useEffect(() => {
-    if (!firebaseUser?.uid) return;
-    let cancelled = false;
-    void fetchAiServerStatus()
-      .then((status) => {
-        if (cancelled) return;
-        setHasPersonalKey(status.hasPersonalKey);
-        setAiEnabled(status.aiEnabled);
-        setStoredAiEnabled(firebaseUser.uid, status.aiEnabled);
-        setAiStatusFetched(true);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setAiStatusFetched(true);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [firebaseUser?.uid]);
-
-  useEffect(() => {
-    return () => {
-      aiBriefingAbortRef.current?.abort();
-      plannerAbortRef.current?.abort();
-    };
-  }, []);
+    ensureTodayKeySynced(todayKey);
+  }, [todayKey, ensureTodayKeySynced]);
 
   const imminentDays = workspace?.preferences.imminentDays ?? 3;
   const displayName = workspace?.profile.displayName ?? '선생님';
 
-  const plannerContext = useMemo(
-    () =>
-      buildAiPlannerContext({
-        uid: firebaseUser?.uid ?? 'anonymous',
-        todayKey,
-        now,
-        imminentDays,
-        tasks: briefingTasks,
-        events,
-        timetables,
-        overridesByDate,
-        academicEvents,
-        filter: plannerFilter,
-      }),
+  const plannerInputs = useMemo(
+    () => ({
+      todayKey,
+      now,
+      imminentDays,
+      tasks: briefingTasks,
+      events,
+      timetables,
+      overridesByDate,
+      academicEvents,
+    }),
     [
-      firebaseUser?.uid,
       todayKey,
       now,
       imminentDays,
@@ -303,262 +254,24 @@ export function TodayBriefingView({
       timetables,
       overridesByDate,
       academicEvents,
-      plannerFilter,
     ],
   );
 
-  function handleRunDeterministicPlan(nextFilter: PlanAdjustmentFilter = plannerFilter) {
-    const ctx = buildAiPlannerContext({
-      uid: firebaseUser?.uid ?? 'anonymous',
-      todayKey,
-      now,
-      imminentDays,
-      tasks: briefingTasks,
-      events,
-      timetables,
-      overridesByDate,
-      academicEvents,
-      filter: nextFilter,
-    });
-    rawAiPlanRef.current = null;
-    setPlannerVisible(true);
-    setPlannerError(null);
-    setPlannerErrorCode(null);
-    setPlannerPlan(buildDeterministicDayPlan(ctx));
-  }
+  const plannerContext = useMemo(
+    () =>
+      buildAiPlannerContext({
+        uid: firebaseUser?.uid ?? 'anonymous',
+        ...plannerInputs,
+        filter: plannerFilter,
+      }),
+    [firebaseUser?.uid, plannerInputs, plannerFilter],
+  );
 
-  async function handleRunAiPlanner(
-    forceRefresh = false,
-    constraintText?: string,
-  ) {
-    if (plannerLoading) return;
-    setPlannerVisible(true);
-    setPlannerError(null);
-    setPlannerErrorCode(null);
-
-    const nextFilter: PlanAdjustmentFilter = {
-      ...plannerFilter,
-      constraintText: constraintText?.trim() || undefined,
-    };
-    if (constraintText !== undefined) {
-      setPlannerFilter(nextFilter);
-    }
-
-    // Refresh server status once if not loaded yet so BYOK status is accurate
-    let currentHasKey = hasPersonalKey;
-    let currentEnabled = aiEnabled;
-    if (!aiStatusFetched) {
-      try {
-        const status = await fetchAiServerStatus();
-        currentHasKey = status.hasPersonalKey;
-        currentEnabled = status.aiEnabled;
-        setHasPersonalKey(status.hasPersonalKey);
-        setAiEnabled(status.aiEnabled);
-        setStoredAiEnabled(firebaseUser?.uid, status.aiEnabled);
-        setAiStatusFetched(true);
-      } catch {
-        setAiStatusFetched(true);
-      }
-    }
-
-    if (!currentEnabled || !currentHasKey) {
-      setPlannerPlan(null);
-      setPlannerErrorCode(
-        !currentEnabled ? 'ai_disabled_by_user' : 'personal_key_required',
-      );
-      return;
-    }
-
-    const ctx = buildAiPlannerContext({
-      uid: firebaseUser?.uid ?? 'anonymous',
-      todayKey,
-      now,
-      imminentDays,
-      tasks: briefingTasks,
-      events,
-      timetables,
-      overridesByDate,
-      academicEvents,
-      filter: nextFilter,
-    });
-
-    if (ctx.compressedRequest.tasks.length === 0) {
-      rawAiPlanRef.current = null;
-      setPlannerPlan(buildDeterministicDayPlan(ctx));
-      return;
-    }
-
-    if (!forceRefresh) {
-      const cached = plannerCacheRef.current.get(ctx.fingerprint);
-      if (cached) {
-        setPlannerPlan({ ...cached, fromCache: true });
-        return;
-      }
-    }
-
-    plannerAbortRef.current?.abort();
-    const controller = new AbortController();
-    plannerAbortRef.current = controller;
-    setPlannerLoading(true);
-
-    try {
-      const res = await requestAiDayPlan(ctx.compressedRequest, controller.signal);
-      if (controller.signal.aborted) return;
-
-      rawAiPlanRef.current = {
-        raw: res.rawPlan,
-        model: res.model,
-        generatedAtIso: res.generatedAtIso,
-        usage: res.usage,
-      };
-
-      const validated = validateAndRepairAiPlan(res.rawPlan, ctx, {
-        model: res.model,
-        generatedAtIso: res.generatedAtIso,
-        usage: res.usage,
-      });
-
-      plannerCacheRef.current.set(ctx.fingerprint, validated);
-      setPlannerPlan(validated);
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      if (err instanceof AiClientError) {
-        setPlannerError(err.message);
-        setPlannerErrorCode(err.code);
-        if (err.code === 'personal_key_required') {
-          setHasPersonalKey(false);
-          setPlannerPlan(null);
-        }
-      } else {
-        setPlannerError(
-          err instanceof Error
-            ? err.message
-            : 'AI 업무 계획을 생성하지 못했습니다.',
-        );
-        setPlannerErrorCode('unknown_error');
-      }
-    } finally {
-      if (plannerAbortRef.current === controller) {
-        plannerAbortRef.current = null;
-        setPlannerLoading(false);
-      }
-    }
-  }
-
-  function handleApplyQuickFilter(nextFilter: PlanAdjustmentFilter) {
-    setPlannerFilter(nextFilter);
-    const ctx = buildAiPlannerContext({
-      uid: firebaseUser?.uid ?? 'anonymous',
-      todayKey,
-      now,
-      imminentDays,
-      tasks: briefingTasks,
-      events,
-      timetables,
-      overridesByDate,
-      academicEvents,
-      filter: nextFilter,
-    });
-
-    if (plannerPlan?.mode === 'ai' && rawAiPlanRef.current) {
-      setPlannerPlan(
-        validateAndRepairAiPlan(rawAiPlanRef.current.raw, ctx, {
-          model: rawAiPlanRef.current.model,
-          generatedAtIso: rawAiPlanRef.current.generatedAtIso,
-          usage: rawAiPlanRef.current.usage,
-        }),
-      );
-    } else {
-      setPlannerPlan(buildDeterministicDayPlan(ctx));
-    }
-  }
-
-  function handleMovePlanItem(taskId: string, direction: 'up' | 'down') {
-    setPlannerPlan((prev) =>
-      prev
-        ? movePlanItemOrder(
-            prev,
-            taskId,
-            direction,
-            plannerContext.remainingWorkableIntervals,
-          )
-        : prev,
-    );
-  }
-
-  function handleExcludePlanItem(taskId: string) {
-    const nextExcluded = Array.from(
-      new Set([...(plannerFilter.excludedTaskIds ?? []), taskId]),
-    );
-    setPlannerFilter((prev) => ({ ...prev, excludedTaskIds: nextExcluded }));
-    setPlannerPlan((prev) =>
-      prev
-        ? excludePlanItemFromToday(
-            prev,
-            taskId,
-            plannerContext.remainingWorkableIntervals,
-          )
-        : prev,
-    );
-  }
-
-  function handleReassignPlanSlot(taskId: string, intervalIndex: number) {
-    setPlannerPlan((prev) =>
-      prev
-        ? reassignPlanItemSlot(
-            prev,
-            taskId,
-            intervalIndex,
-            plannerContext.remainingWorkableIntervals,
-          )
-        : prev,
-    );
-  }
-
-  function handleResetLocalAdjustments() {
-    const cleared: PlanAdjustmentFilter = {};
-    setPlannerFilter(cleared);
-    handleApplyQuickFilter(cleared);
-  }
-
-  async function handleRunAiBriefing() {
-    if (!aiEnabled || aiBriefingLoading) return;
-    aiBriefingAbortRef.current?.abort();
-    const controller = new AbortController();
-    aiBriefingAbortRef.current = controller;
-
-    setAiBriefingError(null);
-    setAiBriefingLoading(true);
-
-    try {
-      const payload = buildMinimalBriefingPayload(briefingTasks, events, {
-        now,
-        imminentDays,
-      });
-      const validIds = new Set(payload.tasks.map((t) => t.id));
-      const res = await requestAiTodayBriefing(payload, controller.signal);
-      if (controller.signal.aborted) return;
-      setAiBriefingData({
-        model: res.model,
-        generatedAtIso: res.generatedAtIso,
-        briefing: normalizeAiBriefingResult(res.briefing, validIds),
-      });
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      setAiBriefingError(
-        err instanceof AiClientError
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : 'AI 브리핑 요청에 실패했습니다.',
-      );
-    } finally {
-      if (aiBriefingAbortRef.current === controller) {
-        aiBriefingAbortRef.current = null;
-        setAiBriefingLoading(false);
-      }
-    }
-  }
+  const isPlanStale = Boolean(
+    plannerPlan?.mode === 'ai' &&
+      generatedDataFingerprint &&
+      plannerContext.dataFingerprint !== generatedDataFingerprint,
+  );
 
   useEffect(() => {
     if (!focusedTaskId) return;
@@ -590,14 +303,19 @@ export function TodayBriefingView({
     };
   }, [focusedTaskId, briefingTasks, refreshSingleTask, onClearFocusedTask]);
 
-  const summary = useMemo(
-    () => classifyTodayBriefing(briefingTasks, { imminentDays, now }),
-    [briefingTasks, imminentDays, now],
-  );
-
   const todayEventsSummary = useMemo(
     () => classifyTodayEvents(events, { now, soonMinutes: 120, upcomingDays: 7 }),
     [events, now],
+  );
+
+  const todayChronologicalEvents = useMemo(
+    () => getEventsForDateKey(events, todayKey),
+    [events, todayKey],
+  );
+
+  const todayEventOverlaps = useMemo(
+    () => detectTodayEventOverlaps(todayChronologicalEvents),
+    [todayChronologicalEvents],
   );
 
   const todaySchedule = useMemo(
@@ -624,16 +342,43 @@ export function TodayBriefingView({
     [academicEvents, todayKey],
   );
 
+  const situation = useMemo(
+    () =>
+      buildTodaySituationBriefing({
+        tasks: briefingTasks,
+        completedTasks: cachedDoneTasks,
+        todayEventsCount: todayEventsSummary.totalTodayCount,
+        scheduleConflictCount: todayAvailability.conflicts.length,
+        eventOverlapCount: todayEventOverlaps.length,
+        now,
+        imminentDays,
+      }),
+    [
+      briefingTasks,
+      cachedDoneTasks,
+      todayEventsSummary.totalTodayCount,
+      todayAvailability.conflicts.length,
+      todayEventOverlaps.length,
+      now,
+      imminentDays,
+    ],
+  );
+
+  const summary = situation.summary;
+  const totalScheduleConflicts =
+    todayAvailability.conflicts.length + todayEventOverlaps.length;
+
   const hasAnyPriorityFocus =
     summary.overdue.length > 0 ||
     summary.dueToday.length > 0 ||
+    situation.dueTomorrow.length > 0 ||
     summary.remindDue.length > 0 ||
-    summary.imminent.length > 0 ||
+    situation.laterImminent.length > 0 ||
     summary.doing.length > 0;
 
   return (
     <div className="space-y-6">
-      {/* Header */}
+      {/* Header: Pure Zero-AI Today Briefing */}
       <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-4">
         <div className="space-y-1">
           <p className="text-xs font-medium text-slate-500">
@@ -652,30 +397,6 @@ export function TodayBriefingView({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          <button
-            type="button"
-            disabled={plannerLoading}
-            onClick={() => void handleRunAiPlanner(false)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
-            <span>
-              {plannerLoading ? '업무 계획 정리 중...' : 'AI로 오늘 업무 계획 세우기'}
-            </span>
-          </button>
-
-          {aiEnabled && hasPersonalKey && (
-            <button
-              type="button"
-              disabled={aiBriefingLoading}
-              onClick={() => void handleRunAiBriefing()}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-lg hover:bg-teal-100 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>{aiBriefingLoading ? 'AI 브리핑 생성 중...' : 'AI 브리핑'}</span>
-            </button>
-          )}
-
           <button
             type="button"
             disabled={briefingLoading || eventsLoading}
@@ -720,76 +441,6 @@ export function TodayBriefingView({
         onGoToCalendarView={() => onOpenCalendar()}
       />
 
-      <AiTodayPlannerCard
-        visible={plannerVisible}
-        loading={plannerLoading}
-        error={plannerError}
-        errorCode={plannerErrorCode}
-        plan={plannerPlan}
-        hasPersonalKey={hasPersonalKey}
-        aiEnabled={aiEnabled}
-        availableIntervals={plannerContext.remainingWorkableIntervals}
-        activeFilter={plannerFilter}
-        onCancel={() => {
-          plannerAbortRef.current?.abort();
-          plannerAbortRef.current = null;
-          setPlannerLoading(false);
-        }}
-        onClose={() => {
-          setPlannerVisible(false);
-          setPlannerError(null);
-          setPlannerErrorCode(null);
-        }}
-        onRunAiPlan={(force, constraint) =>
-          void handleRunAiPlanner(force, constraint)
-        }
-        onRunDeterministicPlan={() => handleRunDeterministicPlan()}
-        onOpenSettings={onOpenSettings}
-        onOpenTimetable={onOpenTimetable}
-        onOpenAcademicCalendar={onOpenAcademicCalendar}
-        onOpenTask={(taskId) => {
-          const matched = briefingTasks.find((t) => t.id === taskId);
-          if (matched) {
-            setSelectedTask(matched);
-          } else {
-            void refreshSingleTask(taskId).then((fetched) => {
-              if (fetched) setSelectedTask(fetched);
-            });
-          }
-        }}
-        onMoveItemOrder={handleMovePlanItem}
-        onExcludeItem={handleExcludePlanItem}
-        onReassignItemSlot={handleReassignPlanSlot}
-        onApplyQuickFilter={handleApplyQuickFilter}
-        onResetLocalAdjustments={handleResetLocalAdjustments}
-      />
-
-      <AiTodayBriefingCard
-        loading={aiBriefingLoading}
-        error={aiBriefingError}
-        data={aiBriefingData}
-        onCancel={() => {
-          aiBriefingAbortRef.current?.abort();
-          aiBriefingAbortRef.current = null;
-          setAiBriefingLoading(false);
-        }}
-        onClose={() => {
-          setAiBriefingError(null);
-          setAiBriefingData(null);
-        }}
-        onRetry={() => void handleRunAiBriefing()}
-        onOpenTask={(taskId) => {
-          const matched = briefingTasks.find((t) => t.id === taskId);
-          if (matched) {
-            setSelectedTask(matched);
-          } else {
-            void refreshSingleTask(taskId).then((fetched) => {
-              if (fetched) setSelectedTask(fetched);
-            });
-          }
-        }}
-      />
-
       {usedIndexFallback && (
         <div
           role="status"
@@ -820,8 +471,57 @@ export function TodayBriefingView({
         </div>
       )}
 
+      {/* Zero-AI Auto Situation Summary Banner */}
+      <section
+        aria-label="오늘의 요약"
+        className="rounded-xl border border-slate-200 bg-slate-50/80 px-4 py-3.5 flex flex-wrap items-center justify-between gap-3"
+      >
+        <div className="space-y-1 min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-bold text-slate-900">오늘의 요약</span>
+            <span className="text-[11px] text-slate-500">
+              자동 집계 · AI 미사용
+            </span>
+          </div>
+          <p className="text-sm text-slate-800 leading-relaxed">
+            {situation.headlineSummary}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 tabular-nums shrink-0">
+          <span>미착수 {situation.todoCount}건</span>
+          <span>진행 중 {situation.doingCount}건</span>
+          <span>보류 {situation.onHoldCount}건</span>
+          <span>
+            완료 {situation.completedCount}건
+            {situation.completedTodayCount > 0
+              ? ` (오늘 ${situation.completedTodayCount})`
+              : ''}
+          </span>
+        </div>
+      </section>
+
       {/* Clean 4-column Summary Strip */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div
+          className={`p-4 rounded-xl border ${
+            totalScheduleConflicts > 0
+              ? 'border-amber-200 bg-amber-50/40'
+              : 'border-slate-200 bg-white'
+          }`}
+        >
+          <p className="text-xs font-medium text-slate-600">오늘의 주요 일정</p>
+          <p className="mt-1 text-2xl font-bold text-slate-900 tabular-nums">
+            {todayEventsSummary.totalTodayCount}건
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
+            {totalScheduleConflicts > 0
+              ? `시간 중복·충돌 ${totalScheduleConflicts}건`
+              : todayAvailability.hasTimetable
+                ? `가용 ${formatMinutesKorean(todayAvailability.netAvailableMinutes)}`
+                : '시간 중복 없음'}
+          </p>
+        </div>
+
         <div
           className={`p-4 rounded-xl border ${
             summary.overdue.length > 0
@@ -829,39 +529,95 @@ export function TodayBriefingView({
               : 'border-slate-200 bg-white'
           }`}
         >
-          <p className="text-xs font-medium text-slate-600">기한 초과</p>
+          <p className="text-xs font-medium text-slate-600">오늘 · 내일 마감</p>
           <p
             className={`mt-1 text-2xl font-bold tabular-nums ${
               summary.overdue.length > 0 ? 'text-red-700' : 'text-slate-900'
             }`}
           >
-            {summary.overdue.length}건
+            {summary.dueToday.length + summary.overdue.length}건
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
+            오늘 {summary.dueToday.length} · 초과 {summary.overdue.length} · 내일{' '}
+            {situation.dueTomorrow.length}
           </p>
         </div>
 
         <div className="p-4 rounded-xl border border-slate-200 bg-white">
-          <p className="text-xs font-medium text-slate-600">오늘 마감</p>
-          <p className="mt-1 text-2xl font-bold text-slate-900 tabular-nums">
-            {summary.dueToday.length}건
-          </p>
-        </div>
-
-        <div className="p-4 rounded-xl border border-slate-200 bg-white">
-          <p className="text-xs font-medium text-slate-600">오늘 재확인</p>
-          <p className="mt-1 text-2xl font-bold text-amber-800 tabular-nums">
-            {summary.remindDue.length}건
-          </p>
-        </div>
-
-        <div className="p-4 rounded-xl border border-slate-200 bg-white">
-          <p className="text-xs font-medium text-slate-600">
-            마감 임박 ({imminentDays}일 이내)
-          </p>
+          <p className="text-xs font-medium text-slate-600">업무 현황 (미완료)</p>
           <p className="mt-1 text-2xl font-bold text-teal-800 tabular-nums">
-            {summary.imminent.length}건
+            {situation.incompleteCount}건
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
+            오늘 처리 {situation.todayActionableCount} · 보류 {situation.onHoldCount} · 완료{' '}
+            {situation.completedCount}
+          </p>
+        </div>
+
+        <div className="p-4 rounded-xl border border-slate-200 bg-white">
+          <p className="text-xs font-medium text-slate-600">주의 · 확인 필요</p>
+          <p className="mt-1 text-2xl font-bold text-amber-800 tabular-nums">
+            {situation.importantTasks.length + summary.imminent.length + totalScheduleConflicts}
+            건
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
+            중요 {situation.importantTasks.length} · 임박 {summary.imminent.length} · 충돌{' '}
+            {totalScheduleConflicts}
           </p>
         </div>
       </div>
+
+      {/* Attention & Verification Panel (Only if real attention items exist) */}
+      {(situation.attentionReasons.length > 0 ||
+        situation.importantTasks.length > 0 ||
+        situation.officialTasks.length > 0) && (
+        <section
+          aria-label="주의 및 확인 사항"
+          className="rounded-xl border border-amber-200 bg-amber-50/40 p-4 space-y-2.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-bold text-amber-950 flex items-center gap-1.5">
+              <AlertTriangle className="w-4 h-4 text-amber-700" aria-hidden="true" />
+              <span>주의 및 확인 사항</span>
+            </h2>
+            {situation.officialTasks.length > 0 && (
+              <span className="text-[11px] font-semibold text-amber-900">
+                공문·제출 확인 {situation.officialTasks.length}건
+              </span>
+            )}
+          </div>
+
+          {situation.attentionReasons.length > 0 && (
+            <ul className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-amber-950">
+              {situation.attentionReasons.map((reason, idx) => (
+                <li key={idx} className="inline-flex items-center gap-1">
+                  <span aria-hidden="true">·</span>
+                  <span>{reason}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {situation.importantTasks.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+              <span className="text-[11px] font-semibold text-amber-900 mr-1">
+                중요 표시 업무:
+              </span>
+              {situation.importantTasks.slice(0, 5).map((task) => (
+                <button
+                  key={`imp-${task.id}`}
+                  type="button"
+                  onClick={() => setSelectedTask(task)}
+                  className="px-2 py-1 text-xs font-medium bg-white border border-amber-200 text-slate-800 rounded-md hover:border-teal-600 hover:text-teal-800 transition-colors cursor-pointer"
+                >
+                  {task.priority === 'urgent' ? '[긴급] ' : '[높음] '}
+                  {task.title}
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* Main Layout */}
       {briefingLoading && briefingTasks.length === 0 ? (
@@ -891,6 +647,15 @@ export function TodayBriefingView({
             />
 
             <BriefingSection
+              title="내일 마감 예정 업무"
+              subtitle={`내일(${situation.tomorrowKey}) 마감 예정입니다`}
+              tasks={situation.dueTomorrow}
+              tone="warn"
+              onSelectTask={setSelectedTask}
+              onError={setActionError}
+            />
+
+            <BriefingSection
               title="오늘 재확인할 업무"
               subtitle="재확인 시점이 도래했거나 지난 업무입니다"
               tasks={summary.remindDue}
@@ -902,7 +667,7 @@ export function TodayBriefingView({
             <BriefingSection
               title="마감 임박 업무"
               subtitle={`향후 ${imminentDays}일 이내 마감`}
-              tasks={summary.imminent}
+              tasks={situation.laterImminent}
               onSelectTask={setSelectedTask}
               onError={setActionError}
             />
@@ -915,6 +680,47 @@ export function TodayBriefingView({
               onError={setActionError}
               onViewAllInTasks={() => onOpenTasksView('doing')}
             />
+
+            {situation.onHoldTasks.length > 0 && (
+              <section
+                aria-label="보류 중인 업무"
+                className="bg-white border border-slate-200 rounded-xl overflow-hidden"
+              >
+                <button
+                  type="button"
+                  aria-expanded={onHoldOpen}
+                  onClick={() => setOnHoldOpen((prev) => !prev)}
+                  className="w-full px-5 py-3.5 flex items-center justify-between gap-3 text-left hover:bg-slate-50 transition-colors cursor-pointer"
+                >
+                  <div className="flex items-baseline gap-2">
+                    <h2 className="text-sm font-bold text-slate-900">
+                      보류 중인 업무
+                    </h2>
+                    <span className="text-xs font-semibold text-slate-500 tabular-nums">
+                      {situation.onHoldTasks.length}건
+                    </span>
+                  </div>
+                  {onHoldOpen ? (
+                    <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" aria-hidden="true" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" aria-hidden="true" />
+                  )}
+                </button>
+                {onHoldOpen && (
+                  <div className="px-4 pb-4 pt-1 border-t border-slate-100 space-y-2">
+                    {situation.onHoldTasks.map((task) => (
+                      <TaskRow
+                        key={task.id}
+                        task={task}
+                        onSelect={setSelectedTask}
+                        onError={setActionError}
+                        compact
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+            )}
 
             {!hasAnyPriorityFocus && (
               <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
@@ -1098,6 +904,30 @@ export function TodayBriefingView({
                       </div>
                     </div>
                   )}
+
+                  {(todayEventOverlaps.length > 0 ||
+                    todayAvailability.conflicts.length > 0) && (
+                    <div className="p-2.5 rounded-lg border border-amber-200 bg-amber-50/70 space-y-1 text-[11px] text-amber-950">
+                      <p className="font-semibold flex items-center gap-1">
+                        <AlertTriangle
+                          className="w-3.5 h-3.5 text-amber-700 shrink-0"
+                          aria-hidden="true"
+                        />
+                        <span>일정 시간 중복 · 충돌 확인</span>
+                      </p>
+                      {todayEventOverlaps.map((ov, idx) => (
+                        <p key={`ov-${idx}`} className="leading-relaxed">
+                          · 일정 겹침 ({ov.overlapLabel}): {ov.eventATitle} /{' '}
+                          {ov.eventBTitle}
+                        </p>
+                      ))}
+                      {todayAvailability.conflicts.map((cf, idx) => (
+                        <p key={`cf-${idx}`} className="leading-relaxed">
+                          · 수업·일과 충돌: {cf.eventTitle} ({cf.startTime}~{cf.endTime})
+                        </p>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </section>
@@ -1194,7 +1024,7 @@ export function TodayBriefingView({
                   <p className="text-xs text-slate-500 leading-relaxed">
                     {todaySchedule.isWeekday
                       ? '오늘 적용되는 주간 시간표가 없습니다. 엑셀·한글(HWPX)·PDF·이미지 또는 직접 입력으로 시간표를 등록하면 수업과 업무 가능 시간이 함께 정리됩니다.'
-                      : '주말에는 주간 수업 시간표가 표시되지 않습니다.'}
+                      : '주말·휴일에는 주간 수업 시간표가 적용되지 않으며 임의 근무시간을 생성하지 않습니다.'}
                   </p>
                   {onOpenTimetable && (
                     <button
@@ -1202,7 +1032,9 @@ export function TodayBriefingView({
                       onClick={onOpenTimetable}
                       className="text-xs font-semibold text-teal-700 hover:text-teal-900 cursor-pointer"
                     >
-                      주간 시간표 등록하기 →
+                      {todaySchedule.isWeekday
+                        ? '주간 시간표 등록하기 →'
+                        : '오늘 임시 근무시간 등록하기 →'}
                     </button>
                   )}
                 </div>
@@ -1257,6 +1089,42 @@ export function TodayBriefingView({
                       </div>
                     ))}
                   </div>
+
+                  {todaySchedule.isWeekday &&
+                    todaySchedule.timetableId &&
+                    todaySchedule.periods.length < 7 && (
+                      <div className="p-2.5 rounded-lg border border-amber-200 bg-amber-50/70 flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <span className="text-amber-950 font-medium">
+                          현재 시간표가 {todaySchedule.periods.length}교시까지로 설정되어 있습니다.
+                        </span>
+                        <button
+                          type="button"
+                          disabled={extendingTimetable}
+                          onClick={() => {
+                            if (!todaySchedule.timetableId) return;
+                            setExtendingTimetable(true);
+                            setActionError(null);
+                            void extendTimetableToPeriodCount(
+                              todaySchedule.timetableId,
+                              7,
+                            )
+                              .catch((err) => {
+                                setActionError(
+                                  err instanceof Error
+                                    ? err.message
+                                    : '시간표를 7교시까지로 확장하는 중 오류가 발생했습니다.',
+                                );
+                              })
+                              .finally(() => {
+                                setExtendingTimetable(false);
+                              });
+                          }}
+                          className="px-2.5 py-1 text-[11px] font-semibold bg-teal-700 text-white rounded-md hover:bg-teal-800 disabled:opacity-60 shrink-0 cursor-pointer"
+                        >
+                          {extendingTimetable ? '확장 중...' : '7교시까지로 확장하기'}
+                        </button>
+                      </div>
+                    )}
 
                   {todayAvailability.hasTimetable && (
                     <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-1 text-xs">
@@ -1423,6 +1291,106 @@ export function TodayBriefingView({
           </aside>
         </div>
       )}
+
+      {/* Separated Bottom Section: AI Work Planner */}
+      <section
+        aria-label="AI 업무 계획"
+        className="rounded-2xl border-2 border-teal-200 bg-gradient-to-br from-teal-50/50 via-white to-slate-50 p-5 space-y-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-teal-700" aria-hidden="true" />
+              <h2 className="text-base font-bold text-slate-900">AI 업무 계획</h2>
+            </div>
+            <p className="text-xs text-slate-600">
+              오늘의 일정과 업무를 종합하여 우선순위와 실행 전략을 추천합니다.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={plannerLoading}
+              onClick={() => void runAiPlanner(plannerInputs, { forceRefresh: false })}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>
+                {plannerLoading
+                  ? '업무 계획 정리 중...'
+                  : plannerPlan?.mode === 'ai' && !plannerVisible
+                    ? '저장된 AI 업무 계획 열기'
+                    : 'AI로 오늘 업무 계획 세우기'}
+              </span>
+            </button>
+
+            {!plannerVisible && !plannerLoading && (
+              <button
+                type="button"
+                onClick={() => runDeterministicPlan(plannerInputs)}
+                className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                기본 우선순위 계획 보기 (AI 미사용)
+              </button>
+            )}
+          </div>
+        </div>
+
+        <AiTodayPlannerCard
+          visible={plannerVisible}
+          loading={plannerLoading}
+          error={plannerError}
+          errorCode={plannerErrorCode}
+          plan={plannerPlan}
+          hasPersonalKey={hasPersonalKey}
+          aiEnabled={aiEnabled}
+          availableIntervals={plannerContext.remainingWorkableIntervals}
+          activeFilter={plannerFilter}
+          isStaleInputs={isPlanStale}
+          availabilityReason={plannerContext.availabilityReason}
+          availabilityReasonDetail={plannerContext.availabilityReasonDetail}
+          onCancel={cancelAiPlanner}
+          onClose={closeAiPlanner}
+          onRunAiPlan={(force, constraint) =>
+            void runAiPlanner(plannerInputs, {
+              forceRefresh: force,
+              constraintText: constraint,
+            })
+          }
+          onRunDeterministicPlan={() => runDeterministicPlan(plannerInputs)}
+          onOpenSettings={onOpenSettings}
+          onOpenTimetable={onOpenTimetable}
+          onOpenAcademicCalendar={onOpenAcademicCalendar}
+          onOpenTask={(taskId) => {
+            const matched = briefingTasks.find((t) => t.id === taskId);
+            if (matched) {
+              setSelectedTask(matched);
+            } else {
+              void refreshSingleTask(taskId).then((fetched) => {
+                if (fetched) setSelectedTask(fetched);
+              });
+            }
+          }}
+          onMoveItemOrder={(taskId, direction) =>
+            movePlanItem(taskId, direction, plannerContext.remainingWorkableIntervals)
+          }
+          onExcludeItem={(taskId) =>
+            excludePlanItem(taskId, plannerContext.remainingWorkableIntervals)
+          }
+          onReassignItemSlot={(taskId, intervalIndex) =>
+            reassignPlanSlot(
+              taskId,
+              intervalIndex,
+              plannerContext.remainingWorkableIntervals,
+            )
+          }
+          onApplyQuickFilter={(nextFilter) =>
+            applyQuickFilter(nextFilter, plannerInputs)
+          }
+          onResetLocalAdjustments={() => resetLocalAdjustments(plannerInputs)}
+        />
+      </section>
 
       <TaskDetailModal
         task={selectedTask}

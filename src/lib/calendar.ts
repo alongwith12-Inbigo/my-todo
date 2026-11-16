@@ -224,3 +224,63 @@ export function formatEventStartDayLabel(
   if (startKey === addKstDaysToDateKey(todayKey, 1)) return '내일';
   return startKey;
 }
+
+export interface EventTimeOverlap {
+  eventAId: string;
+  eventATitle: string;
+  eventBId: string;
+  eventBTitle: string;
+  overlapStartMs: number;
+  overlapEndMs: number;
+  overlapLabel: string;
+}
+
+function formatKstHhMmFromMs(ms: number): string {
+  const parts = getKstDateParts(new Date(ms));
+  const d = new Date(ms + 9 * 60 * 60 * 1000);
+  return `${String(parts.hour).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * Detects time overlaps among timed (non-all-day) calendar events on the same day.
+ * Zero AI calls, purely deterministic.
+ */
+export function detectTodayEventOverlaps(
+  todayEvents: CalendarEventRecord[],
+): EventTimeOverlap[] {
+  const timed = todayEvents
+    .filter((ev) => !ev.allDay)
+    .map((ev) => ({
+      event: ev,
+      startMs: timestampToMillis(ev.startsAt),
+      endMs: timestampToMillis(ev.endsAt),
+    }))
+    .filter(
+      (item): item is { event: CalendarEventRecord; startMs: number; endMs: number } =>
+        item.startMs !== null && item.endMs !== null && item.endMs > item.startMs,
+    )
+    .sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+
+  const overlaps: EventTimeOverlap[] = [];
+  for (let i = 0; i < timed.length; i++) {
+    const a = timed[i];
+    for (let j = i + 1; j < timed.length; j++) {
+      const b = timed[j];
+      if (b.startMs >= a.endMs) break;
+      const overlapStartMs = Math.max(a.startMs, b.startMs);
+      const overlapEndMs = Math.min(a.endMs, b.endMs);
+      if (overlapEndMs > overlapStartMs) {
+        overlaps.push({
+          eventAId: a.event.id,
+          eventATitle: a.event.title,
+          eventBId: b.event.id,
+          eventBTitle: b.event.title,
+          overlapStartMs,
+          overlapEndMs,
+          overlapLabel: `${formatKstHhMmFromMs(overlapStartMs)}~${formatKstHhMmFromMs(overlapEndMs)}`,
+        });
+      }
+    }
+  }
+  return overlaps;
+}

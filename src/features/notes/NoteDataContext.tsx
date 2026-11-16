@@ -179,13 +179,16 @@ export function NoteDataProvider({ children }: { children: ReactNode }) {
       }
       markPending(noteId, true);
       try {
-        await updateNote(uid, noteId, expectedVersion, patch);
+        const res = await updateNote(uid, noteId, expectedVersion, patch);
+        if (res.unchanged) {
+          return notes.find((item) => item.id === noteId) ?? null;
+        }
         return await refreshSingleNote(noteId);
       } finally {
         markPending(noteId, false);
       }
     },
-    [uid, isActive, markPending, refreshSingleNote],
+    [uid, isActive, notes, markPending, refreshSingleNote],
   );
 
   const moveNoteOrder = useCallback(
@@ -220,12 +223,26 @@ export function NoteDataProvider({ children }: { children: ReactNode }) {
       txUpdates.forEach((item) => markPending(item.id, true));
       try {
         await reorderNotes(uid, txUpdates);
-        await refreshNotes();
+        const updateById = new Map(txUpdates.map((u) => [u.id, u]));
+        setNotes((prev) =>
+          sortStickyNotes(
+            prev.map((note) => {
+              const upd = updateById.get(note.id);
+              return upd
+                ? {
+                    ...note,
+                    sortOrder: upd.sortOrder,
+                    version: note.version + 1,
+                  }
+                : note;
+            }),
+          ),
+        );
       } finally {
         txUpdates.forEach((item) => markPending(item.id, false));
       }
     },
-    [uid, isActive, notes, markPending, refreshNotes],
+    [uid, isActive, notes, markPending],
   );
 
   const removeNote = useCallback(

@@ -121,7 +121,7 @@ export async function updateTaskDetails(
   taskId: string,
   expectedVersion: number,
   patch: UpdateTaskDetailsPatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   const path = `users/${uid}/tasks/${taskId}`;
   try {
     return await updateTaskDetailsOp(db, uid, taskId, expectedVersion, patch);
@@ -135,7 +135,7 @@ export async function postponeTask(
   taskId: string,
   expectedVersion: number,
   datesPatch: PostponeTaskPatch,
-): Promise<{ id: string; version: number }> {
+): Promise<{ id: string; version: number; unchanged?: boolean }> {
   const path = `users/${uid}/tasks/${taskId}`;
   try {
     return await postponeTaskOp(db, uid, taskId, expectedVersion, datesPatch);
