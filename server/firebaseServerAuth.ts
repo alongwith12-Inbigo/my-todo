@@ -136,12 +136,21 @@ async function defaultFetchFirestoreAccessDoc(params: {
     params.firestoreDatabaseId,
   )}/documents/access/${encodeURIComponent(params.uid)}`;
 
-  const res = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${params.idToken}`,
-    },
-  });
+  let res: globalThis.Response;
+  try {
+    res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${params.idToken}`,
+      },
+    });
+  } catch {
+    throw new ServerAuthError(
+      503,
+      'access_check_failed',
+      '계정 승인 상태를 확인하는 중 네트워크 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+    );
+  }
 
   if (res.status === 404) {
     return null;

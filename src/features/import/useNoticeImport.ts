@@ -40,6 +40,7 @@ import {
 import { AiClientError, requestAiNoticeAnalysis } from '../../services/aiClient';
 import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
+import { useOptionalAiWorkspace } from '../tasks/AiWorkspaceContext';
 import { formatTaskErrorMessage } from '../tasks/taskErrors';
 import { useTaskData } from '../tasks/TaskDataContext';
 import type { CandidateSaveState } from './ImportCandidateCard';
@@ -60,6 +61,7 @@ export function useNoticeImport() {
   const { firebaseUser } = useAuth();
   const { briefingTasks, createNewTask } = useTaskData();
   const { events, createNewEvent } = useEventData();
+  const aiWorkspace = useOptionalAiWorkspace();
 
   const [aiEnabled, setAiEnabled] = useState(() =>
     getStoredAiEnabled(firebaseUser?.uid),
@@ -422,6 +424,7 @@ export function useNoticeImport() {
           controller.signal,
         );
         if (controller.signal.aborted) return;
+        aiWorkspace?.recordNoticeAnalysisSuccess(response);
 
         const normalized = normalizeAiNoticeCandidates(response.rawOutput, {
           now,
@@ -457,7 +460,7 @@ export function useNoticeImport() {
         }
       }
     },
-    [aiPendingConsent, briefingTasks, events],
+    [aiPendingConsent, aiWorkspace, briefingTasks, events],
   );
 
   const runRuleFallbackAfterAiError = useCallback(() => {

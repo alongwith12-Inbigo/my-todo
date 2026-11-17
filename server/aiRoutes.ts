@@ -14,7 +14,11 @@ import {
   type GeminiDiagnosticErrorCategory,
 } from '../src/lib/aiTypes.ts';
 import { detectGeminiApiKeyType } from '../src/lib/byokKeyFormat.ts';
-import { getAiStatusBasePayload, getGeminiModelName } from './aiConfig.ts';
+import {
+  getAiStatusBasePayload,
+  getGeminiModelName,
+  logAiServerDiagnostic,
+} from './aiConfig.ts';
 import {
   acquireUidInFlightLock,
   applyUsageIncrement,
@@ -173,8 +177,15 @@ function parseRequestObjectBody(
   };
 }
 
-function handleRouteError(err: unknown): AiRouteResult {
+function handleRouteError(err: unknown, route?: string): AiRouteResult {
   if (err instanceof ServerAuthError) {
+    if (err.statusCode >= 500) {
+      logAiServerDiagnostic('warn', 'ai_route_auth_error', {
+        route,
+        status: err.statusCode,
+        errorCode: err.code,
+      });
+    }
     return {
       status: err.statusCode,
       body: {
@@ -185,6 +196,11 @@ function handleRouteError(err: unknown): AiRouteResult {
     };
   }
   if (err instanceof ByokVaultError) {
+    logAiServerDiagnostic('warn', 'ai_route_vault_error', {
+      route,
+      status: err.statusCode,
+      errorCode: err.code,
+    });
     return {
       status: err.statusCode,
       body: {
@@ -195,6 +211,14 @@ function handleRouteError(err: unknown): AiRouteResult {
     };
   }
   if (err instanceof GeminiServiceError) {
+    logAiServerDiagnostic('warn', 'ai_route_gemini_error', {
+      route,
+      status: err.status,
+      errorCode: err.code,
+      diagnosticCategory: err.diagnosticCategory,
+      upstreamHttpStatus: err.upstreamHttpStatus,
+      upstreamApiStatus: err.upstreamApiStatus,
+    });
     return {
       status: err.status,
       body: {
@@ -204,6 +228,11 @@ function handleRouteError(err: unknown): AiRouteResult {
       },
     };
   }
+  logAiServerDiagnostic('error', 'ai_route_internal_error', {
+    route,
+    errorName: err instanceof Error ? err.name : typeof err,
+    errorDetail: err instanceof Error ? err.message : String(err),
+  });
   return {
     status: 500,
     body: {
@@ -776,6 +805,7 @@ export async function handleAnalyzeNoticeRequest(
       keyOrErr.apiKey,
     );
 
+    let usageSnapshot: AiStatusResponse['usage'] | undefined;
     if (!resolved.isConfiguredOverride) {
       const updatedState = applyUsageIncrement(
         userState,
@@ -783,16 +813,20 @@ export async function handleAnalyzeNoticeRequest(
         result.model,
         result.usage,
       );
-      await saveUserAiState(user.uid, updatedState, idToken);
+      const savedState = await saveUserAiState(user.uid, updatedState, idToken);
+      usageSnapshot = toUsageSnapshot(savedState);
     }
 
     return {
       status: 200,
-      body: result,
+      body: {
+        ...result,
+        ...(usageSnapshot ? { usageSnapshot } : {}),
+      },
       headers: { 'Cache-Control': 'no-store' },
     };
   } catch (err) {
-    return handleRouteError(err);
+    return handleRouteError(err, 'analyze-notice');
   } finally {
     if (lockedUid) releaseUidInFlightLock(lockedUid);
   }
@@ -893,6 +927,7 @@ export async function handleAiBriefingRequest(
       keyOrErr.apiKey,
     );
 
+    let usageSnapshot: AiStatusResponse['usage'] | undefined;
     if (!resolved.isConfiguredOverride) {
       const updatedState = applyUsageIncrement(
         userState,
@@ -900,16 +935,20 @@ export async function handleAiBriefingRequest(
         result.model,
         result.usage,
       );
-      await saveUserAiState(user.uid, updatedState, idToken);
+      const savedState = await saveUserAiState(user.uid, updatedState, idToken);
+      usageSnapshot = toUsageSnapshot(savedState);
     }
 
     return {
       status: 200,
-      body: result,
+      body: {
+        ...result,
+        ...(usageSnapshot ? { usageSnapshot } : {}),
+      },
       headers: { 'Cache-Control': 'no-store' },
     };
   } catch (err) {
-    return handleRouteError(err);
+    return handleRouteError(err, 'briefing');
   } finally {
     if (lockedUid) releaseUidInFlightLock(lockedUid);
   }
@@ -1051,6 +1090,7 @@ export async function handleAiPlannerRequest(
       keyOrErr.apiKey,
     );
 
+    let usageSnapshot: AiStatusResponse['usage'] | undefined;
     if (!resolved.isConfiguredOverride) {
       const updatedState = applyUsageIncrement(
         userState,
@@ -1058,16 +1098,20 @@ export async function handleAiPlannerRequest(
         result.model,
         result.usage,
       );
-      await saveUserAiState(user.uid, updatedState, idToken);
+      const savedState = await saveUserAiState(user.uid, updatedState, idToken);
+      usageSnapshot = toUsageSnapshot(savedState);
     }
 
     return {
       status: 200,
-      body: result,
+      body: {
+        ...result,
+        ...(usageSnapshot ? { usageSnapshot } : {}),
+      },
       headers: { 'Cache-Control': 'no-store' },
     };
   } catch (err) {
-    return handleRouteError(err);
+    return handleRouteError(err, 'planner');
   } finally {
     if (lockedUid) releaseUidInFlightLock(lockedUid);
   }
@@ -1211,6 +1255,7 @@ export interface VercelLikeRequest {
   method?: string;
   headers: Record<string, string | string[] | undefined>;
   body?: unknown;
+  complete?: boolean;
   on?: (event: string, listener: () => void) => void;
 }
 
@@ -1238,7 +1283,11 @@ export async function dispatchVercelAiRoute(
   }
 
   const controller = new AbortController();
-  req.on?.('close', () => controller.abort());
+  req.on?.('close', () => {
+    if (!req.complete) {
+      controller.abort();
+    }
+  });
 
   try {
     const result = await runner(controller.signal);
@@ -1249,7 +1298,7 @@ export async function dispatchVercelAiRoute(
     }
     res.status(result.status).json(result.body);
   } catch (err) {
-    const fallback = handleRouteError(err);
+    const fallback = handleRouteError(err, 'vercel-dispatch');
     res.setHeader('Cache-Control', 'no-store');
     res.status(fallback.status).json(fallback.body);
   }

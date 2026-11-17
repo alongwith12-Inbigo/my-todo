@@ -24,6 +24,7 @@ import {
   encryptApiKeyForUid,
   maskGeminiApiKey,
   normalizeGeminiApiKeyInput,
+  parseCookies,
   REDACTED_VAULT_KEY_HINT,
   sealByokCookieValue,
   unsealByokCookieValue,
@@ -34,6 +35,7 @@ import {
   dispatchVercelAiRoute,
   handleAiPlannerRequest,
   handleAiStatusRequest,
+  handleAnalyzeNoticeRequest,
   handleDeleteByokKeyRequest,
   handleSaveByokKeyRequest,
   handleTestByokKeyRequest,
@@ -44,6 +46,7 @@ import {
 } from '../server/aiConfig.ts';
 import { ServerAuthError } from '../server/firebaseServerAuth.ts';
 import {
+  analyzeNoticeWithGemini,
   buildThinkingConfigForModel,
   clearGeminiModelCacheForTesting,
   createGeminiClient,
@@ -51,6 +54,7 @@ import {
   generateDayPlanWithGemini,
   getEffectiveGeminiApiVersion,
   inspectListedGeminiModels,
+  parseGeminiJsonResponse,
   testGeminiPersonalKey,
 } from '../server/geminiService.ts';
 import { SlidingWindowRateLimiter } from '../server/rateLimiter.ts';
@@ -1089,11 +1093,18 @@ test('AQ. Authorization key compatibility: x-goog-api-key SDK headers, redacted 
   assert.ok(!JSON.stringify(aqRouteRes.body).includes('6789'));
 });
 
-test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on gemini-4, and day planner works + falls back on 404', async () => {
+test('thinkingConfig uses bounded thinkingBudget on gemini-2.5-flash, avoids MINIMAL on gemini-4, and day planner works + falls back on 404', async () => {
   // 1. Model-aware thinkingConfig rules
   assert.equal(buildThinkingConfigForModel('gemini-2.5-flash', 'probe'), undefined);
-  assert.equal(buildThinkingConfigForModel('gemini-2.5-flash', 'low_reasoning'), undefined);
-  assert.equal(buildThinkingConfigForModel('gemini-2.5-pro', 'low_reasoning'), undefined);
+  assert.deepEqual(buildThinkingConfigForModel('gemini-2.5-flash', 'minimal_extract'), {
+    thinkingBudget: 128,
+  });
+  assert.deepEqual(buildThinkingConfigForModel('gemini-2.5-flash', 'low_reasoning'), {
+    thinkingBudget: 512,
+  });
+  assert.deepEqual(buildThinkingConfigForModel('gemini-2.5-pro', 'low_reasoning'), {
+    thinkingBudget: 512,
+  });
   assert.deepEqual(buildThinkingConfigForModel('gemini-4-hydrogen', 'probe'), {
     thinkingLevel: ThinkingLevel.LOW,
   });
@@ -1139,7 +1150,7 @@ test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on 
 
   const prevModel = process.env.GEMINI_MODEL;
   try {
-    // 3. With GEMINI_MODEL=gemini-2.5-flash, generateDayPlanWithGemini must omit thinkingConfig
+    // 3. With GEMINI_MODEL=gemini-2.5-flash, generateDayPlanWithGemini sends bounded thinkingBudget & higher maxOutputTokens
     clearGeminiModelCacheForTesting();
     process.env.GEMINI_MODEL = 'gemini-2.5-flash';
     const capturedConfigs: Array<Record<string, unknown> | undefined> = [];
@@ -1162,6 +1173,8 @@ test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on 
                     recommendedStart: '10:00',
                     recommendedEnd: '10:25',
                     estimatedMinutes: 25,
+                    tier: 'must',
+                    strategy: '공문 양식 확인 후 즉시 결재 상신',
                     reason: '오늘 마감 긴급 업무입니다.',
                   },
                 ],
@@ -1176,8 +1189,10 @@ test('thinkingConfig omits thinkingLevel on gemini-2.5-flash, avoids MINIMAL on 
     );
     assert.equal(planOk.model, 'gemini-2.5-flash');
     assert.equal(capturedConfigs.length, 1);
-    assert.equal(capturedConfigs[0]?.thinkingConfig, undefined);
+    assert.deepEqual(capturedConfigs[0]?.thinkingConfig, { thinkingBudget: 512 });
+    assert.equal(capturedConfigs[0]?.maxOutputTokens, 3072);
     assert.equal(planOk.rawPlan.recommendations[0].taskId, 't1');
+    assert.equal(planOk.rawPlan.recommendations[0].tier, 'must');
 
     // 4. When configured model returns 404 NOT_FOUND, planner looks up models.list and falls back to supported active model
     clearGeminiModelCacheForTesting();
@@ -1658,5 +1673,248 @@ test('planner supports must/optional tiers, execution strategy, and linked-today
   );
   assert.equal(validated.recommendations[1].tier, 'optional');
 });
+
+test('planner truncation/invalid JSON maps to 502 (never 500 internal_error), notice analysis bounds thinking, and failed calls never increment usage', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  clearGeminiModelCacheForTesting();
+  process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+
+  try {
+    // 1. parseGeminiJsonResponse classifies truncated MAX_TOKENS JSON as 502 ai_response_truncated (NOT SyntaxError -> 500)
+    assert.throws(
+      () =>
+        parseGeminiJsonResponse({
+          response: {
+            text: '{"coreAdvice":"우선 급한 공문부터","recommendations":[{"taskId":"t1","tier":"must","strategy":"핵심만',
+            candidates: [{ finishReason: 'MAX_TOKENS' }],
+            usageMetadata: { promptTokenCount: 900, candidatesTokenCount: 450, thoughtsTokenCount: 950, totalTokenCount: 2300 },
+          },
+          model: 'gemini-2.5-flash',
+          operation: 'planner',
+          emptyMessage: 'empty',
+        }),
+      (err: unknown) =>
+        err instanceof GeminiServiceError &&
+        err.status === 502 &&
+        err.code === 'ai_response_truncated',
+    );
+
+    // 2. parseGeminiJsonResponse classifies malformed JSON without MAX_TOKENS as 502 ai_invalid_json
+    assert.throws(
+      () =>
+        parseGeminiJsonResponse({
+          response: {
+            text: 'not valid json {broken',
+            candidates: [{ finishReason: 'STOP' }],
+          },
+          model: 'gemini-2.5-flash',
+          operation: 'planner',
+          emptyMessage: 'empty',
+        }),
+      (err: unknown) =>
+        err instanceof GeminiServiceError &&
+        err.status === 502 &&
+        err.code === 'ai_invalid_json',
+    );
+
+    // 3. generateDayPlanWithGemini on truncated response returns 502 GeminiServiceError instead of 500
+    const samplePlannerInput = {
+      todayKey: '2026-11-17',
+      currentTimeHhMm: '09:00',
+      totalIncompleteCount: 1,
+      overdueCount: 0,
+      dueTodayCount: 1,
+      timetableConfigured: true,
+      remainingWorkableMinutes: 50,
+      workableSlots: [{ st: '10:00', et: '10:50', min: 50, lb: '2교시 공강' }],
+      blockedEventsSummary: [],
+      academicAlertsSummary: [],
+      tasks: [
+        { id: 't1', t: '공문 회신', d: '2026-11-17', ov: false, dd: 0, p: 'u' as const, s: 'td' as const, m: 25, tdy: true },
+      ],
+    };
+
+    await assert.rejects(
+      () =>
+        generateDayPlanWithGemini(
+          'AQ.Ab8DummyPlannerTruncKey_1234567890',
+          samplePlannerInput,
+          undefined,
+          {
+            models: {
+              list: async () => ({ page: [] }),
+              generateContent: async () => ({
+                text: '{"coreAdvice":"중단됨',
+                candidates: [{ finishReason: 'MAX_TOKENS' }],
+                usageMetadata: { promptTokenCount: 800, candidatesTokenCount: 400, thoughtsTokenCount: 1000, totalTokenCount: 2200 },
+              }),
+            },
+          },
+        ),
+      (err: unknown) =>
+        err instanceof GeminiServiceError &&
+        err.status === 502 &&
+        err.code === 'ai_response_truncated',
+    );
+
+    // 4. analyzeNoticeWithGemini on 23-line notice sends minimal_extract thinkingBudget=128 & maxOutputTokens=3072,
+    //    and if thinkingConfig is rejected with 400 on clientOverride, retries once without thinkingConfig and caches.
+    const twentyThreeLineNotice = Array.from(
+      { length: 23 },
+      (_, idx) => `${idx + 1}. 11월 ${20 + (idx % 5)}일까지 ${idx + 1}번 학급 안내문 확인 및 제출`,
+    ).join('\n');
+    let noticeAttempt = 0;
+    const noticeConfigs: Array<Record<string, unknown> | undefined> = [];
+    const noticeRes = await analyzeNoticeWithGemini(
+      'AQ.Ab8DummyNoticeKey_1234567890ABCDEF',
+      { text: twentyThreeLineNotice, todayKey: '2026-11-17', existingItems: [] },
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async (params) => {
+            noticeAttempt += 1;
+            noticeConfigs.push(params.config);
+            if (noticeAttempt === 1) {
+              throw new Error('400 INVALID_ARGUMENT: Unknown name "thinkingConfig" at generation_config');
+            }
+            return {
+              text: JSON.stringify({
+                candidates: [
+                  {
+                    kind: 'task',
+                    title: '학급 안내문 확인 및 제출',
+                    description: '',
+                    dueDate: '2026-11-20',
+                    priority: 'normal',
+                  },
+                ],
+                unparsedSummary: [],
+              }),
+              usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 80, totalTokenCount: 380 },
+            };
+          },
+        },
+      },
+    );
+    assert.equal(noticeAttempt, 2);
+    assert.deepEqual(noticeConfigs[0]?.thinkingConfig, { thinkingBudget: 128 });
+    assert.equal(noticeConfigs[0]?.maxOutputTokens, 3072);
+    assert.equal(noticeConfigs[1]?.thinkingConfig, undefined);
+    assert.equal(noticeRes.rawOutput.candidates.length, 1);
+
+    // 5. Route-level usage policy: failed requests (timeout / truncated) do NOT increment usage;
+    //    successful notice vs planner requests separate todayNoticeCount and todayPlanCount.
+    const uid = 'teacher-usage-policy-1';
+    const activeAuth = async () => ({
+      uid,
+      email: 'policy@icedu.kr',
+      emailVerified: true,
+      accessStatus: 'active' as const,
+      role: 'teacher',
+    });
+    const resolveKey = async () => ({
+      apiKey: 'AQ.Ab8DummyPolicyKey_1234567890ABCDEF',
+      keyType: 'auth_aq' as const,
+    });
+
+    // Failed notice timeout -> 504 ai_timeout, usage remains 0
+    const timeoutRes = await handleAnalyzeNoticeRequest(
+      {
+        authorizationHeader: 'Bearer test-token',
+        body: { text: twentyThreeLineNotice, todayKey: '2026-11-17' },
+      },
+      {
+        verifyAuth: activeAuth,
+        resolveApiKey: resolveKey,
+        analyzeNotice: async () => {
+          throw new GeminiServiceError(504, 'ai_timeout', 'AI 서버 응답 시간이 초과되었습니다.');
+        },
+      },
+    );
+    assert.equal(timeoutRes.status, 504);
+
+    // Failed planner truncated -> 502 ai_response_truncated (NOT 500), usage remains 0
+    const truncatedRouteRes = await handleAiPlannerRequest(
+      {
+        authorizationHeader: 'Bearer test-token',
+        body: samplePlannerInput,
+      },
+      {
+        verifyAuth: activeAuth,
+        resolveApiKey: resolveKey,
+        generateDayPlan: async () => {
+          throw new GeminiServiceError(502, 'ai_response_truncated', 'AI 응답 길이 초과');
+        },
+      },
+    );
+    assert.equal(truncatedRouteRes.status, 502);
+
+    const statusAfterFailures = await handleAiStatusRequest('Bearer test-token', {
+      verifyAuth: activeAuth,
+      resolveApiKey: resolveKey,
+    });
+    const failUsage = (statusAfterFailures.body as { usage: { todayPlanCount: number; todayNoticeCount: number; todayTotalCount: number } }).usage;
+    assert.equal(failUsage.todayPlanCount, 0);
+    assert.equal(failUsage.todayNoticeCount, 0);
+    assert.equal(failUsage.todayTotalCount, 0);
+
+    // Success notice analysis -> todayNoticeCount=1, todayPlanCount=0, todayTotalCount=1
+    const okNotice = await handleAnalyzeNoticeRequest(
+      {
+        authorizationHeader: 'Bearer test-token',
+        body: { text: '11월 20일까지 제출', todayKey: '2026-11-17' },
+      },
+      {
+        verifyAuth: activeAuth,
+        resolveApiKey: resolveKey,
+        analyzeNotice: async () => noticeRes,
+      },
+    );
+    assert.equal(okNotice.status, 200);
+    const noticeSnap = (okNotice.body as { usageSnapshot?: { todayPlanCount: number; todayNoticeCount: number; todayTotalCount: number } }).usageSnapshot;
+    assert.equal(noticeSnap?.todayPlanCount, 0);
+    assert.equal(noticeSnap?.todayNoticeCount, 1);
+    assert.equal(noticeSnap?.todayTotalCount, 1);
+
+    // Success planner -> todayPlanCount=1, todayNoticeCount=1, todayTotalCount=2
+    const okPlanner = await handleAiPlannerRequest(
+      {
+        authorizationHeader: 'Bearer test-token',
+        body: samplePlannerInput,
+      },
+      {
+        verifyAuth: activeAuth,
+        resolveApiKey: resolveKey,
+        generateDayPlan: async () => ({
+          model: 'gemini-2.5-flash',
+          generatedAtIso: '2026-11-17T01:00:00Z',
+          rawPlan: {
+            coreAdvice: '공강 활용',
+            recommendations: [],
+            attentionTasks: [],
+            deferredTasks: [],
+          },
+          usage: { inputTokens: 100, outputTokens: 50, thoughtTokens: 120, totalTokens: 270 },
+        }),
+      },
+    );
+    assert.equal(okPlanner.status, 200);
+    const planSnap = (okPlanner.body as { usageSnapshot?: { todayPlanCount: number; todayNoticeCount: number; todayTotalCount: number } }).usageSnapshot;
+    assert.equal(planSnap?.todayPlanCount, 1);
+    assert.equal(planSnap?.todayNoticeCount, 1);
+    assert.equal(planSnap?.todayTotalCount, 2);
+
+    // 6. Malformed cookie percent encoding never crashes parseCookies with 500 URIError
+    const parsedMalformedCookie = parseCookies('bad=%E0%A4%A; good=hello%20world');
+    assert.equal(parsedMalformedCookie.bad, '%E0%A4%A');
+    assert.equal(parsedMalformedCookie.good, 'hello world');
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
 
 

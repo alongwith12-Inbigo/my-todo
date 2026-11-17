@@ -39,6 +39,7 @@ export interface AiTokenUsage {
 export interface AiUsageSnapshot {
   todayDateKey: string;
   todayPlanCount: number;
+  todayNoticeCount?: number;
   todayTotalCount: number;
   monthKey: string;
   monthTotalCount: number;
@@ -175,6 +176,7 @@ export interface AiAnalyzeNoticeResponse {
   model: string;
   rawOutput: AiRawNoticeOutput;
   usage?: AiTokenUsage;
+  usageSnapshot?: AiUsageSnapshot;
 }
 
 export interface MinimalBriefingTask {
@@ -227,6 +229,7 @@ export interface AiBriefingResponse {
   generatedAtIso: string;
   briefing: AiBriefingResult;
   usage?: AiTokenUsage;
+  usageSnapshot?: AiUsageSnapshot;
 }
 
 /**
@@ -300,4 +303,5 @@ export interface AiPlannerResponse {
   generatedAtIso: string;
   rawPlan: AiPlannerRawResult;
   usage?: AiTokenUsage;
+  usageSnapshot?: AiUsageSnapshot;
 }

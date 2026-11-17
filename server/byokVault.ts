@@ -217,7 +217,11 @@ export function parseCookies(
     const name = part.slice(0, eq).trim();
     const val = part.slice(eq + 1).trim();
     if (name) {
-      out[name] = decodeURIComponent(val);
+      try {
+        out[name] = decodeURIComponent(val);
+      } catch {
+        out[name] = val;
+      }
     }
   }
   return out;
@@ -310,6 +314,7 @@ export function toUsageSnapshot(state: StoredAiUserState): AiUsageSnapshot {
   return {
     todayDateKey: state.todayDateKey,
     todayPlanCount: state.todayPlanCount,
+    todayNoticeCount: Math.max(0, state.todayTotalCount - state.todayPlanCount),
     todayTotalCount: state.todayTotalCount,
     monthKey: state.monthKey,
     monthTotalCount: state.monthTotalCount,

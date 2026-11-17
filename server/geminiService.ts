@@ -21,6 +21,7 @@ import {
 } from '../src/lib/byokKeyFormat.ts';
 import {
   getGeminiModelName,
+  logAiServerDiagnostic,
   mapGeminiError,
   type MappedGeminiError,
 } from './aiConfig.ts';
@@ -312,13 +313,13 @@ function toServiceError(mapped: MappedGeminiError): GeminiServiceError {
 
 /**
  * thinkingConfig.thinkingLevel is only supported on Gemini 3 and Gemini 4 models.
- * Passing thinkingLevel to Gemini 2.5 models causes HTTP 400 INVALID_ARGUMENT,
- * and passing ThinkingLevel.MINIMAL to gemini-4-* models also causes a 400 error.
+ * Gemini 2.5 models use thinkingConfig.thinkingBudget instead (omitting on single-shot
+ * probe avoids v1 endpoint rejections on probe, while bounding reasoning on analyze/planner).
  */
 export function buildThinkingConfigForModel(
   modelName: string,
-  mode: 'probe' | 'low_reasoning',
-): { thinkingLevel: ThinkingLevel } | undefined {
+  mode: 'probe' | 'minimal_extract' | 'low_reasoning',
+): { thinkingLevel: ThinkingLevel } | { thinkingBudget: number } | undefined {
   const short = modelName.replace(/^models\//, '').trim().toLowerCase();
   if (short.startsWith('gemini-4-')) {
     return { thinkingLevel: ThinkingLevel.LOW };
@@ -329,11 +330,19 @@ export function buildThinkingConfigForModel(
   ) {
     return {
       thinkingLevel:
-        mode === 'probe' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW,
+        mode === 'low_reasoning' ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL,
     };
   }
   if (short.startsWith('gemini-3')) {
     return { thinkingLevel: ThinkingLevel.LOW };
+  }
+  if (short.startsWith('gemini-2.5-pro')) {
+    if (mode === 'probe') return undefined;
+    return { thinkingBudget: mode === 'minimal_extract' ? 128 : 512 };
+  }
+  if (short.startsWith('gemini-2.5-')) {
+    if (mode === 'probe') return undefined;
+    return { thinkingBudget: mode === 'minimal_extract' ? 128 : 512 };
   }
   return undefined;
 }
@@ -349,6 +358,7 @@ export interface GeminiTestClientLike {
       config?: Record<string, unknown>;
     }) => Promise<{
       text?: string;
+      candidates?: Array<{ finishReason?: string }>;
       usageMetadata?: {
         promptTokenCount?: number;
         candidatesTokenCount?: number;
@@ -401,6 +411,7 @@ interface CachedResolvedModelEntry {
   expiresAt: number;
   resolvedModel: string;
   resolvedApiVersion: string;
+  omitThinkingConfig?: boolean;
 }
 
 const modelListCache = new Map<string, CachedModelListEntry>();
@@ -697,7 +708,7 @@ export async function testGeminiPersonalKey(
   try {
     const thinkingConfig = buildThinkingConfigForModel(configuredModel, 'probe');
     const config: Record<string, unknown> = {
-      maxOutputTokens: 16,
+      maxOutputTokens: 64,
       ...(thinkingConfig ? { thinkingConfig } : {}),
     };
     const response = await runWithTimeoutAndAbort(
@@ -774,6 +785,97 @@ export async function testGeminiPersonalKey(
   }
 }
 
+function stripJsonCodeFence(raw: string): string {
+  const trimmed = raw.trim();
+  const match = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  return match ? match[1].trim() : trimmed;
+}
+
+export function parseGeminiJsonResponse<T extends object>(params: {
+  response: {
+    text?: string;
+    candidates?: Array<{ finishReason?: string }>;
+    usageMetadata?: {
+      promptTokenCount?: number;
+      candidatesTokenCount?: number;
+      thoughtsTokenCount?: number;
+      totalTokenCount?: number;
+    };
+  };
+  model: string;
+  operation: 'analyze_notice' | 'briefing' | 'planner';
+  emptyMessage: string;
+}): T {
+  const finishReason = params.response.candidates?.[0]?.finishReason;
+  const rawText = params.response.text;
+  const usage = extractUsageMetadata(params.response);
+
+  if (!rawText || !rawText.trim()) {
+    if (finishReason === 'MAX_TOKENS') {
+      logAiServerDiagnostic('warn', 'gemini_response_truncated_empty', {
+        operation: params.operation,
+        model: params.model,
+        finishReason,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        thoughtTokens: usage.thoughtTokens,
+      });
+      throw new GeminiServiceError(
+        502,
+        'ai_response_truncated',
+        'AI 응답 생성 길이가 초과되어 결과를 완성하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
+        { diagnosticCategory: 'server_error' },
+      );
+    }
+    logAiServerDiagnostic('warn', 'gemini_empty_response', {
+      operation: params.operation,
+      model: params.model,
+      finishReason: finishReason ?? 'UNKNOWN',
+    });
+    throw new GeminiServiceError(502, 'ai_empty_response', params.emptyMessage, {
+      diagnosticCategory: 'server_error',
+    });
+  }
+
+  const candidateJson = stripJsonCodeFence(rawText);
+  try {
+    const parsed = JSON.parse(candidateJson) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('JSON root is not an object');
+    }
+    return parsed as T;
+  } catch {
+    const isTruncated = finishReason === 'MAX_TOKENS';
+    logAiServerDiagnostic(
+      'warn',
+      isTruncated ? 'gemini_response_truncated_json' : 'gemini_invalid_json',
+      {
+        operation: params.operation,
+        model: params.model,
+        finishReason: finishReason ?? 'UNKNOWN',
+        responseChars: rawText.length,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        thoughtTokens: usage.thoughtTokens,
+      },
+    );
+    if (isTruncated) {
+      throw new GeminiServiceError(
+        502,
+        'ai_response_truncated',
+        'AI 응답이 길이 제한으로 중간에 잘려 결과를 처리하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
+        { diagnosticCategory: 'server_error' },
+      );
+    }
+    throw new GeminiServiceError(
+      502,
+      'ai_invalid_json',
+      'AI 모델이 올바른 JSON 형식의 응답을 반환하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
+      { diagnosticCategory: 'server_error' },
+    );
+  }
+}
+
 async function generateContentWithModelResolution(params: {
   ai: GeminiTestClientLike;
   apiKey: string;
@@ -782,11 +884,14 @@ async function generateContentWithModelResolution(params: {
   contents: string;
   baseConfig: Record<string, unknown>;
   timeoutMs: number;
+  thinkingMode?: 'minimal_extract' | 'low_reasoning';
+  operation?: 'analyze_notice' | 'briefing' | 'planner';
   signal?: AbortSignal;
 }): Promise<{
   model: string;
   response: {
     text?: string;
+    candidates?: Array<{ finishReason?: string }>;
     usageMetadata?: {
       promptTokenCount?: number;
       candidatesTokenCount?: number;
@@ -798,19 +903,23 @@ async function generateContentWithModelResolution(params: {
   const apiVersion = getEffectiveGeminiApiVersion();
   const keyHash = hashKeyForCache(params.apiKey || 'override');
   const resolvedCacheKey = `${keyHash}:${apiVersion}:${params.configuredModel}`;
+  const thinkingMode = params.thinkingMode ?? 'low_reasoning';
 
-  const buildConfigFor = (targetModel: string): Record<string, unknown> => {
-    const thinkingConfig = buildThinkingConfigForModel(
-      targetModel,
-      'low_reasoning',
-    );
+  const buildConfigFor = (
+    targetModel: string,
+    omitThinkingConfig = false,
+  ): Record<string, unknown> => {
+    if (omitThinkingConfig) {
+      return { ...params.baseConfig };
+    }
+    const thinkingConfig = buildThinkingConfigForModel(targetModel, thinkingMode);
     return {
       ...params.baseConfig,
       ...(thinkingConfig ? { thinkingConfig } : {}),
     };
   };
 
-  // Reuse cached working fallback model when configuredModel previously returned 404 within TTL
+  // Reuse cached working model / API version when configuredModel previously required adjustment within TTL
   const cachedResolved = resolvedModelCache.get(resolvedCacheKey);
   if (cachedResolved && cachedResolved.expiresAt > Date.now()) {
     const targetClient =
@@ -824,7 +933,10 @@ async function generateContentWithModelResolution(params: {
           targetClient.models.generateContent({
             model: cachedResolved.resolvedModel,
             contents: params.contents,
-            config: buildConfigFor(cachedResolved.resolvedModel),
+            config: buildConfigFor(
+              cachedResolved.resolvedModel,
+              Boolean(cachedResolved.omitThinkingConfig),
+            ),
           }),
         params.timeoutMs,
         params.signal,
@@ -837,6 +949,7 @@ async function generateContentWithModelResolution(params: {
     }
   }
 
+  const startedAt = Date.now();
   try {
     const response = await runWithTimeoutAndAbort(
       () =>
@@ -852,6 +965,72 @@ async function generateContentWithModelResolution(params: {
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
     const mapped = mapGeminiError(err, params.configuredModel);
+    const lowerUpstream = (mapped.upstreamErrorMessage ?? '').toLowerCase();
+
+    logAiServerDiagnostic('warn', 'gemini_generate_attempt_failed', {
+      operation: params.operation ?? 'unknown',
+      model: params.configuredModel,
+      apiVersion,
+      errorCode: mapped.code,
+      diagnosticCategory: mapped.diagnosticCategory,
+      upstreamHttpStatus: mapped.upstreamHttpStatus,
+      upstreamApiStatus: mapped.upstreamApiStatus,
+      latencyMs: Date.now() - startedAt,
+    });
+
+    // If v1 rejected thinkingConfig (e.g. "Unknown name 'thinkingConfig'"), switch to v1beta ONCE (or omit thinkingConfig) and cache.
+    if (
+      mapped.code === 'invalid_request_format' &&
+      lowerUpstream.includes('thinking')
+    ) {
+      if (!params.hasClientOverride && apiVersion !== 'v1beta') {
+        try {
+          const betaClient = createGeminiClient(params.apiKey, 'v1beta');
+          const betaResponse = await runWithTimeoutAndAbort(
+            () =>
+              betaClient.models.generateContent({
+                model: params.configuredModel,
+                contents: params.contents,
+                config: buildConfigFor(params.configuredModel),
+              }),
+            params.timeoutMs,
+            params.signal,
+          );
+          setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
+            expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+            resolvedModel: params.configuredModel,
+            resolvedApiVersion: 'v1beta',
+          });
+          return { model: params.configuredModel, response: betaResponse };
+        } catch (betaErr) {
+          if (betaErr instanceof GeminiServiceError) throw betaErr;
+          throw toServiceError(mapGeminiError(betaErr, params.configuredModel));
+        }
+      }
+
+      try {
+        const plainResponse = await runWithTimeoutAndAbort(
+          () =>
+            params.ai.models.generateContent({
+              model: params.configuredModel,
+              contents: params.contents,
+              config: buildConfigFor(params.configuredModel, true),
+            }),
+          params.timeoutMs,
+          params.signal,
+        );
+        setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
+          expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+          resolvedModel: params.configuredModel,
+          resolvedApiVersion: apiVersion,
+          omitThinkingConfig: true,
+        });
+        return { model: params.configuredModel, response: plainResponse };
+      } catch (plainErr) {
+        if (plainErr instanceof GeminiServiceError) throw plainErr;
+        throw toServiceError(mapGeminiError(plainErr, params.configuredModel));
+      }
+    }
 
     // Only attempt at most ONE retry when the model itself is missing or unsupported.
     // Never mask permission, quota, invalid request format, auth, or timeout errors.
@@ -863,7 +1042,6 @@ async function generateContentWithModelResolution(params: {
     }
 
     // Special case: Google explicitly reported API version mismatch on this exact model name -> max 1 retry on v1beta
-    const lowerUpstream = (mapped.upstreamErrorMessage ?? '').toLowerCase();
     if (
       !params.hasClientOverride &&
       apiVersion !== 'v1beta' &&
@@ -959,13 +1137,14 @@ export async function analyzeNoticeWithGemini(
     `[규칙]`,
     `1. 원문에 없는 사실, 날짜, 시각, 장소를 추측하거나 지어내지 마세요.`,
     `2. 제출·회신·작성·취합·확인·입력 등 행위가 중심이면 kind='task', 회의·연수·상담·행사·출장·수업공개 등 일정 참여가 중심이면 kind='event'로 분류하세요.`,
-    `3. 연도가 생략된 월/일(예: '11월 20일', '1월 10일')은 기준 날짜(${todayKey}) 기준으로 오늘이거나 미래면 올해, 이미 지났으면 다음 해의 YYYY-MM-DD로 해석하세요. 연도 생략 자체는 dateUncertain=true 사유로 삼지 마세요.`,
-    `4. '2시', '3교시'처럼 오전/오후 또는 구체 시각이 불명확하거나 날짜가 전혀 없는 경우에만 dateUncertain=true 및 uncertaintyReason을 짧게 작성하세요.`,
-    `5. dateEvidence에는 날짜/시각을 해석한 원문 표현을 그대로 적고, rationale에는 업무/일정으로 판단한 짧은 근거(1문장)를 적으세요.`,
-    `6. 기존 목록과 의미가 겹치는 항목이 보이면(예: '디지털 수업사례 제출' vs '수업사례 보고서 제출') semanticDuplicateId에 해당 기존 id를, semanticDuplicateReason에 짧은 사유를 적으세요. 없으면 null로 두세요.`,
-    `7. 원문 내 [성명], [연락처], [이메일], [고유식별번호 제외됨] 같은 마스킹 토큰은 그대로 존중하고 복원하려 하지 마세요.`,
+    `3. 같은 행사나 업무의 부연 설명 줄은 하나의 후보로 묶고 중복 생성하지 마세요.`,
+    `4. 연도가 생략된 월/일(예: '11월 20일', '1월 10일')은 기준 날짜(${todayKey}) 기준으로 오늘이거나 미래면 올해, 이미 지났으면 다음 해의 YYYY-MM-DD로 해석하세요. 연도 생략 자체는 dateUncertain=true 사유로 삼지 마세요.`,
+    `5. '2시', '3교시'처럼 오전/오후 또는 구체 시각이 불명확하거나 날짜가 전혀 없는 경우에만 dateUncertain=true 및 uncertaintyReason을 짧게 적으세요.`,
+    `6. 간결성: title은 30자 이내, description은 원문에 꼭 필요한 보충 세부사항이 있을 때만 60자 이내(없으면 ""), dateEvidence는 20자 이내 원문 표현, rationale은 25자 이내 한 구절로 짧게 적고, unparsedSummary는 추출 못 한 핵심 문장만 최대 5개(단순 인사말·구분선 제외)로 줄이세요.`,
+    `7. 기존 목록과 의미가 겹치는 항목이 보이면 semanticDuplicateId에 기존 id를, semanticDuplicateReason에 짧은 사유(25자 이내)를 적고 없으면 null로 두세요.`,
+    `8. 원문 내 [성명], [연락처], [이메일], [고유식별번호 제외됨] 같은 마스킹 토큰은 그대로 존중하고 복원하지 마세요.`,
     ``,
-    existingList ? `[현재 등록된 기존 업무/일정 참고 목록]\n${existingList}\n` : '',
+    existingList ? `[기존 업무/일정 목록]\n${existingList}\n` : '',
     `[분석할 학교 쪽지/안내문]\n${input.text}`,
   ]
     .filter(Boolean)
@@ -978,23 +1157,23 @@ export async function analyzeNoticeWithGemini(
     configuredModel,
     contents: prompt,
     baseConfig: {
+      maxOutputTokens: 3072,
       responseMimeType: 'application/json',
       responseSchema: NOTICE_RESPONSE_SCHEMA,
     },
     timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+    thinkingMode: 'minimal_extract',
+    operation: 'analyze_notice',
     signal,
   });
 
-  const text = response.text;
-  if (!text) {
-    throw new GeminiServiceError(
-      502,
-      'ai_empty_response',
-      'AI 모델이 빈 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
-    );
-  }
+  const parsed = parseGeminiJsonResponse<AiRawNoticeOutput>({
+    response,
+    model,
+    operation: 'analyze_notice',
+    emptyMessage: 'AI 모델이 빈 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
+  });
 
-  const parsed = JSON.parse(text) as AiRawNoticeOutput;
   return {
     model,
     rawOutput: {
@@ -1060,23 +1239,23 @@ export async function generateBriefingWithGemini(
     configuredModel,
     contents: prompt,
     baseConfig: {
+      maxOutputTokens: 2048,
       responseMimeType: 'application/json',
       responseSchema: BRIEFING_RESPONSE_SCHEMA,
     },
     timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+    thinkingMode: 'low_reasoning',
+    operation: 'briefing',
     signal,
   });
 
-  const text = response.text;
-  if (!text) {
-    throw new GeminiServiceError(
-      502,
-      'ai_empty_response',
-      'AI 모델이 빈 브리핑 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
-    );
-  }
+  const parsed = parseGeminiJsonResponse<AiBriefingResult>({
+    response,
+    model,
+    operation: 'briefing',
+    emptyMessage: 'AI 모델이 빈 브리핑 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
+  });
 
-  const parsed = JSON.parse(text) as AiBriefingResult;
   return {
     model,
     generatedAtIso: new Date().toISOString(),
@@ -1130,24 +1309,23 @@ export async function generateDayPlanWithGemini(
     configuredModel,
     contents: prompt,
     baseConfig: {
-      maxOutputTokens: 1400,
+      maxOutputTokens: 3072,
       responseMimeType: 'application/json',
       responseSchema: PLANNER_RESPONSE_SCHEMA,
     },
     timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+    thinkingMode: 'low_reasoning',
+    operation: 'planner',
     signal,
   });
 
-  const text = response.text;
-  if (!text) {
-    throw new GeminiServiceError(
-      502,
-      'ai_empty_response',
-      'AI 모델이 빈 업무 계획 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
-    );
-  }
+  const parsed = parseGeminiJsonResponse<AiPlannerRawResult>({
+    response,
+    model,
+    operation: 'planner',
+    emptyMessage: 'AI 모델이 빈 업무 계획 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
+  });
 
-  const parsed = JSON.parse(text) as AiPlannerRawResult;
   return {
     model,
     generatedAtIso: new Date().toISOString(),

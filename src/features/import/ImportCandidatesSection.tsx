@@ -135,6 +135,11 @@ export function ImportCandidatesSection({
             <div className="space-y-0.5">
               <p className="font-semibold text-amber-900">AI 분석을 완료하지 못했습니다</p>
               <p>{aiError}</p>
+              {candidates.length > 0 && analysisMode !== 'ai' && (
+                <p className="text-amber-900 font-medium">
+                  아래에 표시된 목록({candidates.length}건)은 이번에 실패한 AI 결과가 아니라 이전에 실행한 「이전 기본 분석 결과」입니다.
+                </p>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -188,10 +193,18 @@ export function ImportCandidatesSection({
                 <h3 className="text-sm font-bold text-slate-900">
                   분석된 업무·일정 후보 검토 및 선택 등록
                 </h3>
-                {analysisMode === 'ai' && (
+                {analysisMode === 'ai' ? (
                   <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-teal-800 bg-teal-50 border border-teal-200 px-2 py-0.5 rounded-md">
                     <Sparkles className="w-3 h-3" aria-hidden="true" />
                     <span>Gemini AI 분석{aiModelUsed ? ` (${aiModelUsed})` : ''}</span>
+                  </span>
+                ) : aiError ? (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-900 bg-amber-50 border border-amber-300 px-2 py-0.5 rounded-md">
+                    이전 기본 분석 결과
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-700 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md">
+                    기본 분석 결과
                   </span>
                 )}
               </div>

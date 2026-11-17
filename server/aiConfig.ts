@@ -57,6 +57,28 @@ export function sanitizeUpstreamErrorMessage(raw: string): string | undefined {
   return cleaned.length > 220 ? `${cleaned.slice(0, 217)}...` : cleaned;
 }
 
+export function logAiServerDiagnostic(
+  level: 'warn' | 'error',
+  event: string,
+  meta: Record<string, string | number | boolean | undefined | null>,
+): void {
+  const safeMeta: Record<string, string | number | boolean | null> = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (v === undefined) continue;
+    if (typeof v === 'string') {
+      safeMeta[k] = sanitizeUpstreamErrorMessage(v) ?? '';
+    } else {
+      safeMeta[k] = v;
+    }
+  }
+  const line = `[AI_DIAG] ${event} ${JSON.stringify(safeMeta)}`;
+  if (level === 'error') {
+    console.error(line);
+  } else {
+    console.warn(line);
+  }
+}
+
 function parseUpstreamGeminiError(error: unknown): ParsedUpstreamErrorInfo {
   const rawMessage = error instanceof Error ? error.message : String(error);
   let upstreamHttpStatus =

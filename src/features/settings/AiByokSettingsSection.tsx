@@ -849,11 +849,22 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
               <p className="text-xs text-slate-500">사용량을 불러오는 중입니다...</p>
             ) : aiStatus ? (
               <div className="space-y-3">
-                <div className="grid grid-cols-3 gap-2.5 text-center tabular-nums">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center tabular-nums">
                   <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
-                    <p className="text-[11px] text-slate-500">오늘 계획 생성</p>
+                    <p className="text-[11px] text-slate-500">오늘 AI 업무 계획</p>
                     <p className="mt-1 text-base font-bold text-slate-900">
                       {aiStatus.usage.todayPlanCount} / {aiStatus.dailyPlanLimit}
+                    </p>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <p className="text-[11px] text-slate-500">오늘 업무 등록 AI 분석</p>
+                    <p className="mt-1 text-base font-bold text-slate-900">
+                      {aiStatus.usage.todayNoticeCount ??
+                        Math.max(
+                          0,
+                          aiStatus.usage.todayTotalCount - aiStatus.usage.todayPlanCount,
+                        )}
+                      회
                     </p>
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
@@ -869,6 +880,10 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                     </p>
                   </div>
                 </div>
+
+                <p className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-2 leading-relaxed">
+                  <strong>사용량 집계 기준:</strong> 정상 응답을 완료한 요청만 「AI 업무 계획」과 「업무 등록 AI 분석」 합계에 차감됩니다. 시간 초과·파싱 오류·취소 등 실패한 요청은 앱 내 호출 횟수에 차감되지 않습니다.
+                </p>
 
                 <dl className="text-xs text-slate-700 space-y-1.5 pt-2 border-t border-slate-100 tabular-nums">
                   <div className="flex items-center justify-between gap-2">
@@ -913,8 +928,8 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                 <strong>오후 4시(서머타임 적용 시) 또는 오후 5시(표준시)</strong>입니다.
               </li>
               <li>
-                <strong>앱 내 일일 보호 한도:</strong> 위에서 설정한 계획 생성·전체 호출 한도는{' '}
-                <strong>한국시간(Asia/Seoul) 자정</strong>에 초기화됩니다.
+                <strong>앱 내 일일 보호 한도 및 실패 요청 처리:</strong> 계획 생성·업무 등록 AI 분석을 합산한 전체 호출 한도는{' '}
+                <strong>한국시간(Asia/Seoul) 자정</strong>에 초기화되며, 오류·시간 초과로 실패한 요청은 앱 한도에 차감되지 않습니다. (단, Gemini 서버까지 도달한 시간 초과·응답 잘림 요청은 Google AI Studio 계정 측 사용량에는 일부 반영될 수 있습니다.)
               </li>
               <li>
                 <strong>과금 및 키 보안:</strong> 유료 결제가 연결된 Google Cloud 프로젝트의 API 키를 등록한 경우 사용량에 따라 본인 계정에 비용이 청구될 수 있습니다. 키는 Firestore 평문·브라우저 저장소에 절대 보관하지 않으며, 서버에서도 등록자 본인 UID로만 격리 복호화됩니다.

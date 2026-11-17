@@ -24,9 +24,11 @@ import {
   type AiPlannerSessionSnapshot,
 } from '../../lib/aiPlannerSession';
 import type {
+  AiAnalyzeNoticeResponse,
   AiBriefingRequest,
   AiBriefingResponse,
   AiStatusResponse,
+  AiUsageSnapshot,
 } from '../../lib/aiTypes';
 import type { MinuteInterval } from '../../lib/timetable';
 import {
@@ -59,6 +61,7 @@ interface AiWorkspaceContextValue {
   patchAiStatus: (
     updater: (prev: AiStatusResponse | null) => AiStatusResponse | null,
   ) => void;
+  recordNoticeAnalysisSuccess: (response: AiAnalyzeNoticeResponse) => void;
   setLocalAiEnabled: (enabled: boolean) => void;
 
   plannerVisible: boolean;
@@ -263,6 +266,42 @@ export function AiWorkspaceProvider({
     [uid],
   );
 
+  const recordNoticeAnalysisSuccess = useCallback(
+    (response: AiAnalyzeNoticeResponse) => {
+      setAiStatus((prev) => {
+        if (!prev) return prev;
+        if (response.usageSnapshot) {
+          return {
+            ...prev,
+            usage: response.usageSnapshot,
+          };
+        }
+        const prevNotice =
+          prev.usage.todayNoticeCount ??
+          Math.max(0, prev.usage.todayTotalCount - prev.usage.todayPlanCount);
+        const usageTokens = response.usage;
+        return {
+          ...prev,
+          usage: {
+            ...prev.usage,
+            todayNoticeCount: prevNotice + 1,
+            todayTotalCount: prev.usage.todayTotalCount + 1,
+            monthTotalCount: prev.usage.monthTotalCount + 1,
+            totalInputTokens:
+              prev.usage.totalInputTokens + (usageTokens?.inputTokens ?? 0),
+            totalOutputTokens:
+              prev.usage.totalOutputTokens + (usageTokens?.outputTokens ?? 0),
+            totalThoughtTokens:
+              prev.usage.totalThoughtTokens + (usageTokens?.thoughtTokens ?? 0),
+            lastModel: response.model || prev.usage.lastModel,
+            lastUsedAtIso: new Date().toISOString(),
+          },
+        };
+      });
+    },
+    [],
+  );
+
   const setLocalAiEnabled = useCallback(
     (enabled: boolean) => {
       setAiEnabled(enabled);
@@ -405,12 +444,14 @@ export function AiWorkspaceProvider({
       plannerAbortRef.current = controller;
       setPlannerLoading(true);
 
+      let latestUsageSnapshot: AiUsageSnapshot | undefined;
       try {
         await controllerRef.current.runAiPlan({
           context: ctx,
           forceRefresh,
           executeGemini: async (compressedRequest) => {
             const res = await requestAiDayPlan(compressedRequest, controller.signal);
+            latestUsageSnapshot = res.usageSnapshot;
             return {
               rawPlan: res.rawPlan,
               model: res.model,
@@ -425,26 +466,36 @@ export function AiWorkspaceProvider({
         // Reflect usage count locally without an extra /api/ai/status Firestore read
         const latestPlan = controllerRef.current.getSnapshot().validatedPlan;
         const usageTokens = latestPlan?.usage;
-        setAiStatus((prev) =>
-          prev
-            ? {
-                ...prev,
-                usage: {
-                  ...prev.usage,
-                  todayPlanCount: prev.usage.todayPlanCount + 1,
-                  todayTotalCount: prev.usage.todayTotalCount + 1,
-                  monthTotalCount: prev.usage.monthTotalCount + 1,
-                  totalInputTokens:
-                    prev.usage.totalInputTokens + (usageTokens?.inputTokens ?? 0),
-                  totalOutputTokens:
-                    prev.usage.totalOutputTokens + (usageTokens?.outputTokens ?? 0),
-                  totalThoughtTokens:
-                    prev.usage.totalThoughtTokens + (usageTokens?.thoughtTokens ?? 0),
-                  lastUsedAtIso: latestPlan?.generatedAtIso ?? prev.usage.lastUsedAtIso,
-                },
-              }
-            : prev,
-        );
+        setAiStatus((prev) => {
+          if (!prev) return prev;
+          if (latestUsageSnapshot) {
+            return {
+              ...prev,
+              usage: latestUsageSnapshot,
+            };
+          }
+          const prevNotice =
+            prev.usage.todayNoticeCount ??
+            Math.max(0, prev.usage.todayTotalCount - prev.usage.todayPlanCount);
+          return {
+            ...prev,
+            usage: {
+              ...prev.usage,
+              todayPlanCount: prev.usage.todayPlanCount + 1,
+              todayNoticeCount: prevNotice,
+              todayTotalCount: prev.usage.todayTotalCount + 1,
+              monthTotalCount: prev.usage.monthTotalCount + 1,
+              totalInputTokens:
+                prev.usage.totalInputTokens + (usageTokens?.inputTokens ?? 0),
+              totalOutputTokens:
+                prev.usage.totalOutputTokens + (usageTokens?.outputTokens ?? 0),
+              totalThoughtTokens:
+                prev.usage.totalThoughtTokens + (usageTokens?.thoughtTokens ?? 0),
+              lastModel: latestPlan?.model ?? prev.usage.lastModel,
+              lastUsedAtIso: latestPlan?.generatedAtIso ?? prev.usage.lastUsedAtIso,
+            },
+          };
+        });
       } catch (err) {
         if (controller.signal.aborted) return;
         if (err instanceof AiClientError) {
@@ -620,6 +671,7 @@ export function AiWorkspaceProvider({
       hasPersonalKey,
       refreshAiStatus,
       patchAiStatus,
+      recordNoticeAnalysisSuccess,
       setLocalAiEnabled,
       plannerVisible: sessionState.plannerVisible,
       plannerLoading,
@@ -654,6 +706,7 @@ export function AiWorkspaceProvider({
       hasPersonalKey,
       refreshAiStatus,
       patchAiStatus,
+      recordNoticeAnalysisSuccess,
       setLocalAiEnabled,
       sessionState,
       plannerLoading,
@@ -682,6 +735,10 @@ export function AiWorkspaceProvider({
       {children}
     </AiWorkspaceContext.Provider>
   );
+}
+
+export function useOptionalAiWorkspace(): AiWorkspaceContextValue | null {
+  return useContext(AiWorkspaceContext);
 }
 
 export function useAiWorkspace(): AiWorkspaceContextValue {
