@@ -471,6 +471,106 @@ export function TodayBriefingView({
         </div>
       )}
 
+      {/* Separated Top Section: AI Work Planner (explicit click only) */}
+      <section
+        aria-label="AI 업무 계획"
+        className="rounded-2xl border-2 border-teal-200 bg-gradient-to-br from-teal-50/50 via-white to-slate-50 p-4 sm:px-5 sm:py-4 space-y-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-teal-700" aria-hidden="true" />
+              <h2 className="text-base font-bold text-slate-900">AI 업무 계획</h2>
+            </div>
+            <p className="text-xs text-slate-600">
+              오늘의 일정과 업무를 종합하여 우선순위와 실행 전략을 추천합니다.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={plannerLoading}
+              onClick={() => void runAiPlanner(plannerInputs, { forceRefresh: false })}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>
+                {plannerLoading
+                  ? '업무 계획 정리 중...'
+                  : plannerPlan?.mode === 'ai' && !plannerVisible
+                    ? '저장된 AI 업무 계획 열기'
+                    : 'AI로 오늘 업무 계획 세우기'}
+              </span>
+            </button>
+
+            {!plannerVisible && !plannerLoading && (
+              <button
+                type="button"
+                onClick={() => runDeterministicPlan(plannerInputs)}
+                className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                기본 우선순위 계획 보기 (AI 미사용)
+              </button>
+            )}
+          </div>
+        </div>
+
+        <AiTodayPlannerCard
+          visible={plannerVisible}
+          loading={plannerLoading}
+          error={plannerError}
+          errorCode={plannerErrorCode}
+          plan={plannerPlan}
+          hasPersonalKey={hasPersonalKey}
+          aiEnabled={aiEnabled}
+          availableIntervals={plannerContext.remainingWorkableIntervals}
+          activeFilter={plannerFilter}
+          isStaleInputs={isPlanStale}
+          availabilityReason={plannerContext.availabilityReason}
+          availabilityReasonDetail={plannerContext.availabilityReasonDetail}
+          onCancel={cancelAiPlanner}
+          onClose={closeAiPlanner}
+          onRunAiPlan={(force, constraint) =>
+            void runAiPlanner(plannerInputs, {
+              forceRefresh: force,
+              constraintText: constraint,
+            })
+          }
+          onRunDeterministicPlan={() => runDeterministicPlan(plannerInputs)}
+          onOpenSettings={onOpenSettings}
+          onOpenTimetable={onOpenTimetable}
+          onOpenAcademicCalendar={onOpenAcademicCalendar}
+          onOpenTask={(taskId) => {
+            const matched = briefingTasks.find((t) => t.id === taskId);
+            if (matched) {
+              setSelectedTask(matched);
+            } else {
+              void refreshSingleTask(taskId).then((fetched) => {
+                if (fetched) setSelectedTask(fetched);
+              });
+            }
+          }}
+          onMoveItemOrder={(taskId, direction) =>
+            movePlanItem(taskId, direction, plannerContext.remainingWorkableIntervals)
+          }
+          onExcludeItem={(taskId) =>
+            excludePlanItem(taskId, plannerContext.remainingWorkableIntervals)
+          }
+          onReassignItemSlot={(taskId, intervalIndex) =>
+            reassignPlanSlot(
+              taskId,
+              intervalIndex,
+              plannerContext.remainingWorkableIntervals,
+            )
+          }
+          onApplyQuickFilter={(nextFilter) =>
+            applyQuickFilter(nextFilter, plannerInputs)
+          }
+          onResetLocalAdjustments={() => resetLocalAdjustments(plannerInputs)}
+        />
+      </section>
+
       {/* Zero-AI Auto Situation Summary Banner */}
       <section
         aria-label="오늘의 요약"
@@ -1291,106 +1391,6 @@ export function TodayBriefingView({
           </aside>
         </div>
       )}
-
-      {/* Separated Bottom Section: AI Work Planner */}
-      <section
-        aria-label="AI 업무 계획"
-        className="rounded-2xl border-2 border-teal-200 bg-gradient-to-br from-teal-50/50 via-white to-slate-50 p-5 space-y-4"
-      >
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="space-y-1">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-teal-700" aria-hidden="true" />
-              <h2 className="text-base font-bold text-slate-900">AI 업무 계획</h2>
-            </div>
-            <p className="text-xs text-slate-600">
-              오늘의 일정과 업무를 종합하여 우선순위와 실행 전략을 추천합니다.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 shrink-0">
-            <button
-              type="button"
-              disabled={plannerLoading}
-              onClick={() => void runAiPlanner(plannerInputs, { forceRefresh: false })}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Sparkles className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>
-                {plannerLoading
-                  ? '업무 계획 정리 중...'
-                  : plannerPlan?.mode === 'ai' && !plannerVisible
-                    ? '저장된 AI 업무 계획 열기'
-                    : 'AI로 오늘 업무 계획 세우기'}
-              </span>
-            </button>
-
-            {!plannerVisible && !plannerLoading && (
-              <button
-                type="button"
-                onClick={() => runDeterministicPlan(plannerInputs)}
-                className="px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                기본 우선순위 계획 보기 (AI 미사용)
-              </button>
-            )}
-          </div>
-        </div>
-
-        <AiTodayPlannerCard
-          visible={plannerVisible}
-          loading={plannerLoading}
-          error={plannerError}
-          errorCode={plannerErrorCode}
-          plan={plannerPlan}
-          hasPersonalKey={hasPersonalKey}
-          aiEnabled={aiEnabled}
-          availableIntervals={plannerContext.remainingWorkableIntervals}
-          activeFilter={plannerFilter}
-          isStaleInputs={isPlanStale}
-          availabilityReason={plannerContext.availabilityReason}
-          availabilityReasonDetail={plannerContext.availabilityReasonDetail}
-          onCancel={cancelAiPlanner}
-          onClose={closeAiPlanner}
-          onRunAiPlan={(force, constraint) =>
-            void runAiPlanner(plannerInputs, {
-              forceRefresh: force,
-              constraintText: constraint,
-            })
-          }
-          onRunDeterministicPlan={() => runDeterministicPlan(plannerInputs)}
-          onOpenSettings={onOpenSettings}
-          onOpenTimetable={onOpenTimetable}
-          onOpenAcademicCalendar={onOpenAcademicCalendar}
-          onOpenTask={(taskId) => {
-            const matched = briefingTasks.find((t) => t.id === taskId);
-            if (matched) {
-              setSelectedTask(matched);
-            } else {
-              void refreshSingleTask(taskId).then((fetched) => {
-                if (fetched) setSelectedTask(fetched);
-              });
-            }
-          }}
-          onMoveItemOrder={(taskId, direction) =>
-            movePlanItem(taskId, direction, plannerContext.remainingWorkableIntervals)
-          }
-          onExcludeItem={(taskId) =>
-            excludePlanItem(taskId, plannerContext.remainingWorkableIntervals)
-          }
-          onReassignItemSlot={(taskId, intervalIndex) =>
-            reassignPlanSlot(
-              taskId,
-              intervalIndex,
-              plannerContext.remainingWorkableIntervals,
-            )
-          }
-          onApplyQuickFilter={(nextFilter) =>
-            applyQuickFilter(nextFilter, plannerInputs)
-          }
-          onResetLocalAdjustments={() => resetLocalAdjustments(plannerInputs)}
-        />
-      </section>
 
       <TaskDetailModal
         task={selectedTask}
