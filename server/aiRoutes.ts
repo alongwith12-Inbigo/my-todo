@@ -15,9 +15,11 @@ import {
 } from '../src/lib/aiTypes.ts';
 import { detectGeminiApiKeyType } from '../src/lib/byokKeyFormat.ts';
 import {
+  generateSafeRequestId,
   getAiStatusBasePayload,
   getGeminiModelName,
   logAiServerDiagnostic,
+  resolveSafeRequestId,
 } from './aiConfig.ts';
 import {
   acquireUidInFlightLock,
@@ -81,24 +83,29 @@ export interface AiRouteDeps {
     input: AiAnalyzeNoticeRequest,
     signal?: AbortSignal,
     apiKey?: string,
+    requestId?: string,
   ) => Promise<AiAnalyzeNoticeResponse>;
   generateBriefing?: (
     input: AiBriefingRequest,
     signal?: AbortSignal,
     apiKey?: string,
+    requestId?: string,
   ) => Promise<AiBriefingResponse>;
   generateDayPlan?: (
     input: AiPlannerRequest,
     signal?: AbortSignal,
     apiKey?: string,
+    requestId?: string,
   ) => Promise<AiPlannerResponse>;
   verifyKeyAuthOnly?: (
     apiKey: string,
     signal?: AbortSignal,
+    requestId?: string,
   ) => Promise<{ keyType: GeminiApiKeyType; availableGenerateModels: string[] }>;
   testApiKey?: (
     apiKey: string,
     signal?: AbortSignal,
+    requestId?: string,
   ) => Promise<
     Partial<GeminiPersonalKeyTestResult> & {
       model: string;
@@ -120,18 +127,38 @@ function resolveDeps(deps: AiRouteDeps = {}) {
     resolveApiKey: deps.resolveApiKey ?? resolvePersonalApiKeyForUid,
     analyzeNotice:
       deps.analyzeNotice ??
-      ((input: AiAnalyzeNoticeRequest, signal?: AbortSignal, apiKey?: string) =>
-        analyzeNoticeWithGemini(apiKey ?? '', input, signal)),
+      ((
+        input: AiAnalyzeNoticeRequest,
+        signal?: AbortSignal,
+        apiKey?: string,
+        requestId?: string,
+      ) => analyzeNoticeWithGemini(apiKey ?? '', input, signal, undefined, requestId)),
     generateBriefing:
       deps.generateBriefing ??
-      ((input: AiBriefingRequest, signal?: AbortSignal, apiKey?: string) =>
-        generateBriefingWithGemini(apiKey ?? '', input, signal)),
+      ((
+        input: AiBriefingRequest,
+        signal?: AbortSignal,
+        apiKey?: string,
+        requestId?: string,
+      ) =>
+        generateBriefingWithGemini(apiKey ?? '', input, signal, undefined, requestId)),
     generateDayPlan:
       deps.generateDayPlan ??
-      ((input: AiPlannerRequest, signal?: AbortSignal, apiKey?: string) =>
-        generateDayPlanWithGemini(apiKey ?? '', input, signal)),
-    verifyKeyAuthOnly: deps.verifyKeyAuthOnly ?? verifyGeminiKeyAuthOnly,
-    testApiKey: deps.testApiKey ?? testGeminiPersonalKey,
+      ((
+        input: AiPlannerRequest,
+        signal?: AbortSignal,
+        apiKey?: string,
+        requestId?: string,
+      ) =>
+        generateDayPlanWithGemini(apiKey ?? '', input, signal, undefined, requestId)),
+    verifyKeyAuthOnly:
+      deps.verifyKeyAuthOnly ??
+      ((apiKey: string, signal?: AbortSignal, requestId?: string) =>
+        verifyGeminiKeyAuthOnly(apiKey, signal, undefined, requestId)),
+    testApiKey:
+      deps.testApiKey ??
+      ((apiKey: string, signal?: AbortSignal, requestId?: string) =>
+        testGeminiPersonalKey(apiKey, signal, undefined, requestId)),
   };
 }
 
@@ -177,10 +204,16 @@ function parseRequestObjectBody(
   };
 }
 
-function handleRouteError(err: unknown, route?: string): AiRouteResult {
+function handleRouteError(
+  err: unknown,
+  route?: string,
+  requestId?: string,
+): AiRouteResult {
+  const reqId = requestId ?? generateSafeRequestId();
   if (err instanceof ServerAuthError) {
     if (err.statusCode >= 500) {
       logAiServerDiagnostic('warn', 'ai_route_auth_error', {
+        requestId: reqId,
         route,
         status: err.statusCode,
         errorCode: err.code,
@@ -188,56 +221,86 @@ function handleRouteError(err: unknown, route?: string): AiRouteResult {
     }
     return {
       status: err.statusCode,
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
       body: {
         error: err.code,
         category: 'auth' satisfies AiErrorCategory,
+        requestId: reqId,
         message: err.message,
       },
     };
   }
   if (err instanceof ByokVaultError) {
     logAiServerDiagnostic('warn', 'ai_route_vault_error', {
+      requestId: reqId,
       route,
       status: err.statusCode,
       errorCode: err.code,
     });
     return {
       status: err.statusCode,
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
       body: {
         error: err.code,
         category: 'encryption_config' satisfies AiErrorCategory,
+        requestId: reqId,
         message: err.message,
       },
     };
   }
   if (err instanceof GeminiServiceError) {
+    const resolvedReqId = err.requestId ?? reqId;
     logAiServerDiagnostic('warn', 'ai_route_gemini_error', {
+      requestId: resolvedReqId,
       route,
       status: err.status,
       errorCode: err.code,
       diagnosticCategory: err.diagnosticCategory,
       upstreamHttpStatus: err.upstreamHttpStatus,
       upstreamApiStatus: err.upstreamApiStatus,
+      upstreamErrorMessage: err.upstreamErrorMessage,
+      requestApiVersion: err.requestApiVersion,
+      requestEndpoint: err.requestEndpoint,
     });
     return {
       status: err.status,
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': resolvedReqId },
       body: {
         error: err.code,
         category: 'gemini_api' satisfies AiErrorCategory,
+        requestId: resolvedReqId,
+        ...(err.diagnosticCategory
+          ? { diagnosticCategory: err.diagnosticCategory }
+          : {}),
+        ...(typeof err.upstreamHttpStatus === 'number'
+          ? { upstreamHttpStatus: err.upstreamHttpStatus }
+          : {}),
+        ...(err.upstreamApiStatus ? { upstreamApiStatus: err.upstreamApiStatus } : {}),
+        ...(err.requestApiVersion ? { requestApiVersion: err.requestApiVersion } : {}),
+        ...(err.requestEndpoint ? { requestEndpoint: err.requestEndpoint } : {}),
+        ...(err.availableGenerateModels?.length
+          ? { availableGenerateModels: err.availableGenerateModels }
+          : {}),
+        ...(err.recommendedModel !== undefined
+          ? { recommendedModel: err.recommendedModel }
+          : {}),
         message: err.message,
       },
     };
   }
   logAiServerDiagnostic('error', 'ai_route_internal_error', {
+    requestId: reqId,
     route,
     errorName: err instanceof Error ? err.name : typeof err,
     errorDetail: err instanceof Error ? err.message : String(err),
   });
   return {
     status: 500,
+    headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
     body: {
       error: 'internal_error',
       category: 'server_internal' satisfies AiErrorCategory,
+      requestId: reqId,
       message:
         'AI 서버 내부 처리 중 예기치 않은 오류가 발생했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
     },
@@ -299,7 +362,9 @@ export async function handleAiStatusRequest(
   authorizationHeader: string | string[] | undefined,
   deps: AiRouteDeps = {},
   cookieHeader?: string | string[],
+  requestId?: string,
 ): Promise<AiRouteResult> {
+  const reqId = requestId ?? generateSafeRequestId();
   const resolved = resolveDeps(deps);
   try {
     const user = await resolved.verifyAuth(authorizationHeader);
@@ -339,10 +404,10 @@ export async function handleAiStatusRequest(
     return {
       status: 200,
       body,
-      headers: { 'Cache-Control': 'no-store' },
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
     };
   } catch (err) {
-    return handleRouteError(err);
+    return handleRouteError(err, 'status', reqId);
   }
 }
 
@@ -352,9 +417,11 @@ export async function handleSaveByokKeyRequest(
     body: unknown;
     isSecure?: boolean;
     signal?: AbortSignal;
+    requestId?: string;
   },
   deps: AiRouteDeps = {},
 ): Promise<AiRouteResult> {
+  const reqId = params.requestId ?? generateSafeRequestId();
   const resolved = resolveDeps(deps);
   try {
     const user = await resolved.verifyAuth(params.authorizationHeader);
@@ -369,11 +436,13 @@ export async function handleSaveByokKeyRequest(
     if (!validation.valid || !validation.apiKey) {
       return {
         status: 400,
+        headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
         body: {
           error: 'invalid_key_format',
           errorCode: 'invalid_key_format',
           detailCode: validation.reasonCode,
           category: 'input_format' satisfies AiErrorCategory,
+          requestId: reqId,
           message: validation.message || 'API 키 형식이 올바르지 않습니다.',
         },
       };
@@ -382,11 +451,11 @@ export async function handleSaveByokKeyRequest(
     let testUsage: AiTokenUsage | undefined;
     let testWarning: string | undefined;
     if (rawBody.testBeforeSave === true) {
-      const testRes = await resolved.testApiKey(validation.apiKey, params.signal);
+      const testRes = await resolved.testApiKey(validation.apiKey, params.signal, reqId);
       testUsage = testRes.usage;
       testWarning = testRes.warning;
     } else if (rawBody.verifyAuthBeforeSave === true) {
-      await resolved.verifyKeyAuthOnly(validation.apiKey, params.signal);
+      await resolved.verifyKeyAuthOnly(validation.apiKey, params.signal, reqId);
     }
 
     const saved = await savePersonalApiKeyForUid({
@@ -419,6 +488,7 @@ export async function handleSaveByokKeyRequest(
       headers: {
         'Cache-Control': 'no-store',
         'Set-Cookie': setCookie,
+        'X-Request-Id': reqId,
       },
       body: {
         ok: true,
@@ -434,7 +504,7 @@ export async function handleSaveByokKeyRequest(
       },
     };
   } catch (err) {
-    return handleRouteError(err);
+    return handleRouteError(err, 'byok-save', reqId);
   }
 }
 
@@ -444,9 +514,11 @@ export async function handleTestByokKeyRequest(
     cookieHeader?: string | string[];
     body?: unknown;
     signal?: AbortSignal;
+    requestId?: string;
   },
   deps: AiRouteDeps = {},
 ): Promise<AiRouteResult> {
+  const reqId = params.requestId ?? generateSafeRequestId();
   const resolved = resolveDeps(deps);
   try {
     const user = await resolved.verifyAuth(params.authorizationHeader);
@@ -468,12 +540,14 @@ export async function handleTestByokKeyRequest(
       if (!validation.valid || !validation.apiKey) {
         return {
           status: 400,
+          headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
           body: {
             ok: false,
             error: 'invalid_key_format',
             errorCode: 'invalid_key_format',
             detailCode: validation.reasonCode,
             category: 'input_format' satisfies AiErrorCategory,
+            requestId: reqId,
             message: validation.message || 'API 키 형식이 올바르지 않습니다.',
           },
         };
@@ -490,11 +564,13 @@ export async function handleTestByokKeyRequest(
         if (isVercelServerlessRuntime() && getPersistenceMode() !== 'encrypted_vault') {
           return {
             status: 503,
+            headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
             body: {
               ok: false,
               error: 'encryption_secret_missing',
               errorCode: 'encryption_secret_missing',
               category: 'encryption_config' satisfies AiErrorCategory,
+              requestId: reqId,
               message:
                 'Vercel 서버 환경변수 BYOK_ENCRYPTION_SECRET가 설정되지 않아 저장된 개인 API 키를 복호화할 수 없습니다.',
             },
@@ -502,11 +578,13 @@ export async function handleTestByokKeyRequest(
         }
         return {
           status: 403,
+          headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
           body: {
             ok: false,
             error: 'personal_key_required',
             errorCode: 'personal_key_required',
             category: 'encryption_config' satisfies AiErrorCategory,
+            requestId: reqId,
             message: '테스트할 개인 API 키가 등록되어 있지 않습니다.',
           },
         };
@@ -516,7 +594,7 @@ export async function handleTestByokKeyRequest(
     }
 
     const startMs = Date.now();
-    const res = await resolved.testApiKey(targetKey, params.signal);
+    const res = await resolved.testApiKey(targetKey, params.signal, reqId);
     const latencyMs = Math.max(1, Date.now() - startMs);
     const keyType = res.keyType ?? resolvedKeyType ?? detectGeminiApiKeyType(targetKey);
     const configuredModel = res.configuredModel ?? getGeminiModelName();
@@ -527,9 +605,10 @@ export async function handleTestByokKeyRequest(
 
     return {
       status: 200,
-      headers: { 'Cache-Control': 'no-store' },
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
       body: {
         ok: overallOk,
+        requestId: reqId,
         model: res.model,
         configuredModel,
         apiKeyAuthOk,
@@ -568,9 +647,12 @@ export async function handleTestByokKeyRequest(
     };
   } catch (err) {
     if (err instanceof GeminiServiceError) {
+      const resolvedReqId = err.requestId ?? reqId;
       const configuredModel = getGeminiModelName();
-      const requestApiVersion = getEffectiveGeminiApiVersion();
-      const requestEndpoint = `models/${configuredModel.replace(/^models\//, '')}:generateContent`;
+      const requestApiVersion = err.requestApiVersion ?? getEffectiveGeminiApiVersion();
+      const requestEndpoint =
+        err.requestEndpoint ??
+        `models/${configuredModel.replace(/^models\//, '')}:generateContent`;
       const isAuthFailure =
         err.diagnosticCategory === 'auth_failed' ||
         err.diagnosticCategory === 'auth_header_error' ||
@@ -579,9 +661,10 @@ export async function handleTestByokKeyRequest(
         err.code === 'gemini_auth_header_error';
       return {
         status: err.status,
-        headers: { 'Cache-Control': 'no-store' },
+        headers: { 'Cache-Control': 'no-store', 'X-Request-Id': resolvedReqId },
         body: {
           ok: false,
+          requestId: resolvedReqId,
           model: configuredModel,
           configuredModel,
           apiKeyAuthOk: !isAuthFailure,
@@ -607,7 +690,7 @@ export async function handleTestByokKeyRequest(
         },
       };
     }
-    return handleRouteError(err);
+    return handleRouteError(err, 'byok-test', reqId);
   }
 }
 
@@ -699,9 +782,11 @@ export async function handleAnalyzeNoticeRequest(
     cookieHeader?: string | string[];
     body: unknown;
     signal?: AbortSignal;
+    requestId?: string;
   },
   deps: AiRouteDeps = {},
 ): Promise<AiRouteResult> {
+  const reqId = params.requestId ?? generateSafeRequestId();
   const resolved = resolveDeps(deps);
   let lockedUid: string | null = null;
   try {
@@ -715,16 +800,23 @@ export async function handleAnalyzeNoticeRequest(
       resolvedDeps: resolved,
     });
     if ('status' in keyOrErr) {
-      return keyOrErr;
+      return {
+        ...keyOrErr,
+        headers: { ...(keyOrErr.headers ?? {}), 'X-Request-Id': reqId },
+      };
     }
 
     const rate = resolved.rateLimiter.consume(user.uid);
     if (!rate.allowed) {
       return {
         status: 429,
-        headers: { 'Retry-After': String(rate.retryAfterSeconds) },
+        headers: {
+          'Retry-After': String(rate.retryAfterSeconds),
+          'X-Request-Id': reqId,
+        },
         body: {
           error: 'rate_limit_exceeded',
+          requestId: reqId,
           message: `잠시 후(${rate.retryAfterSeconds}초 뒤) 다시 시도해 주세요. AI 호출 한도를 초과했습니다.`,
         },
       };
@@ -736,7 +828,8 @@ export async function handleAnalyzeNoticeRequest(
       if (!quota.allowed) {
         return {
           status: 429,
-          body: { error: quota.code, message: quota.reason },
+          headers: { 'X-Request-Id': reqId },
+          body: { error: quota.code, requestId: reqId, message: quota.reason },
         };
       }
     }
@@ -750,8 +843,10 @@ export async function handleAnalyzeNoticeRequest(
     if (!text) {
       return {
         status: 400,
+        headers: { 'X-Request-Id': reqId },
         body: {
           error: 'empty_input',
+          requestId: reqId,
           message: '분석할 텍스트를 입력해 주세요.',
         },
       };
@@ -760,8 +855,10 @@ export async function handleAnalyzeNoticeRequest(
     if (text.length > AI_LIMITS.MAX_NOTICE_CHARS) {
       return {
         status: 400,
+        headers: { 'X-Request-Id': reqId },
         body: {
           error: 'input_too_long',
+          requestId: reqId,
           message: `입력 텍스트가 너무 깁니다. ${AI_LIMITS.MAX_NOTICE_CHARS.toLocaleString()}자 이내로 줄여서 분석해 주세요.`,
         },
       };
@@ -770,8 +867,10 @@ export async function handleAnalyzeNoticeRequest(
     if (!acquireUidInFlightLock(user.uid)) {
       return {
         status: 429,
+        headers: { 'X-Request-Id': reqId },
         body: {
           error: 'concurrent_ai_request',
+          requestId: reqId,
           message: '이전 AI 요청이 아직 처리 중입니다. 완료된 후 다시 시도해 주세요.',
         },
       };
@@ -803,6 +902,7 @@ export async function handleAnalyzeNoticeRequest(
       { text, todayKey, existingItems },
       params.signal,
       keyOrErr.apiKey,
+      reqId,
     );
 
     let usageSnapshot: AiStatusResponse['usage'] | undefined;
@@ -823,10 +923,10 @@ export async function handleAnalyzeNoticeRequest(
         ...result,
         ...(usageSnapshot ? { usageSnapshot } : {}),
       },
-      headers: { 'Cache-Control': 'no-store' },
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
     };
   } catch (err) {
-    return handleRouteError(err, 'analyze-notice');
+    return handleRouteError(err, 'analyze-notice', reqId);
   } finally {
     if (lockedUid) releaseUidInFlightLock(lockedUid);
   }
@@ -838,9 +938,11 @@ export async function handleAiBriefingRequest(
     cookieHeader?: string | string[];
     body: unknown;
     signal?: AbortSignal;
+    requestId?: string;
   },
   deps: AiRouteDeps = {},
 ): Promise<AiRouteResult> {
+  const reqId = params.requestId ?? generateSafeRequestId();
   const resolved = resolveDeps(deps);
   let lockedUid: string | null = null;
   try {
@@ -854,16 +956,23 @@ export async function handleAiBriefingRequest(
       resolvedDeps: resolved,
     });
     if ('status' in keyOrErr) {
-      return keyOrErr;
+      return {
+        ...keyOrErr,
+        headers: { ...(keyOrErr.headers ?? {}), 'X-Request-Id': reqId },
+      };
     }
 
     const rate = resolved.rateLimiter.consume(user.uid);
     if (!rate.allowed) {
       return {
         status: 429,
-        headers: { 'Retry-After': String(rate.retryAfterSeconds) },
+        headers: {
+          'Retry-After': String(rate.retryAfterSeconds),
+          'X-Request-Id': reqId,
+        },
         body: {
           error: 'rate_limit_exceeded',
+          requestId: reqId,
           message: `잠시 후(${rate.retryAfterSeconds}초 뒤) 다시 시도해 주세요. AI 호출 한도를 초과했습니다.`,
         },
       };
@@ -875,7 +984,8 @@ export async function handleAiBriefingRequest(
       if (!quota.allowed) {
         return {
           status: 429,
-          body: { error: quota.code, message: quota.reason },
+          headers: { 'X-Request-Id': reqId },
+          body: { error: quota.code, requestId: reqId, message: quota.reason },
         };
       }
     }
@@ -883,8 +993,10 @@ export async function handleAiBriefingRequest(
     if (!acquireUidInFlightLock(user.uid)) {
       return {
         status: 429,
+        headers: { 'X-Request-Id': reqId },
         body: {
           error: 'concurrent_ai_request',
+          requestId: reqId,
           message: '이전 AI 요청이 아직 처리 중입니다. 완료된 후 다시 시도해 주세요.',
         },
       };
@@ -925,6 +1037,7 @@ export async function handleAiBriefingRequest(
       { todayKey, imminentDays, tasks, events },
       params.signal,
       keyOrErr.apiKey,
+      reqId,
     );
 
     let usageSnapshot: AiStatusResponse['usage'] | undefined;
@@ -945,10 +1058,10 @@ export async function handleAiBriefingRequest(
         ...result,
         ...(usageSnapshot ? { usageSnapshot } : {}),
       },
-      headers: { 'Cache-Control': 'no-store' },
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
     };
   } catch (err) {
-    return handleRouteError(err, 'briefing');
+    return handleRouteError(err, 'briefing', reqId);
   } finally {
     if (lockedUid) releaseUidInFlightLock(lockedUid);
   }
@@ -960,9 +1073,11 @@ export async function handleAiPlannerRequest(
     cookieHeader?: string | string[];
     body: unknown;
     signal?: AbortSignal;
+    requestId?: string;
   },
   deps: AiRouteDeps = {},
 ): Promise<AiRouteResult> {
+  const reqId = params.requestId ?? generateSafeRequestId();
   const resolved = resolveDeps(deps);
   let lockedUid: string | null = null;
   try {
@@ -976,16 +1091,23 @@ export async function handleAiPlannerRequest(
       resolvedDeps: resolved,
     });
     if ('status' in keyOrErr) {
-      return keyOrErr;
+      return {
+        ...keyOrErr,
+        headers: { ...(keyOrErr.headers ?? {}), 'X-Request-Id': reqId },
+      };
     }
 
     const rate = resolved.rateLimiter.consume(user.uid);
     if (!rate.allowed) {
       return {
         status: 429,
-        headers: { 'Retry-After': String(rate.retryAfterSeconds) },
+        headers: {
+          'Retry-After': String(rate.retryAfterSeconds),
+          'X-Request-Id': reqId,
+        },
         body: {
           error: 'rate_limit_exceeded',
+          requestId: reqId,
           message: `잠시 후(${rate.retryAfterSeconds}초 뒤) 다시 시도해 주세요. 분당 호출 한도를 초과했습니다.`,
         },
       };
@@ -997,7 +1119,8 @@ export async function handleAiPlannerRequest(
       if (!quota.allowed) {
         return {
           status: 429,
-          body: { error: quota.code, message: quota.reason },
+          headers: { 'X-Request-Id': reqId },
+          body: { error: quota.code, requestId: reqId, message: quota.reason },
         };
       }
     }
@@ -1028,8 +1151,10 @@ export async function handleAiPlannerRequest(
     if (tasks.length === 0) {
       return {
         status: 400,
+        headers: { 'X-Request-Id': reqId },
         body: {
           error: 'no_tasks_to_plan',
+          requestId: reqId,
           message: '계획할 미완료 업무가 없습니다. 새 업무를 등록한 뒤 다시 시도해 주세요.',
         },
       };
@@ -1038,8 +1163,10 @@ export async function handleAiPlannerRequest(
     if (!acquireUidInFlightLock(user.uid)) {
       return {
         status: 429,
+        headers: { 'X-Request-Id': reqId },
         body: {
           error: 'concurrent_ai_request',
+          requestId: reqId,
           message: '오늘의 업무 계획을 생성하는 중입니다. 잠시만 기다려 주세요.',
         },
       };
@@ -1088,6 +1215,7 @@ export async function handleAiPlannerRequest(
       plannerPayload,
       params.signal,
       keyOrErr.apiKey,
+      reqId,
     );
 
     let usageSnapshot: AiStatusResponse['usage'] | undefined;
@@ -1108,10 +1236,10 @@ export async function handleAiPlannerRequest(
         ...result,
         ...(usageSnapshot ? { usageSnapshot } : {}),
       },
-      headers: { 'Cache-Control': 'no-store' },
+      headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
     };
   } catch (err) {
-    return handleRouteError(err, 'planner');
+    return handleRouteError(err, 'planner', reqId);
   } finally {
     if (lockedUid) releaseUidInFlightLock(lockedUid);
   }
@@ -1148,22 +1276,26 @@ export function createAiExpressRouter(deps: AiRouteDeps = {}) {
   const router = Router();
 
   router.get('/status', async (req, res) => {
+    const requestId = resolveSafeRequestId(req.headers);
     const result = await handleAiStatusRequest(
       req.headers.authorization,
       deps,
       req.headers.cookie,
+      requestId,
     );
     sendRouteResult(res, result);
   });
 
   router.post('/byok', async (req, res) => {
     const controller = bindRequestAbortController(req);
+    const requestId = resolveSafeRequestId(req.headers);
     const result = await handleSaveByokKeyRequest(
       {
         authorizationHeader: req.headers.authorization,
         body: req.body,
         isSecure: isSecureRequest(req.headers, req.secure),
         signal: controller.signal,
+        requestId,
       },
       deps,
     );
@@ -1183,12 +1315,14 @@ export function createAiExpressRouter(deps: AiRouteDeps = {}) {
 
   router.post('/byok/test', async (req, res) => {
     const controller = bindRequestAbortController(req);
+    const requestId = resolveSafeRequestId(req.headers);
     const result = await handleTestByokKeyRequest(
       {
         authorizationHeader: req.headers.authorization,
         cookieHeader: req.headers.cookie,
         body: req.body,
         signal: controller.signal,
+        requestId,
       },
       deps,
     );
@@ -1208,12 +1342,14 @@ export function createAiExpressRouter(deps: AiRouteDeps = {}) {
 
   router.post('/analyze-notice', async (req, res) => {
     const controller = bindRequestAbortController(req);
+    const requestId = resolveSafeRequestId(req.headers);
     const result = await handleAnalyzeNoticeRequest(
       {
         authorizationHeader: req.headers.authorization,
         cookieHeader: req.headers.cookie,
         body: req.body,
         signal: controller.signal,
+        requestId,
       },
       deps,
     );
@@ -1222,12 +1358,14 @@ export function createAiExpressRouter(deps: AiRouteDeps = {}) {
 
   router.post('/briefing', async (req, res) => {
     const controller = bindRequestAbortController(req);
+    const requestId = resolveSafeRequestId(req.headers);
     const result = await handleAiBriefingRequest(
       {
         authorizationHeader: req.headers.authorization,
         cookieHeader: req.headers.cookie,
         body: req.body,
         signal: controller.signal,
+        requestId,
       },
       deps,
     );
@@ -1236,12 +1374,14 @@ export function createAiExpressRouter(deps: AiRouteDeps = {}) {
 
   router.post('/planner', async (req, res) => {
     const controller = bindRequestAbortController(req);
+    const requestId = resolveSafeRequestId(req.headers);
     const result = await handleAiPlannerRequest(
       {
         authorizationHeader: req.headers.authorization,
         cookieHeader: req.headers.cookie,
         body: req.body,
         signal: controller.signal,
+        requestId,
       },
       deps,
     );
@@ -1269,14 +1409,17 @@ export async function dispatchVercelAiRoute(
   req: VercelLikeRequest,
   res: VercelLikeResponse,
   expectedMethod: 'GET' | 'POST' | 'DELETE' | Array<'GET' | 'POST' | 'DELETE'>,
-  runner: (signal?: AbortSignal) => Promise<AiRouteResult>,
+  runner: (signal?: AbortSignal, requestId?: string) => Promise<AiRouteResult>,
 ) {
+  const requestId = resolveSafeRequestId(req.headers);
   const allowed = Array.isArray(expectedMethod) ? expectedMethod : [expectedMethod];
   if (!req.method || !allowed.includes(req.method as 'GET' | 'POST' | 'DELETE')) {
     res.setHeader('Allow', allowed.join(', '));
+    res.setHeader('X-Request-Id', requestId);
     res.status(405).json({
       error: 'method_not_allowed',
       category: 'request_format' satisfies AiErrorCategory,
+      requestId,
       message: '허용되지 않은 요청 방식입니다.',
     });
     return;
@@ -1290,7 +1433,8 @@ export async function dispatchVercelAiRoute(
   });
 
   try {
-    const result = await runner(controller.signal);
+    const result = await runner(controller.signal, requestId);
+    res.setHeader('X-Request-Id', requestId);
     if (result.headers) {
       for (const [k, v] of Object.entries(result.headers)) {
         res.setHeader(k, v);
@@ -1298,8 +1442,9 @@ export async function dispatchVercelAiRoute(
     }
     res.status(result.status).json(result.body);
   } catch (err) {
-    const fallback = handleRouteError(err, 'vercel-dispatch');
+    const fallback = handleRouteError(err, 'vercel-dispatch', requestId);
     res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Request-Id', requestId);
     res.status(fallback.status).json(fallback.body);
   }
 }

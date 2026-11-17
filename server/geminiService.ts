@@ -20,6 +20,7 @@ import {
   normalizeGeminiApiKeyInput,
 } from '../src/lib/byokKeyFormat.ts';
 import {
+  generateSafeRequestId,
   getGeminiModelName,
   logAiServerDiagnostic,
   mapGeminiError,
@@ -195,11 +196,12 @@ export function createGeminiClient(
       '개인 Gemini API 키가 등록되어 있지 않습니다.',
     );
   }
+  const effectiveApiVersion = apiVersionOverride ?? getEffectiveGeminiApiVersion();
   // GoogleGenAI with { apiKey } injects x-goog-api-key (never Authorization: Bearer),
   // which is required by Google for both AIza... standard keys and AQ.... authorization keys.
   return new GoogleGenAI({
     apiKey: cleanKey,
-    ...(apiVersionOverride ? { apiVersion: apiVersionOverride } : {}),
+    apiVersion: effectiveApiVersion,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -229,32 +231,48 @@ function extractUsageMetadata(response: {
   return { inputTokens, outputTokens, thoughtTokens, totalTokens };
 }
 
+function createLocalTimeoutError(): Error {
+  return Object.assign(new Error('Request timed out'), {
+    name: 'LocalTimeoutError',
+  });
+}
+
+function createLocalAbortError(): Error {
+  return Object.assign(new Error('Request aborted'), {
+    name: 'LocalAbortError',
+  });
+}
+
 async function runWithTimeoutAndAbort<T>(
-  fn: () => Promise<T>,
+  fn: (attemptSignal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<T> {
   if (signal?.aborted) {
-    throw new Error('Request aborted');
+    throw createLocalAbortError();
   }
 
   return await new Promise<T>((resolve, reject) => {
     let settled = false;
+    const internalController = new AbortController();
+
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      reject(new Error('Request timed out'));
+      internalController.abort();
+      reject(createLocalTimeoutError());
     }, timeoutMs);
 
     const onAbort = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      reject(new Error('Request aborted'));
+      internalController.abort();
+      reject(createLocalAbortError());
     };
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    fn()
+    fn(internalController.signal)
       .then((value) => {
         if (settled) return;
         settled = true;
@@ -279,6 +297,11 @@ export class GeminiServiceError extends Error {
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
   upstreamErrorMessage?: string;
+  requestId?: string;
+  requestApiVersion?: string;
+  requestEndpoint?: string;
+  availableGenerateModels?: string[];
+  recommendedModel?: string | null;
 
   constructor(
     status: number,
@@ -289,6 +312,11 @@ export class GeminiServiceError extends Error {
       upstreamHttpStatus?: number;
       upstreamApiStatus?: string;
       upstreamErrorMessage?: string;
+      requestId?: string;
+      requestApiVersion?: string;
+      requestEndpoint?: string;
+      availableGenerateModels?: string[];
+      recommendedModel?: string | null;
     },
   ) {
     super(message);
@@ -299,15 +327,34 @@ export class GeminiServiceError extends Error {
     this.upstreamHttpStatus = extra?.upstreamHttpStatus;
     this.upstreamApiStatus = extra?.upstreamApiStatus;
     this.upstreamErrorMessage = extra?.upstreamErrorMessage;
+    this.requestId = extra?.requestId;
+    this.requestApiVersion = extra?.requestApiVersion;
+    this.requestEndpoint = extra?.requestEndpoint;
+    this.availableGenerateModels = extra?.availableGenerateModels;
+    this.recommendedModel = extra?.recommendedModel;
   }
 }
 
-function toServiceError(mapped: MappedGeminiError): GeminiServiceError {
+function toServiceError(
+  mapped: MappedGeminiError,
+  extra?: {
+    requestId?: string;
+    requestApiVersion?: string;
+    requestEndpoint?: string;
+    availableGenerateModels?: string[];
+    recommendedModel?: string | null;
+  },
+): GeminiServiceError {
   return new GeminiServiceError(mapped.status, mapped.code, mapped.message, {
     diagnosticCategory: mapped.diagnosticCategory,
     upstreamHttpStatus: mapped.upstreamHttpStatus,
     upstreamApiStatus: mapped.upstreamApiStatus,
     upstreamErrorMessage: mapped.upstreamErrorMessage,
+    requestId: extra?.requestId,
+    requestApiVersion: extra?.requestApiVersion,
+    requestEndpoint: extra?.requestEndpoint,
+    availableGenerateModels: extra?.availableGenerateModels,
+    recommendedModel: extra?.recommendedModel,
   });
 }
 
@@ -603,13 +650,16 @@ export async function verifyGeminiKeyAuthOnly(
   apiKey: string,
   signal?: AbortSignal,
   clientOverride?: GeminiTestClientLike,
+  requestId?: string,
 ): Promise<{ keyType: GeminiApiKeyType; availableGenerateModels: string[] }> {
+  const reqId = requestId ?? generateSafeRequestId();
   const cleanKey = normalizeGeminiApiKeyInput(apiKey);
   if (!cleanKey) {
     throw new GeminiServiceError(
       403,
       'personal_key_required',
       '개인 Gemini API 키가 등록되어 있지 않습니다.',
+      { requestId: reqId },
     );
   }
   const keyType = detectGeminiApiKeyType(cleanKey);
@@ -632,7 +682,21 @@ export async function verifyGeminiKeyAuthOnly(
     };
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
-    throw toServiceError(mapGeminiError(err, configuredModel));
+    const mapped = mapGeminiError(err, configuredModel);
+    logAiServerDiagnostic('warn', 'gemini_verify_auth_failed', {
+      requestId: reqId,
+      model: configuredModel,
+      apiVersion,
+      errorCode: mapped.code,
+      diagnosticCategory: mapped.diagnosticCategory,
+      upstreamHttpStatus: mapped.upstreamHttpStatus,
+      upstreamApiStatus: mapped.upstreamApiStatus,
+      upstreamErrorMessage: mapped.upstreamErrorMessage,
+    });
+    throw toServiceError(mapped, {
+      requestId: reqId,
+      requestApiVersion: apiVersion,
+    });
   }
 }
 
@@ -640,13 +704,16 @@ export async function testGeminiPersonalKey(
   apiKey: string,
   signal?: AbortSignal,
   clientOverride?: GeminiTestClientLike,
+  requestId?: string,
 ): Promise<GeminiPersonalKeyTestResult> {
+  const reqId = requestId ?? generateSafeRequestId();
   const cleanKey = normalizeGeminiApiKeyInput(apiKey);
   if (!cleanKey) {
     throw new GeminiServiceError(
       403,
       'personal_key_required',
       '개인 Gemini API 키가 등록되어 있지 않습니다.',
+      { requestId: reqId },
     );
   }
   const keyType = detectGeminiApiKeyType(cleanKey);
@@ -672,7 +739,21 @@ export async function testGeminiPersonalKey(
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
     const mapped = mapGeminiError(err, configuredModel);
-    throw toServiceError(mapped);
+    logAiServerDiagnostic('warn', 'gemini_key_test_list_failed', {
+      requestId: reqId,
+      model: configuredModel,
+      apiVersion,
+      errorCode: mapped.code,
+      diagnosticCategory: mapped.diagnosticCategory,
+      upstreamHttpStatus: mapped.upstreamHttpStatus,
+      upstreamApiStatus: mapped.upstreamApiStatus,
+      upstreamErrorMessage: mapped.upstreamErrorMessage,
+    });
+    throw toServiceError(mapped, {
+      requestId: reqId,
+      requestApiVersion: apiVersion,
+      requestEndpoint,
+    });
   }
 
   // Note: If configured model is explicitly listed WITHOUT generateContent support,
@@ -705,18 +786,19 @@ export async function testGeminiPersonalKey(
   }
 
   // 2. Run strictly ONE minimal generateContent probe against the configured model (no speculative 2nd AI call)
+  const startedAt = Date.now();
   try {
     const thinkingConfig = buildThinkingConfigForModel(configuredModel, 'probe');
-    const config: Record<string, unknown> = {
-      maxOutputTokens: 64,
-      ...(thinkingConfig ? { thinkingConfig } : {}),
-    };
     const response = await runWithTimeoutAndAbort(
-      () =>
+      (attemptSignal) =>
         ai.models.generateContent({
           model: configuredModel,
           contents: 'Reply with OK.',
-          config,
+          config: {
+            maxOutputTokens: 64,
+            ...(thinkingConfig ? { thinkingConfig } : {}),
+            abortSignal: attemptSignal,
+          },
         }),
       8000,
       signal,
@@ -741,12 +823,32 @@ export async function testGeminiPersonalKey(
     if (err instanceof GeminiServiceError) throw err;
     const mapped = mapGeminiError(err, configuredModel);
 
+    logAiServerDiagnostic('warn', 'gemini_key_test_probe_failed', {
+      requestId: reqId,
+      model: configuredModel,
+      apiVersion,
+      requestEndpoint,
+      errorCode: mapped.code,
+      diagnosticCategory: mapped.diagnosticCategory,
+      upstreamHttpStatus: mapped.upstreamHttpStatus,
+      upstreamApiStatus: mapped.upstreamApiStatus,
+      upstreamErrorMessage: mapped.upstreamErrorMessage,
+      configuredModelInList: inspection.configuredModelInList,
+      configuredModelSupportsGenerate: inspection.configuredModelSupportsGenerate,
+      modelListCached,
+      latencyMs: Date.now() - startedAt,
+    });
+
     // Key-level auth rejection even during generateContent -> treat as auth error
     if (
       mapped.diagnosticCategory === 'auth_failed' ||
       mapped.diagnosticCategory === 'auth_header_error'
     ) {
-      throw toServiceError(mapped);
+      throw toServiceError(mapped, {
+        requestId: reqId,
+        requestApiVersion: apiVersion,
+        requestEndpoint,
+      });
     }
 
     const modelAccessible =
@@ -804,6 +906,7 @@ export function parseGeminiJsonResponse<T extends object>(params: {
   };
   model: string;
   operation: 'analyze_notice' | 'briefing' | 'planner';
+  requestId?: string;
   emptyMessage: string;
 }): T {
   const finishReason = params.response.candidates?.[0]?.finishReason;
@@ -813,6 +916,7 @@ export function parseGeminiJsonResponse<T extends object>(params: {
   if (!rawText || !rawText.trim()) {
     if (finishReason === 'MAX_TOKENS') {
       logAiServerDiagnostic('warn', 'gemini_response_truncated_empty', {
+        requestId: params.requestId,
         operation: params.operation,
         model: params.model,
         finishReason,
@@ -824,16 +928,21 @@ export function parseGeminiJsonResponse<T extends object>(params: {
         502,
         'ai_response_truncated',
         'AI 응답 생성 길이가 초과되어 결과를 완성하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
-        { diagnosticCategory: 'server_error' },
+        {
+          diagnosticCategory: 'server_error',
+          requestId: params.requestId,
+        },
       );
     }
     logAiServerDiagnostic('warn', 'gemini_empty_response', {
+      requestId: params.requestId,
       operation: params.operation,
       model: params.model,
       finishReason: finishReason ?? 'UNKNOWN',
     });
     throw new GeminiServiceError(502, 'ai_empty_response', params.emptyMessage, {
       diagnosticCategory: 'server_error',
+      requestId: params.requestId,
     });
   }
 
@@ -850,6 +959,7 @@ export function parseGeminiJsonResponse<T extends object>(params: {
       'warn',
       isTruncated ? 'gemini_response_truncated_json' : 'gemini_invalid_json',
       {
+        requestId: params.requestId,
         operation: params.operation,
         model: params.model,
         finishReason: finishReason ?? 'UNKNOWN',
@@ -864,14 +974,20 @@ export function parseGeminiJsonResponse<T extends object>(params: {
         502,
         'ai_response_truncated',
         'AI 응답이 길이 제한으로 중간에 잘려 결과를 처리하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
-        { diagnosticCategory: 'server_error' },
+        {
+          diagnosticCategory: 'server_error',
+          requestId: params.requestId,
+        },
       );
     }
     throw new GeminiServiceError(
       502,
       'ai_invalid_json',
       'AI 모델이 올바른 JSON 형식의 응답을 반환하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
-      { diagnosticCategory: 'server_error' },
+      {
+        diagnosticCategory: 'server_error',
+        requestId: params.requestId,
+      },
     );
   }
 }
@@ -886,6 +1002,7 @@ async function generateContentWithModelResolution(params: {
   timeoutMs: number;
   thinkingMode?: 'minimal_extract' | 'low_reasoning';
   operation?: 'analyze_notice' | 'briefing' | 'planner';
+  requestId?: string;
   signal?: AbortSignal;
 }): Promise<{
   model: string;
@@ -901,62 +1018,90 @@ async function generateContentWithModelResolution(params: {
   };
 }> {
   const apiVersion = getEffectiveGeminiApiVersion();
+  const requestEndpoint = buildGenerateEndpointPath(params.configuredModel);
+  const requestId = params.requestId ?? generateSafeRequestId();
   const keyHash = hashKeyForCache(params.apiKey || 'override');
   const resolvedCacheKey = `${keyHash}:${apiVersion}:${params.configuredModel}`;
   const thinkingMode = params.thinkingMode ?? 'low_reasoning';
+  const deadline = Date.now() + params.timeoutMs;
 
   const buildConfigFor = (
     targetModel: string,
     omitThinkingConfig = false,
+    attemptSignal?: AbortSignal,
   ): Record<string, unknown> => {
-    if (omitThinkingConfig) {
-      return { ...params.baseConfig };
-    }
-    const thinkingConfig = buildThinkingConfigForModel(targetModel, thinkingMode);
+    const thinkingConfig = omitThinkingConfig
+      ? undefined
+      : buildThinkingConfigForModel(targetModel, thinkingMode);
     return {
       ...params.baseConfig,
       ...(thinkingConfig ? { thinkingConfig } : {}),
+      ...(attemptSignal ? { abortSignal: attemptSignal } : {}),
     };
   };
 
-  // Reuse cached working model / API version when configuredModel previously required adjustment within TTL
+  // Reuse cached API version / thinkingConfig compatibility ONLY for the configured model (never switch models silently)
   const cachedResolved = resolvedModelCache.get(resolvedCacheKey);
-  if (cachedResolved && cachedResolved.expiresAt > Date.now()) {
+  if (
+    cachedResolved &&
+    cachedResolved.expiresAt > Date.now() &&
+    cachedResolved.resolvedModel === params.configuredModel
+  ) {
     const targetClient =
       !params.hasClientOverride &&
       cachedResolved.resolvedApiVersion !== apiVersion
         ? createGeminiClient(params.apiKey, cachedResolved.resolvedApiVersion)
         : params.ai;
+    const cachedStartedAt = Date.now();
     try {
       const response = await runWithTimeoutAndAbort(
-        () =>
+        (attemptSignal) =>
           targetClient.models.generateContent({
-            model: cachedResolved.resolvedModel,
+            model: params.configuredModel,
             contents: params.contents,
             config: buildConfigFor(
-              cachedResolved.resolvedModel,
+              params.configuredModel,
               Boolean(cachedResolved.omitThinkingConfig),
+              attemptSignal,
             ),
           }),
         params.timeoutMs,
         params.signal,
       );
-      return { model: cachedResolved.resolvedModel, response };
+      return { model: params.configuredModel, response };
     } catch (err) {
       resolvedModelCache.delete(resolvedCacheKey);
       if (err instanceof GeminiServiceError) throw err;
-      throw toServiceError(mapGeminiError(err, cachedResolved.resolvedModel));
+      const mappedCached = mapGeminiError(err, params.configuredModel);
+      logAiServerDiagnostic('warn', 'gemini_cached_compat_attempt_failed', {
+        requestId,
+        operation: params.operation ?? 'unknown',
+        model: params.configuredModel,
+        apiVersion: cachedResolved.resolvedApiVersion,
+        requestEndpoint,
+        errorCode: mappedCached.code,
+        diagnosticCategory: mappedCached.diagnosticCategory,
+        upstreamHttpStatus: mappedCached.upstreamHttpStatus,
+        upstreamApiStatus: mappedCached.upstreamApiStatus,
+        upstreamErrorMessage: mappedCached.upstreamErrorMessage,
+        latencyMs: Date.now() - cachedStartedAt,
+      });
+      throw toServiceError(mappedCached, {
+        requestId,
+        requestApiVersion: cachedResolved.resolvedApiVersion,
+        requestEndpoint,
+      });
     }
   }
 
   const startedAt = Date.now();
   try {
     const response = await runWithTimeoutAndAbort(
-      () =>
+      (attemptSignal) =>
         params.ai.models.generateContent({
           model: params.configuredModel,
           contents: params.contents,
-          config: buildConfigFor(params.configuredModel),
+          config: buildConfigFor(params.configuredModel, false, attemptSignal),
         }),
       params.timeoutMs,
       params.signal,
@@ -968,32 +1113,50 @@ async function generateContentWithModelResolution(params: {
     const lowerUpstream = (mapped.upstreamErrorMessage ?? '').toLowerCase();
 
     logAiServerDiagnostic('warn', 'gemini_generate_attempt_failed', {
+      requestId,
       operation: params.operation ?? 'unknown',
       model: params.configuredModel,
       apiVersion,
+      requestEndpoint,
       errorCode: mapped.code,
       diagnosticCategory: mapped.diagnosticCategory,
       upstreamHttpStatus: mapped.upstreamHttpStatus,
       upstreamApiStatus: mapped.upstreamApiStatus,
+      upstreamErrorMessage: mapped.upstreamErrorMessage,
       latencyMs: Date.now() - startedAt,
     });
 
-    // If v1 rejected thinkingConfig (e.g. "Unknown name 'thinkingConfig'"), switch to v1beta ONCE (or omit thinkingConfig) and cache.
+    // If v1 rejected thinkingConfig (e.g. "Unknown name 'thinkingConfig'"), switch to v1beta ONCE
+    // (or omit thinkingConfig) on the SAME configured model using the remaining timeout budget.
     if (
       mapped.code === 'invalid_request_format' &&
       lowerUpstream.includes('thinking')
     ) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs < 1000) {
+        throw toServiceError(mapped, {
+          requestId,
+          requestApiVersion: apiVersion,
+          requestEndpoint,
+        });
+      }
+
       if (!params.hasClientOverride && apiVersion !== 'v1beta') {
+        const betaStartedAt = Date.now();
         try {
           const betaClient = createGeminiClient(params.apiKey, 'v1beta');
           const betaResponse = await runWithTimeoutAndAbort(
-            () =>
+            (attemptSignal) =>
               betaClient.models.generateContent({
                 model: params.configuredModel,
                 contents: params.contents,
-                config: buildConfigFor(params.configuredModel),
+                config: buildConfigFor(
+                  params.configuredModel,
+                  false,
+                  attemptSignal,
+                ),
               }),
-            params.timeoutMs,
+            remainingMs,
             params.signal,
           );
           setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
@@ -1004,19 +1167,37 @@ async function generateContentWithModelResolution(params: {
           return { model: params.configuredModel, response: betaResponse };
         } catch (betaErr) {
           if (betaErr instanceof GeminiServiceError) throw betaErr;
-          throw toServiceError(mapGeminiError(betaErr, params.configuredModel));
+          const betaMapped = mapGeminiError(betaErr, params.configuredModel);
+          logAiServerDiagnostic('warn', 'gemini_thinking_compat_retry_failed', {
+            requestId,
+            operation: params.operation ?? 'unknown',
+            model: params.configuredModel,
+            fromApiVersion: apiVersion,
+            toApiVersion: 'v1beta',
+            errorCode: betaMapped.code,
+            upstreamHttpStatus: betaMapped.upstreamHttpStatus,
+            upstreamApiStatus: betaMapped.upstreamApiStatus,
+            upstreamErrorMessage: betaMapped.upstreamErrorMessage,
+            latencyMs: Date.now() - betaStartedAt,
+          });
+          throw toServiceError(betaMapped, {
+            requestId,
+            requestApiVersion: 'v1beta',
+            requestEndpoint,
+          });
         }
       }
 
+      const plainStartedAt = Date.now();
       try {
         const plainResponse = await runWithTimeoutAndAbort(
-          () =>
+          (attemptSignal) =>
             params.ai.models.generateContent({
               model: params.configuredModel,
               contents: params.contents,
-              config: buildConfigFor(params.configuredModel, true),
+              config: buildConfigFor(params.configuredModel, true, attemptSignal),
             }),
-          params.timeoutMs,
+          remainingMs,
           params.signal,
         );
         setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
@@ -1028,90 +1209,162 @@ async function generateContentWithModelResolution(params: {
         return { model: params.configuredModel, response: plainResponse };
       } catch (plainErr) {
         if (plainErr instanceof GeminiServiceError) throw plainErr;
-        throw toServiceError(mapGeminiError(plainErr, params.configuredModel));
+        const plainMapped = mapGeminiError(plainErr, params.configuredModel);
+        logAiServerDiagnostic('warn', 'gemini_thinking_compat_retry_failed', {
+          requestId,
+          operation: params.operation ?? 'unknown',
+          model: params.configuredModel,
+          apiVersion,
+          omitThinkingConfig: true,
+          errorCode: plainMapped.code,
+          upstreamHttpStatus: plainMapped.upstreamHttpStatus,
+          upstreamApiStatus: plainMapped.upstreamApiStatus,
+          upstreamErrorMessage: plainMapped.upstreamErrorMessage,
+          latencyMs: Date.now() - plainStartedAt,
+        });
+        throw toServiceError(plainMapped, {
+          requestId,
+          requestApiVersion: apiVersion,
+          requestEndpoint,
+        });
       }
     }
 
-    // Only attempt at most ONE retry when the model itself is missing or unsupported.
-    // Never mask permission, quota, invalid request format, auth, or timeout errors.
+    // Never auto-switch models or blindly retry on 404/model errors.
     if (
       mapped.code !== 'model_not_found' &&
       mapped.code !== 'model_generate_unsupported'
     ) {
-      throw toServiceError(mapped);
+      throw toServiceError(mapped, {
+        requestId,
+        requestApiVersion: apiVersion,
+        requestEndpoint,
+      });
     }
 
-    // Special case: Google explicitly reported API version mismatch on this exact model name -> max 1 retry on v1beta
+    // Narrow non-speculative check: ONLY when Google explicitly states the exact configured model
+    // is not found for the current API version (e.g. v1), try v1beta ONCE for the SAME model.
     if (
+      mapped.code === 'model_not_found' &&
       !params.hasClientOverride &&
       apiVersion !== 'v1beta' &&
       lowerUpstream.includes('not found for api version')
     ) {
-      try {
-        const betaClient = createGeminiClient(params.apiKey, 'v1beta');
-        const betaResponse = await runWithTimeoutAndAbort(
-          () =>
-            betaClient.models.generateContent({
-              model: params.configuredModel,
-              contents: params.contents,
-              config: buildConfigFor(params.configuredModel),
-            }),
-          params.timeoutMs,
-          params.signal,
-        );
-        setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
-          expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
-          resolvedModel: params.configuredModel,
-          resolvedApiVersion: 'v1beta',
-        });
-        return { model: params.configuredModel, response: betaResponse };
-      } catch (betaErr) {
-        if (betaErr instanceof GeminiServiceError) throw betaErr;
-        throw toServiceError(mapGeminiError(betaErr, params.configuredModel));
+      const remainingMs = deadline - Date.now();
+      if (remainingMs >= 1000) {
+        const betaStartedAt = Date.now();
+        try {
+          const betaClient = createGeminiClient(params.apiKey, 'v1beta');
+          const betaResponse = await runWithTimeoutAndAbort(
+            (attemptSignal) =>
+              betaClient.models.generateContent({
+                model: params.configuredModel,
+                contents: params.contents,
+                config: buildConfigFor(
+                  params.configuredModel,
+                  false,
+                  attemptSignal,
+                ),
+              }),
+            remainingMs,
+            params.signal,
+          );
+          setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
+            expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
+            resolvedModel: params.configuredModel,
+            resolvedApiVersion: 'v1beta',
+          });
+          return { model: params.configuredModel, response: betaResponse };
+        } catch (betaErr) {
+          if (betaErr instanceof GeminiServiceError) throw betaErr;
+          const betaMapped = mapGeminiError(betaErr, params.configuredModel);
+          logAiServerDiagnostic('warn', 'gemini_api_version_retry_failed', {
+            requestId,
+            operation: params.operation ?? 'unknown',
+            model: params.configuredModel,
+            fromApiVersion: apiVersion,
+            toApiVersion: 'v1beta',
+            priorErrorCode: mapped.code,
+            errorCode: betaMapped.code,
+            upstreamHttpStatus: betaMapped.upstreamHttpStatus,
+            upstreamApiStatus: betaMapped.upstreamApiStatus,
+            upstreamErrorMessage: betaMapped.upstreamErrorMessage,
+            latencyMs: Date.now() - betaStartedAt,
+          });
+          // Never mask the prior 404 model error behind a 504 timeout if the version probe itself timed out.
+          if (betaMapped.code !== 'ai_timeout' && betaMapped.code !== 'ai_aborted') {
+            throw toServiceError(betaMapped, {
+              requestId,
+              requestApiVersion: 'v1beta',
+              requestEndpoint,
+            });
+          }
+        }
       }
     }
 
-    let inspection: ListedModelInspection;
+    // Use existing 0-token cached models.list diagnostic to report which models this key can access
+    // (strictly 0 extra generateContent calls — never switch models behind the scenes).
+    let inspection: ListedModelInspection | null = null;
+    let modelListCached = false;
     try {
+      const listTimeoutMs = Math.min(3500, Math.max(1500, deadline - Date.now()));
       const listed = await getCachedOrFetchModelList({
         ai: params.ai,
         apiKey: params.apiKey,
         apiVersion,
         configuredModel: params.configuredModel,
-        timeoutMs: Math.min(5000, params.timeoutMs),
+        timeoutMs: listTimeoutMs,
         signal: params.signal,
       });
       inspection = listed.inspection;
+      modelListCached = listed.cached;
     } catch {
-      throw toServiceError(mapped);
+      inspection = null;
     }
 
-    const fallbackModel = inspection.recommendedFallbackModel;
-    if (!fallbackModel) {
-      throw toServiceError(mapped);
-    }
+    logAiServerDiagnostic('warn', 'gemini_model_not_found_diagnostics', {
+      requestId,
+      operation: params.operation ?? 'unknown',
+      model: params.configuredModel,
+      apiVersion,
+      requestEndpoint,
+      upstreamHttpStatus: mapped.upstreamHttpStatus,
+      upstreamApiStatus: mapped.upstreamApiStatus,
+      upstreamErrorMessage: mapped.upstreamErrorMessage,
+      configuredModelInList: inspection?.configuredModelInList ?? null,
+      configuredModelSupportsGenerate:
+        inspection?.configuredModelSupportsGenerate ?? null,
+      modelListCached,
+      availableGenerateModels: inspection?.availableGenerateModels ?? [],
+      recommendedModel: inspection?.recommendedFallbackModel ?? null,
+    });
 
-    try {
-      const fallbackResponse = await runWithTimeoutAndAbort(
-        () =>
-          params.ai.models.generateContent({
-            model: fallbackModel,
-            contents: params.contents,
-            config: buildConfigFor(fallbackModel),
-          }),
-        params.timeoutMs,
-        params.signal,
-      );
-      setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
-        expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
-        resolvedModel: fallbackModel,
-        resolvedApiVersion: apiVersion,
-      });
-      return { model: fallbackModel, response: fallbackResponse };
-    } catch (fallbackErr) {
-      if (fallbackErr instanceof GeminiServiceError) throw fallbackErr;
-      throw toServiceError(mapGeminiError(fallbackErr, fallbackModel));
-    }
+    const availableList = inspection?.availableGenerateModels ?? [];
+    const recommended = inspection?.recommendedFallbackModel ?? null;
+    const modelHint =
+      availableList.length > 0
+        ? ` (계정에서 조회된 모델: ${availableList.slice(0, 4).join(', ')}${
+            recommended ? ` · 권장: ${recommended}` : ''
+          })`
+        : '';
+
+    throw new GeminiServiceError(
+      mapped.status,
+      mapped.code,
+      `${mapped.message}${modelHint}`,
+      {
+        diagnosticCategory: mapped.diagnosticCategory,
+        upstreamHttpStatus: mapped.upstreamHttpStatus,
+        upstreamApiStatus: mapped.upstreamApiStatus,
+        upstreamErrorMessage: mapped.upstreamErrorMessage,
+        requestId,
+        requestApiVersion: apiVersion,
+        requestEndpoint,
+        availableGenerateModels: availableList,
+        recommendedModel: recommended,
+      },
+    );
   }
 }
 
@@ -1120,7 +1373,9 @@ export async function analyzeNoticeWithGemini(
   input: AiAnalyzeNoticeRequest,
   signal?: AbortSignal,
   clientOverride?: GeminiTestClientLike,
+  requestId?: string,
 ): Promise<AiAnalyzeNoticeResponse> {
+  const reqId = requestId ?? generateSafeRequestId();
   const configuredModel = getGeminiModelName();
   const ai = clientOverride ?? createGeminiClient(apiKey);
   const todayKey = input.todayKey || new Date().toISOString().slice(0, 10);
@@ -1164,6 +1419,7 @@ export async function analyzeNoticeWithGemini(
     timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
     thinkingMode: 'minimal_extract',
     operation: 'analyze_notice',
+    requestId: reqId,
     signal,
   });
 
@@ -1171,6 +1427,7 @@ export async function analyzeNoticeWithGemini(
     response,
     model,
     operation: 'analyze_notice',
+    requestId: reqId,
     emptyMessage: 'AI 모델이 빈 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
   });
 
@@ -1191,7 +1448,9 @@ export async function generateBriefingWithGemini(
   input: AiBriefingRequest,
   signal?: AbortSignal,
   clientOverride?: GeminiTestClientLike,
+  requestId?: string,
 ): Promise<AiBriefingResponse> {
+  const reqId = requestId ?? generateSafeRequestId();
   const configuredModel = getGeminiModelName();
   const ai = clientOverride ?? createGeminiClient(apiKey);
 
@@ -1246,6 +1505,7 @@ export async function generateBriefingWithGemini(
     timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
     thinkingMode: 'low_reasoning',
     operation: 'briefing',
+    requestId: reqId,
     signal,
   });
 
@@ -1253,6 +1513,7 @@ export async function generateBriefingWithGemini(
     response,
     model,
     operation: 'briefing',
+    requestId: reqId,
     emptyMessage: 'AI 모델이 빈 브리핑 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
   });
 
@@ -1269,7 +1530,9 @@ export async function generateDayPlanWithGemini(
   input: AiPlannerRequest,
   signal?: AbortSignal,
   clientOverride?: GeminiTestClientLike,
+  requestId?: string,
 ): Promise<AiPlannerResponse> {
+  const reqId = requestId ?? generateSafeRequestId();
   const configuredModel = getGeminiModelName();
   const ai = clientOverride ?? createGeminiClient(apiKey);
 
@@ -1316,6 +1579,7 @@ export async function generateDayPlanWithGemini(
     timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
     thinkingMode: 'low_reasoning',
     operation: 'planner',
+    requestId: reqId,
     signal,
   });
 
@@ -1323,6 +1587,7 @@ export async function generateDayPlanWithGemini(
     response,
     model,
     operation: 'planner',
+    requestId: reqId,
     emptyMessage: 'AI 모델이 빈 업무 계획 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
   });
 

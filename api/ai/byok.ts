@@ -16,7 +16,7 @@ export default async function handler(
   req: VercelLikeRequest,
   res: VercelLikeResponse,
 ) {
-  await dispatchVercelAiRoute(req, res, ['POST', 'DELETE'], (signal) => {
+  await dispatchVercelAiRoute(req, res, ['POST', 'DELETE'], (signal, requestId) => {
     if (req.method === 'DELETE') {
       return handleDeleteByokKeyRequest({
         authorizationHeader: req.headers.authorization,
@@ -28,6 +28,7 @@ export default async function handler(
       body: req.body,
       isSecure: isHttpsRequest(req),
       signal,
+      requestId,
     });
   });
 }

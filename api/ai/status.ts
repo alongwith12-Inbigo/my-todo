@@ -9,7 +9,7 @@ export default async function handler(
   req: VercelLikeRequest,
   res: VercelLikeResponse,
 ) {
-  await dispatchVercelAiRoute(req, res, 'GET', () =>
-    handleAiStatusRequest(req.headers.authorization, {}, req.headers.cookie),
+  await dispatchVercelAiRoute(req, res, 'GET', (_signal, requestId) =>
+    handleAiStatusRequest(req.headers.authorization, {}, req.headers.cookie, requestId),
   );
 }
