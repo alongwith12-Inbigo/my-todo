@@ -56,6 +56,7 @@ import {
   GeminiServiceError,
   generateDayPlanWithGemini,
   getEffectiveGeminiApiVersion,
+  getKeyTestProbeTimeoutMs,
   inspectListedGeminiModels,
   parseGeminiJsonResponse,
   testGeminiPersonalKey,
@@ -2343,6 +2344,284 @@ test('gemini-4-hydrogen profile separation, thinkingLevel/JSON compatibility, an
     assert.equal(validRouteBody.configuredModel, 'gemini-2.5-flash');
     assert.equal(validRouteBody.httpStatus, 200);
     assert.ok(!JSON.stringify(validRouteBody).includes('AQ.Ab8DummyCandidateRouteKey'));
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
+test('candidate model probe uses 20000ms timeout while standard test stays 8000ms, analyze_notice/planner stay 25000ms, and local vs upstream timeouts are clearly distinguished', async (t) => {
+  const prevModel = process.env.GEMINI_MODEL;
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+
+    // 1. Timeout tiers remain strictly separated: 8000ms (standard test), 20000ms (candidate probe), 25000ms (notice/planner)
+    assert.equal(AI_LIMITS.KEY_TEST_TIMEOUT_MS, 8000);
+    assert.equal(AI_LIMITS.CANDIDATE_TEST_TIMEOUT_MS, 20000);
+    assert.equal(AI_LIMITS.REQUEST_TIMEOUT_MS, 25000);
+    assert.equal(getKeyTestProbeTimeoutMs(false), 8000);
+    assert.equal(getKeyTestProbeTimeoutMs(true), 20000);
+    assert.equal(getGeminiModelProfile('gemini-4-hydrogen').operations.analyze_notice.timeoutMs, 25000);
+    assert.equal(getGeminiModelProfile('gemini-4-hydrogen').operations.planner.timeoutMs, 25000);
+    assert.equal(getGeminiModelProfile('gemini-2.5-flash').operations.analyze_notice.timeoutMs, 25000);
+    assert.equal(getGeminiModelProfile('gemini-2.5-flash').operations.planner.timeoutMs, 25000);
+
+    // 2. mapGeminiError distinguishes local timer timeout vs Google API upstream timeout
+    const localTimeoutMapped = mapGeminiError(
+      Object.assign(new Error('Request timed out'), { name: 'LocalTimeoutError' }),
+      'gemini-4-hydrogen',
+    );
+    assert.equal(localTimeoutMapped.code, 'ai_timeout');
+    assert.equal(localTimeoutMapped.diagnosticCategory, 'timeout');
+    assert.equal(localTimeoutMapped.timeoutSource, 'local');
+    assert.equal(localTimeoutMapped.upstreamHttpStatus, undefined);
+    assert.equal(localTimeoutMapped.upstreamErrorMessage, undefined);
+
+    const upstreamTimeoutMapped = mapGeminiError(
+      Object.assign(
+        new Error(JSON.stringify({
+          error: {
+            code: 504,
+            status: 'DEADLINE_EXCEEDED',
+            message: 'Deadline expired before operation could complete.',
+          },
+        })),
+        { status: 504 },
+      ),
+      'gemini-4-hydrogen',
+    );
+    assert.equal(upstreamTimeoutMapped.code, 'ai_timeout');
+    assert.equal(upstreamTimeoutMapped.diagnosticCategory, 'timeout');
+    assert.equal(upstreamTimeoutMapped.timeoutSource, 'upstream');
+    assert.equal(upstreamTimeoutMapped.upstreamHttpStatus, 504);
+    assert.equal(upstreamTimeoutMapped.upstreamApiStatus, 'DEADLINE_EXCEEDED');
+    assert.equal(
+      upstreamTimeoutMapped.upstreamErrorMessage,
+      'Deadline expired before operation could complete.',
+    );
+
+    // 3. Real timer checks (mocked timers, zero real wait):
+    //    - Standard key test times out locally at 8000ms (1 call, 0 retries, timeoutSource='local')
+    //    - Candidate model probe survives past 8000ms (resolves at 11000ms -> ok=true, timeoutMs=20000)
+    //    - Candidate model probe exceeding 20000ms times out locally at 20000ms (timeoutSource='local')
+    let generateCalls = 0;
+    const dummyKey = 'AQ.Ab8DummyTimeoutSplitKey_123456';
+
+    // Warm models.list cache outside timer mock
+    await testGeminiPersonalKey(
+      dummyKey,
+      undefined,
+      {
+        models: {
+          list: async () => ({
+            page: [
+              { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-4-hydrogen', supportedActions: ['generateContent'] },
+            ],
+          }),
+          generateContent: async () => ({
+            text: 'OK',
+            candidates: [{ finishReason: 'STOP' }],
+            usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 },
+          }),
+        },
+      },
+      'req_warm_cache',
+    );
+
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    try {
+      const flushMicrotasks = async () => {
+        for (let i = 0; i < 6; i += 1) {
+          await Promise.resolve();
+        }
+      };
+
+      // 3a. Non-candidate probe still times out at 8000ms
+      generateCalls = 0;
+      let abortedAt8000 = false;
+      const slowNonCandidatePending = testGeminiPersonalKey(
+        dummyKey,
+        undefined,
+        {
+          models: {
+            list: async () => ({ page: [] }),
+            generateContent: async (params) => {
+              generateCalls += 1;
+              const sig = params.config?.abortSignal as AbortSignal | undefined;
+              return await new Promise((_resolve, reject) => {
+                sig?.addEventListener('abort', () => {
+                  abortedAt8000 = true;
+                  reject(new Error('aborted'));
+                }, { once: true });
+              });
+            },
+          },
+        },
+        'req_non_candidate_8s',
+      );
+      await flushMicrotasks();
+      t.mock.timers.tick(8000);
+      const nonCandidateTimeoutRes = await slowNonCandidatePending;
+      assert.equal(abortedAt8000, true);
+      assert.equal(generateCalls, 1);
+      assert.equal(nonCandidateTimeoutRes.ok, false);
+      assert.equal(nonCandidateTimeoutRes.isCandidateTest, false);
+      assert.equal(nonCandidateTimeoutRes.timeoutMs, 8000);
+      assert.equal(nonCandidateTimeoutRes.latencyMs, 8000);
+      assert.equal(nonCandidateTimeoutRes.timeoutSource, 'local');
+      assert.equal(nonCandidateTimeoutRes.diagnosticCategory, 'timeout');
+      assert.equal(nonCandidateTimeoutRes.upstreamErrorMessage, undefined);
+
+      // 3b. Candidate probe ('gemini-4-hydrogen') does NOT time out at 8000ms and succeeds at 11000ms
+      generateCalls = 0;
+      let resolveAt11s: ((val: {
+        text: string;
+        candidates: Array<{ finishReason: string }>;
+        usageMetadata: { promptTokenCount: number; candidatesTokenCount: number; thoughtsTokenCount: number; totalTokenCount: number };
+      }) => void) | null = null;
+      const candidate11sPending = testGeminiPersonalKey(
+        dummyKey,
+        undefined,
+        {
+          models: {
+            list: async () => ({ page: [] }),
+            generateContent: async () => {
+              generateCalls += 1;
+              return await new Promise((resolve) => {
+                resolveAt11s = resolve;
+              });
+            },
+          },
+        },
+        'req_candidate_11s',
+        { candidateModel: 'gemini-4-hydrogen' },
+      );
+      await flushMicrotasks();
+      t.mock.timers.tick(9000);
+      await flushMicrotasks();
+      assert.equal(generateCalls, 1);
+      t.mock.timers.tick(2000); // Total elapsed: 11000ms (< 20000ms)
+      resolveAt11s!({
+        text: 'OK',
+        candidates: [{ finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, thoughtsTokenCount: 20, totalTokenCount: 27 },
+      });
+      const candidate11sRes = await candidate11sPending;
+      assert.equal(generateCalls, 1);
+      assert.equal(candidate11sRes.ok, true);
+      assert.equal(candidate11sRes.isCandidateTest, true);
+      assert.equal(candidate11sRes.model, 'gemini-4-hydrogen');
+      assert.equal(candidate11sRes.timeoutMs, 20000);
+      assert.equal(candidate11sRes.latencyMs, 11000);
+      assert.equal(candidate11sRes.timeoutSource, undefined);
+
+      // 3c. Candidate probe exceeding 20000ms times out locally at 20000ms with strictly 1 call
+      generateCalls = 0;
+      let abortedAt20000 = false;
+      const slowCandidatePending = testGeminiPersonalKey(
+        dummyKey,
+        undefined,
+        {
+          models: {
+            list: async () => ({ page: [] }),
+            generateContent: async (params) => {
+              generateCalls += 1;
+              const sig = params.config?.abortSignal as AbortSignal | undefined;
+              return await new Promise((_resolve, reject) => {
+                sig?.addEventListener('abort', () => {
+                  abortedAt20000 = true;
+                  reject(new Error('aborted'));
+                }, { once: true });
+              });
+            },
+          },
+        },
+        'req_candidate_20s_timeout',
+        { candidateModel: 'gemini-4-hydrogen' },
+      );
+      await flushMicrotasks();
+      t.mock.timers.tick(19999);
+      assert.equal(abortedAt20000, false);
+      t.mock.timers.tick(1);
+      const candidateTimeoutRes = await slowCandidatePending;
+      assert.equal(abortedAt20000, true);
+      assert.equal(generateCalls, 1);
+      assert.equal(candidateTimeoutRes.ok, false);
+      assert.equal(candidateTimeoutRes.isCandidateTest, true);
+      assert.equal(candidateTimeoutRes.timeoutMs, 20000);
+      assert.equal(candidateTimeoutRes.latencyMs, 20000);
+      assert.equal(candidateTimeoutRes.timeoutSource, 'local');
+      assert.equal(candidateTimeoutRes.diagnosticCategory, 'timeout');
+      assert.equal(candidateTimeoutRes.upstreamHttpStatus, undefined);
+      assert.equal(candidateTimeoutRes.upstreamErrorMessage, undefined);
+
+      // 3d. Route handler forwards latencyMs, timeoutMs, and timeoutSource cleanly for both local and upstream timeouts
+      const routeResLocal = await handleTestByokKeyRequest(
+        {
+          authorizationHeader: 'Bearer token',
+          body: { candidateModel: 'gemini-4-hydrogen' },
+        },
+        {
+          verifyAuth: async () => ({
+            uid: 'teacher-timeout-route',
+            email: 'timeout@icedu.kr',
+            emailVerified: true,
+            accessStatus: 'active',
+            role: 'teacher',
+          }),
+          resolveApiKey: async () => ({
+            apiKey: dummyKey,
+            keyType: 'auth_aq',
+          }),
+          testApiKey: async () => candidateTimeoutRes,
+        },
+      );
+      assert.equal(routeResLocal.status, 200);
+      const localBody = routeResLocal.body as Record<string, unknown>;
+      assert.equal(localBody.latencyMs, 20000);
+      assert.equal(localBody.timeoutMs, 20000);
+      assert.equal(localBody.timeoutSource, 'local');
+      assert.equal(localBody.diagnosticCategory, 'timeout');
+      assert.ok(!JSON.stringify(localBody).includes('AQ.Ab8DummyTimeoutSplitKey'));
+
+      const upstreamTimeoutRes = await testGeminiPersonalKey(
+        dummyKey,
+        undefined,
+        {
+          models: {
+            list: async () => ({ page: [] }),
+            generateContent: async () => {
+              throw Object.assign(
+                new Error(JSON.stringify({
+                  error: {
+                    code: 504,
+                    status: 'DEADLINE_EXCEEDED',
+                    message: 'Google API deadline exceeded upstream.',
+                  },
+                })),
+                { status: 504 },
+              );
+            },
+          },
+        },
+        'req_candidate_upstream_504',
+        { candidateModel: 'gemini-4-hydrogen' },
+      );
+      assert.equal(upstreamTimeoutRes.ok, false);
+      assert.equal(upstreamTimeoutRes.timeoutMs, 20000);
+      assert.equal(upstreamTimeoutRes.timeoutSource, 'upstream');
+      assert.equal(upstreamTimeoutRes.upstreamHttpStatus, 504);
+      assert.equal(upstreamTimeoutRes.upstreamApiStatus, 'DEADLINE_EXCEEDED');
+      assert.equal(
+        upstreamTimeoutRes.upstreamErrorMessage,
+        'Google API deadline exceeded upstream.',
+      );
+    } finally {
+      t.mock.timers.reset();
+    }
   } finally {
     clearGeminiModelCacheForTesting();
     if (prevModel === undefined) delete process.env.GEMINI_MODEL;

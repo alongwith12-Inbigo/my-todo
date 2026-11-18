@@ -11,6 +11,7 @@ import {
   type AiPlannerRequest,
   type AiPlannerResponse,
   type AiRawNoticeOutput,
+  type AiTimeoutSource,
   type AiTokenUsage,
   type GeminiApiKeyType,
   type GeminiDiagnosticErrorCategory,
@@ -297,6 +298,7 @@ export class GeminiServiceError extends Error {
   status: number;
   code: string;
   diagnosticCategory?: GeminiDiagnosticErrorCategory;
+  timeoutSource?: AiTimeoutSource;
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
   upstreamErrorMessage?: string;
@@ -312,6 +314,7 @@ export class GeminiServiceError extends Error {
     message: string,
     extra?: {
       diagnosticCategory?: GeminiDiagnosticErrorCategory;
+      timeoutSource?: AiTimeoutSource;
       upstreamHttpStatus?: number;
       upstreamApiStatus?: string;
       upstreamErrorMessage?: string;
@@ -327,6 +330,7 @@ export class GeminiServiceError extends Error {
     this.status = status;
     this.code = code;
     this.diagnosticCategory = extra?.diagnosticCategory;
+    this.timeoutSource = extra?.timeoutSource;
     this.upstreamHttpStatus = extra?.upstreamHttpStatus;
     this.upstreamApiStatus = extra?.upstreamApiStatus;
     this.upstreamErrorMessage = extra?.upstreamErrorMessage;
@@ -350,6 +354,7 @@ function toServiceError(
 ): GeminiServiceError {
   return new GeminiServiceError(mapped.status, mapped.code, mapped.message, {
     diagnosticCategory: mapped.diagnosticCategory,
+    timeoutSource: mapped.timeoutSource,
     upstreamHttpStatus: mapped.upstreamHttpStatus,
     upstreamApiStatus: mapped.upstreamApiStatus,
     upstreamErrorMessage: mapped.upstreamErrorMessage,
@@ -422,6 +427,9 @@ export interface GeminiPersonalKeyTestResult {
   generateContentOk: boolean;
   httpStatus?: number;
   finishReason?: string;
+  latencyMs?: number;
+  timeoutMs?: number;
+  timeoutSource?: AiTimeoutSource;
   usage: AiTokenUsage;
   keyType: GeminiApiKeyType;
   diagnosticCategory?: GeminiDiagnosticErrorCategory;
@@ -439,6 +447,12 @@ export interface GeminiPersonalKeyTestResult {
   errorCode?: string;
   message?: string;
   warning?: string;
+}
+
+export function getKeyTestProbeTimeoutMs(isCandidateTest: boolean): number {
+  return isCandidateTest
+    ? AI_LIMITS.CANDIDATE_TEST_TIMEOUT_MS
+    : AI_LIMITS.KEY_TEST_TIMEOUT_MS;
 }
 
 const ZERO_USAGE: AiTokenUsage = {
@@ -802,6 +816,7 @@ export async function testGeminiPersonalKey(
 
   // 2. Run strictly ONE minimal generateContent probe against the target model
   //    (no JSON schema, short non-PII prompt, minimal output tokens, zero retries, zero fallback)
+  const probeTimeoutMs = getKeyTestProbeTimeoutMs(isCandidateTest);
   const startedAt = Date.now();
   try {
     const thinkingConfig = buildThinkingConfigForModel(targetModel, 'probe');
@@ -816,9 +831,10 @@ export async function testGeminiPersonalKey(
             abortSignal: attemptSignal,
           },
         }),
-      8000,
+      probeTimeoutMs,
       signal,
     );
+    const probeLatencyMs = Math.max(1, Date.now() - startedAt);
     const finishReason = response.candidates?.[0]?.finishReason;
     const usage = extractUsageMetadata(response);
     const text = response.text?.trim() ?? '';
@@ -838,6 +854,8 @@ export async function testGeminiPersonalKey(
         generateContentOk: false,
         httpStatus: 200,
         finishReason: finishReason ?? 'UNKNOWN',
+        latencyMs: probeLatencyMs,
+        timeoutMs: probeTimeoutMs,
         usage,
         keyType,
         diagnosticCategory: 'server_error',
@@ -868,6 +886,8 @@ export async function testGeminiPersonalKey(
       generateContentOk: true,
       httpStatus: 200,
       finishReason: finishReason ?? 'STOP',
+      latencyMs: probeLatencyMs,
+      timeoutMs: probeTimeoutMs,
       usage,
       keyType,
       requestApiVersion: apiVersion,
@@ -876,7 +896,7 @@ export async function testGeminiPersonalKey(
       targetModelInList: inspection.configuredModelInList,
       targetModelSupportsGenerate: inspection.configuredModelSupportsGenerate,
       availableGenerateModels: inspection.availableGenerateModels,
-      recommendedModel: isCandidateTest ? null : null,
+      recommendedModel: null,
       compatibility,
       message: isCandidateTest
         ? `후보 모델(${targetModel}) 1회 generateContent 검증에 성공했습니다. (현재 서버 GEMINI_MODEL=${configuredModel} 설정은 아직 변경되지 않았습니다.)`
@@ -887,6 +907,7 @@ export async function testGeminiPersonalKey(
     };
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
+    const probeLatencyMs = Math.max(1, Date.now() - startedAt);
     const mapped = mapGeminiError(err, targetModel);
 
     logAiServerDiagnostic('warn', 'gemini_key_test_probe_failed', {
@@ -898,13 +919,15 @@ export async function testGeminiPersonalKey(
       requestEndpoint,
       errorCode: mapped.code,
       diagnosticCategory: mapped.diagnosticCategory,
+      timeoutSource: mapped.timeoutSource,
+      timeoutMs: probeTimeoutMs,
       upstreamHttpStatus: mapped.upstreamHttpStatus,
       upstreamApiStatus: mapped.upstreamApiStatus,
       upstreamErrorMessage: mapped.upstreamErrorMessage,
       targetModelInList: inspection.configuredModelInList,
       targetModelSupportsGenerate: inspection.configuredModelSupportsGenerate,
       modelListCached,
-      latencyMs: Date.now() - startedAt,
+      latencyMs: probeLatencyMs,
     });
 
     // Key-level auth rejection even during generateContent -> treat as auth error
@@ -926,6 +949,13 @@ export async function testGeminiPersonalKey(
         ? false
         : inspection.configuredModelSupportsGenerate;
 
+    const timeoutWarning =
+      mapped.diagnosticCategory === 'timeout'
+        ? mapped.timeoutSource === 'local'
+          ? `호출 시간(${probeLatencyMs}ms)이 앱 로컬 제한 시간(${probeTimeoutMs}ms)에 도달해 중단되었습니다. Google API 오류 응답이 아니며 재시도나 대체 모델 호출 없이 중단되었습니다.`
+          : `Google API가 시간 초과를 반환했습니다(앱 로컬 타임아웃 아님 · 호출 시간 ${probeLatencyMs}ms / 제한 ${probeTimeoutMs}ms).`
+        : undefined;
+
     return {
       ok: false,
       model: targetModel,
@@ -935,6 +965,9 @@ export async function testGeminiPersonalKey(
       modelAccessible,
       generateContentOk: false,
       httpStatus: mapped.upstreamHttpStatus,
+      latencyMs: probeLatencyMs,
+      timeoutMs: probeTimeoutMs,
+      ...(mapped.timeoutSource ? { timeoutSource: mapped.timeoutSource } : {}),
       usage: ZERO_USAGE,
       keyType,
       diagnosticCategory: mapped.diagnosticCategory,
@@ -952,11 +985,12 @@ export async function testGeminiPersonalKey(
       compatibility,
       message: mapped.message,
       warning:
-        !isCandidateTest &&
+        timeoutWarning ??
+        (!isCandidateTest &&
         mapped.diagnosticCategory === 'model_not_supported' &&
         inspection.recommendedFallbackModel
           ? `models.list에 포함되어 있더라도 실제 생성 요청이 404를 반환했습니다. 아래에서 권장 모델(${inspection.recommendedFallbackModel})을 1회 직접 검증한 뒤, 성공 시 Vercel GEMINI_MODEL을 변경해 주세요.`
-          : undefined,
+          : undefined),
     };
   }
 }

@@ -9,6 +9,8 @@ export const AI_LIMITS = {
   MAX_PLANNER_SLOTS: 8,
   MAX_PLANNER_RECOMMENDATIONS: 5,
   MAX_ADJUST_CONSTRAINT_CHARS: 180,
+  KEY_TEST_TIMEOUT_MS: 8000,
+  CANDIDATE_TEST_TIMEOUT_MS: 20000,
   REQUEST_TIMEOUT_MS: 25000,
   RATE_LIMIT_MAX_REQUESTS: 12,
   RATE_LIMIT_WINDOW_MS: 60_000,
@@ -64,6 +66,8 @@ export type GeminiDiagnosticErrorCategory =
   | 'network'
   | 'aborted'
   | 'server_error';
+
+export type AiTimeoutSource = 'local' | 'upstream';
 
 export interface AiStatusResponse {
   configured: boolean;
@@ -125,6 +129,8 @@ export interface AiByokTestResponse {
   httpStatus?: number;
   finishReason?: string;
   latencyMs: number;
+  timeoutMs?: number;
+  timeoutSource?: AiTimeoutSource;
   keyType?: GeminiApiKeyType;
   message: string;
   warning?: string;

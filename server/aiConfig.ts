@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import {
   AI_LIMITS,
+  type AiTimeoutSource,
   type GeminiDiagnosticErrorCategory,
   type GeminiModelCompatibilitySummary,
 } from '../src/lib/aiTypes.ts';
@@ -288,6 +289,7 @@ export interface MappedGeminiError {
   status: number;
   code: string;
   diagnosticCategory: GeminiDiagnosticErrorCategory;
+  timeoutSource?: AiTimeoutSource;
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
   upstreamErrorMessage?: string;
@@ -590,24 +592,31 @@ export function mapGeminiError(
     return buildInvalidArgumentMappedError(modelName, parsed);
   }
 
+  const isLocalTimeout =
+    httpStatus === undefined &&
+    !apiStatus &&
+    (parsed.errorName === 'LocalTimeoutError' ||
+      parsed.rawMessage === 'Request timed out');
+
   if (
+    isLocalTimeout ||
     httpStatus === 504 ||
     apiStatus === 'DEADLINE_EXCEEDED' ||
     (httpStatus === undefined &&
-      (parsed.errorName === 'LocalTimeoutError' ||
-        parsed.rawMessage === 'Request timed out' ||
-        lower.includes('deadline_exceeded') ||
-        lower.includes('etimedout')))
+      (lower.includes('deadline_exceeded') || lower.includes('etimedout')))
   ) {
+    const timeoutSource: AiTimeoutSource = isLocalTimeout ? 'local' : 'upstream';
     return {
       status: 504,
       code: 'ai_timeout',
       diagnosticCategory: 'timeout',
+      timeoutSource,
       upstreamHttpStatus: httpStatus,
       upstreamApiStatus: apiStatus,
-      upstreamErrorMessage: parsed.upstreamErrorMessage,
-      message:
-        'AI 서버 응답 시간이 초과되었습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
+      upstreamErrorMessage: isLocalTimeout ? undefined : parsed.upstreamErrorMessage,
+      message: isLocalTimeout
+        ? '앱 서버의 로컬 제한 시간 내에 Google API 응답이 도착하지 않았습니다. 모델 미지원 오류가 아니므로 호출 시간과 제한 시간을 확인해 주세요.'
+        : 'Google Gemini API 서버가 응답 시간 초과(DEADLINE_EXCEEDED)를 반환했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
     };
   }
 
@@ -639,9 +648,10 @@ export function mapGeminiError(
       status: 504,
       code: 'ai_timeout',
       diagnosticCategory: 'timeout',
+      timeoutSource: 'upstream',
       upstreamErrorMessage: parsed.upstreamErrorMessage,
       message:
-        'AI 서버 응답 시간이 초과되었습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
+        'Google Gemini API 요청이 응답 시간 초과로 종료되었습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
     };
   }
 

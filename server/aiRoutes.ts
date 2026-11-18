@@ -630,7 +630,10 @@ export async function handleTestByokKeyRequest(
       reqId,
       candidateModel ? { candidateModel } : undefined,
     );
-    const latencyMs = Math.max(1, Date.now() - startMs);
+    const latencyMs =
+      typeof res.latencyMs === 'number' && res.latencyMs > 0
+        ? res.latencyMs
+        : Math.max(1, Date.now() - startMs);
     const keyType = res.keyType ?? resolvedKeyType ?? detectGeminiApiKeyType(targetKey);
     const configuredModel = res.configuredModel ?? getGeminiModelName();
     const apiKeyAuthOk = res.apiKeyAuthOk ?? true;
@@ -661,6 +664,8 @@ export async function handleTestByokKeyRequest(
             : {}),
         ...(res.finishReason ? { finishReason: res.finishReason } : {}),
         latencyMs,
+        ...(typeof res.timeoutMs === 'number' ? { timeoutMs: res.timeoutMs } : {}),
+        ...(res.timeoutSource ? { timeoutSource: res.timeoutSource } : {}),
         keyType,
         message:
           res.message ||
@@ -727,6 +732,7 @@ export async function handleTestByokKeyRequest(
             ? { httpStatus: err.upstreamHttpStatus }
             : {}),
           latencyMs: 0,
+          ...(err.timeoutSource ? { timeoutSource: err.timeoutSource } : {}),
           error: err.code,
           errorCode: err.code,
           category: 'gemini_api' satisfies AiErrorCategory,

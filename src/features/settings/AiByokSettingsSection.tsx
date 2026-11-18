@@ -18,6 +18,7 @@ import {
   AI_LIMITS,
   type AiByokTestResponse,
   type AiErrorCategory,
+  type AiTimeoutSource,
   type GeminiDiagnosticErrorCategory,
 } from '../../lib/aiTypes';
 import {
@@ -92,7 +93,10 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     }
   }
 
-  function getDiagnosticErrorLabel(diag?: GeminiDiagnosticErrorCategory): string {
+  function getDiagnosticErrorLabel(
+    diag?: GeminiDiagnosticErrorCategory,
+    timeoutSource?: AiTimeoutSource,
+  ): string {
     switch (diag) {
       case 'auth_failed':
         return 'API 키 인증 오류';
@@ -109,6 +113,8 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       case 'quota_exceeded':
         return 'API 호출 한도 초과';
       case 'timeout':
+        if (timeoutSource === 'local') return '앱 로컬 제한 시간 초과';
+        if (timeoutSource === 'upstream') return 'Google API 응답 시간 초과';
         return '응답 시간 초과';
       case 'network':
         return '네트워크 통신 오류';
@@ -126,7 +132,10 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       return {
         type: 'error' as const,
         categoryLabel: err.diagnostic?.diagnosticCategory
-          ? getDiagnosticErrorLabel(err.diagnostic.diagnosticCategory)
+          ? getDiagnosticErrorLabel(
+              err.diagnostic.diagnosticCategory,
+              err.diagnostic.timeoutSource,
+            )
           : getCategoryLabel(err.category),
         message: err.message,
       };
@@ -216,7 +225,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     setSectionFeedback({
       type: 'error',
       categoryLabel: res.diagnosticCategory
-        ? getDiagnosticErrorLabel(res.diagnosticCategory)
+        ? getDiagnosticErrorLabel(res.diagnosticCategory, res.timeoutSource)
         : 'Gemini 모델 호출 오류',
       message: res.message,
       warning: res.warning,
@@ -688,7 +697,10 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                     </span>
                   </div>
                   <span className="text-[11px] text-slate-600">
-                    응답 {testResult.latencyMs}ms
+                    호출 {testResult.latencyMs}ms
+                    {typeof testResult.timeoutMs === 'number'
+                      ? ` / 제한 ${testResult.timeoutMs}ms`
+                      : ''}
                     {typeof (testResult.httpStatus ?? testResult.upstreamHttpStatus) === 'number'
                       ? ` · HTTP ${testResult.httpStatus ?? testResult.upstreamHttpStatus}`
                       : ''}
@@ -757,7 +769,13 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                     <dd className="font-semibold text-slate-900">
                       {testResult.ok
                         ? '오류 없음'
-                        : `${getDiagnosticErrorLabel(testResult.diagnosticCategory)}${
+                        : `${getDiagnosticErrorLabel(testResult.diagnosticCategory, testResult.timeoutSource)}${
+                            testResult.diagnosticCategory === 'timeout' && testResult.timeoutSource
+                              ? testResult.timeoutSource === 'local'
+                                ? ' (앱 로컬 제한 초과 · Google API 응답 아님)'
+                                : ' (Google API 서버 반환)'
+                              : ''
+                          }${
                             typeof testResult.upstreamHttpStatus === 'number'
                               ? ` (HTTP ${testResult.upstreamHttpStatus}${
                                   testResult.upstreamApiStatus
@@ -766,6 +784,26 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                                 })`
                               : ''
                           }`}
+                    </dd>
+                  </div>
+
+                  <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                    <dt className="text-slate-500">호출 시간 / 제한 시간</dt>
+                    <dd className="font-mono text-slate-800">
+                      실제 {testResult.latencyMs}ms
+                      {typeof testResult.timeoutMs === 'number'
+                        ? ` / 제한 ${testResult.timeoutMs}ms`
+                        : ''}
+                      {testResult.diagnosticCategory === 'timeout' &&
+                        testResult.timeoutSource && (
+                          <span className="ml-1.5 font-sans font-semibold text-red-700">
+                            [
+                            {testResult.timeoutSource === 'local'
+                              ? '로컬 타임아웃'
+                              : 'Google API 타임아웃'}
+                            ]
+                          </span>
+                        )}
                     </dd>
                   </div>
 
@@ -803,6 +841,18 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                     </div>
                   )}
                 </dl>
+
+                {!testResult.ok &&
+                  testResult.diagnosticCategory === 'timeout' &&
+                  testResult.timeoutSource === 'local' && (
+                    <p className="text-[11px] text-amber-950 bg-white/90 border border-amber-300 rounded px-2.5 py-1.5 leading-relaxed break-words">
+                      <strong className="font-semibold">로컬 타임아웃 상세:</strong>{' '}
+                      Google API가 오류를 반환한 것이 아니라 앱 서버의 제한 시간(
+                      <span className="font-mono">{testResult.timeoutMs ?? 8000}ms</span>
+                      ) 내에 응답이 도착하지 않아 요청을 중단했습니다(호출 시간:{' '}
+                      <span className="font-mono">{testResult.latencyMs}ms</span>).
+                    </p>
+                  )}
 
                 {!testResult.ok && testResult.upstreamErrorMessage && (
                   <p className="text-[11px] text-red-900 bg-white/90 border border-red-200 rounded px-2.5 py-1.5 leading-relaxed break-words">
