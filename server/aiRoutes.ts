@@ -20,6 +20,7 @@ import {
   getGeminiModelName,
   logAiServerDiagnostic,
   resolveSafeRequestId,
+  validateCandidateModelName,
 } from './aiConfig.ts';
 import {
   acquireUidInFlightLock,
@@ -106,6 +107,7 @@ export interface AiRouteDeps {
     apiKey: string,
     signal?: AbortSignal,
     requestId?: string,
+    options?: { candidateModel?: string },
   ) => Promise<
     Partial<GeminiPersonalKeyTestResult> & {
       model: string;
@@ -157,8 +159,12 @@ function resolveDeps(deps: AiRouteDeps = {}) {
         verifyGeminiKeyAuthOnly(apiKey, signal, undefined, requestId)),
     testApiKey:
       deps.testApiKey ??
-      ((apiKey: string, signal?: AbortSignal, requestId?: string) =>
-        testGeminiPersonalKey(apiKey, signal, undefined, requestId)),
+      ((
+        apiKey: string,
+        signal?: AbortSignal,
+        requestId?: string,
+        options?: { candidateModel?: string },
+      ) => testGeminiPersonalKey(apiKey, signal, undefined, requestId, options)),
   };
 }
 
@@ -593,8 +599,37 @@ export async function handleTestByokKeyRequest(
       resolvedKeyType = stored.keyType ?? detectGeminiApiKeyType(stored.apiKey);
     }
 
+    let candidateModel: string | undefined;
+    if (
+      rawBody.candidateModel !== undefined &&
+      rawBody.candidateModel !== null &&
+      String(rawBody.candidateModel).trim().length > 0
+    ) {
+      const modelCheck = validateCandidateModelName(rawBody.candidateModel);
+      if (!modelCheck.ok) {
+        return {
+          status: 400,
+          headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
+          body: {
+            ok: false,
+            error: 'invalid_model_name',
+            errorCode: 'invalid_model_name',
+            category: 'input_format' satisfies AiErrorCategory,
+            requestId: reqId,
+            message: modelCheck.message,
+          },
+        };
+      }
+      candidateModel = modelCheck.model;
+    }
+
     const startMs = Date.now();
-    const res = await resolved.testApiKey(targetKey, params.signal, reqId);
+    const res = await resolved.testApiKey(
+      targetKey,
+      params.signal,
+      reqId,
+      candidateModel ? { candidateModel } : undefined,
+    );
     const latencyMs = Math.max(1, Date.now() - startMs);
     const keyType = res.keyType ?? resolvedKeyType ?? detectGeminiApiKeyType(targetKey);
     const configuredModel = res.configuredModel ?? getGeminiModelName();
@@ -611,16 +646,27 @@ export async function handleTestByokKeyRequest(
         requestId: reqId,
         model: res.model,
         configuredModel,
+        ...(typeof res.isCandidateTest === 'boolean'
+          ? { isCandidateTest: res.isCandidateTest }
+          : candidateModel
+            ? { isCandidateTest: candidateModel !== configuredModel }
+            : {}),
         apiKeyAuthOk,
         modelAccessible,
         generateContentOk,
+        ...(typeof res.httpStatus === 'number'
+          ? { httpStatus: res.httpStatus }
+          : overallOk
+            ? { httpStatus: 200 }
+            : {}),
+        ...(res.finishReason ? { finishReason: res.finishReason } : {}),
         latencyMs,
         keyType,
         message:
           res.message ||
           (overallOk
             ? `개인 API 키 인증 및 모델(${res.model}) 호출 확인 완료 (${latencyMs}ms)`
-            : `API 키 인증은 정상이나 설정 모델(${configuredModel}) generateContent 호출에 실패했습니다.`),
+            : `API 키 인증은 정상이나 모델(${res.model}) generateContent 호출에 실패했습니다.`),
         ...(res.errorCode ? { errorCode: res.errorCode } : {}),
         ...(res.diagnosticCategory ? { diagnosticCategory: res.diagnosticCategory } : {}),
         ...(typeof res.upstreamHttpStatus === 'number'
@@ -635,12 +681,19 @@ export async function handleTestByokKeyRequest(
         ...(typeof res.modelListCached === 'boolean'
           ? { modelListCached: res.modelListCached }
           : {}),
+        ...(typeof res.targetModelInList === 'boolean'
+          ? { targetModelInList: res.targetModelInList }
+          : {}),
+        ...(typeof res.targetModelSupportsGenerate === 'boolean'
+          ? { targetModelSupportsGenerate: res.targetModelSupportsGenerate }
+          : {}),
         ...(res.availableGenerateModels
           ? { availableGenerateModels: res.availableGenerateModels }
           : {}),
         ...(res.recommendedModel !== undefined
           ? { recommendedModel: res.recommendedModel }
           : {}),
+        ...(res.compatibility ? { compatibility: res.compatibility } : {}),
         ...(res.warning ? { warning: res.warning } : {}),
         usage: res.usage,
       },
@@ -670,6 +723,9 @@ export async function handleTestByokKeyRequest(
           apiKeyAuthOk: !isAuthFailure,
           modelAccessible: false,
           generateContentOk: false,
+          ...(typeof err.upstreamHttpStatus === 'number'
+            ? { httpStatus: err.upstreamHttpStatus }
+            : {}),
           latencyMs: 0,
           error: err.code,
           errorCode: err.code,

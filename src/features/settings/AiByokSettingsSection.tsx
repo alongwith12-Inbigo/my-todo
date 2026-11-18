@@ -50,6 +50,8 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
   const [showKeyInput, setShowKeyInput] = useState(false);
   const [savingKey, setSavingKey] = useState(false);
   const [testingKey, setTestingKey] = useState(false);
+  const [testingCandidate, setTestingCandidate] = useState(false);
+  const [candidateModelInput, setCandidateModelInput] = useState('');
   const [deletingKey, setDeletingKey] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 
@@ -193,6 +195,16 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
 
   function applyTestResponse(res: AiByokTestResponse) {
     setTestResult(res);
+    if (!res.isCandidateTest) {
+      const nextCandidate =
+        res.recommendedModel ||
+        res.availableGenerateModels?.find((m) => m !== res.configuredModel) ||
+        res.availableGenerateModels?.[0] ||
+        '';
+      if (nextCandidate) {
+        setCandidateModelInput(nextCandidate);
+      }
+    }
     if (res.ok && res.apiKeyAuthOk && res.generateContentOk) {
       setSectionFeedback({
         type: 'success',
@@ -211,30 +223,38 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     });
   }
 
+  async function runSingleKeyTest(candidateModel?: string) {
+    const cleaned = normalizeGeminiApiKeyInput(apiKeyInput);
+    if (cleaned) {
+      const validation = validateGeminiApiKeyFormat(cleaned);
+      if (!validation.valid || !validation.apiKey) {
+        setSectionFeedback({
+          type: 'error',
+          categoryLabel: getCategoryLabel(validation.category ?? 'input_format'),
+          message: validation.message || '올바른 Gemini API 키를 입력해 주세요.',
+        });
+        return;
+      }
+      const res = await testByokApiKey({
+        apiKey: validation.apiKey,
+        ...(candidateModel ? { candidateModel } : {}),
+      });
+      applyTestResponse(res);
+      return;
+    }
+    const res = await testByokApiKey(
+      candidateModel ? { candidateModel } : {},
+    );
+    applyTestResponse(res);
+  }
+
   async function handleTestKey() {
-    if (testingKey || savingKey) return;
+    if (testingKey || testingCandidate || savingKey) return;
     setTestingKey(true);
     setSectionFeedback(null);
     setTestResult(null);
     try {
-      const cleaned = normalizeGeminiApiKeyInput(apiKeyInput);
-      if (cleaned) {
-        const validation = validateGeminiApiKeyFormat(cleaned);
-        if (!validation.valid || !validation.apiKey) {
-          setSectionFeedback({
-            type: 'error',
-            categoryLabel: getCategoryLabel(validation.category ?? 'input_format'),
-            message: validation.message || '올바른 Gemini API 키를 입력해 주세요.',
-          });
-          setTestingKey(false);
-          return;
-        }
-        const res = await testByokApiKey({ apiKey: validation.apiKey });
-        applyTestResponse(res);
-        return;
-      }
-      const res = await testByokApiKey({});
-      applyTestResponse(res);
+      await runSingleKeyTest();
     } catch (err) {
       if (err instanceof AiClientError && err.diagnostic) {
         setTestResult(err.diagnostic);
@@ -244,6 +264,25 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       );
     } finally {
       setTestingKey(false);
+    }
+  }
+
+  async function handleTestCandidateModel() {
+    const trimmedModel = candidateModelInput.trim();
+    if (!trimmedModel || testingCandidate || testingKey || savingKey) return;
+    setTestingCandidate(true);
+    setSectionFeedback(null);
+    try {
+      await runSingleKeyTest(trimmedModel);
+    } catch (err) {
+      if (err instanceof AiClientError && err.diagnostic) {
+        setTestResult(err.diagnostic);
+      }
+      setSectionFeedback(
+        toErrorFeedback(err, `후보 모델(${trimmedModel}) 검증에 실패했습니다.`),
+      );
+    } finally {
+      setTestingCandidate(false);
     }
   }
 
@@ -641,11 +680,18 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                       <AlertTriangle className="w-4 h-4 text-red-700 shrink-0" aria-hidden="true" />
                     )}
                     <span>
-                      {testResult.ok ? '모델 연결 진단 · 정상' : '모델 연결 진단 · 확인 필요'}
+                      {testResult.isCandidateTest
+                        ? `후보 모델 검증(${testResult.model}) · ${testResult.ok ? '성공' : '실패'}`
+                        : testResult.ok
+                          ? '모델 연결 진단 · 정상'
+                          : '모델 연결 진단 · 확인 필요'}
                     </span>
                   </div>
                   <span className="text-[11px] text-slate-600">
                     응답 {testResult.latencyMs}ms
+                    {typeof (testResult.httpStatus ?? testResult.upstreamHttpStatus) === 'number'
+                      ? ` · HTTP ${testResult.httpStatus ?? testResult.upstreamHttpStatus}`
+                      : ''}
                     {testResult.usage && testResult.usage.totalTokens > 0
                       ? ` · 토큰 ${testResult.usage.totalTokens}`
                       : ''}
@@ -670,9 +716,16 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                   </div>
 
                   <div className="flex items-center justify-between gap-2">
-                    <dt className="text-slate-600">2. 현재 설정 모델</dt>
+                    <dt className="text-slate-600">
+                      {testResult.isCandidateTest ? '2. 검증 요청 모델' : '2. 현재 설정 모델'}
+                    </dt>
                     <dd className="font-mono font-semibold text-slate-900">
-                      {testResult.configuredModel}
+                      {testResult.model}
+                      {testResult.isCandidateTest && (
+                        <span className="ml-1 font-sans font-normal text-slate-500">
+                          (서버 설정: {testResult.configuredModel})
+                        </span>
+                      )}
                     </dd>
                   </div>
 
@@ -695,6 +748,7 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                       }`}
                     >
                       {testResult.generateContentOk ? '성공' : '실패'}
+                      {testResult.finishReason ? ` (${testResult.finishReason})` : ''}
                     </dd>
                   </div>
 
@@ -715,12 +769,36 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                     </dd>
                   </div>
 
+                  {testResult.usage && testResult.usage.totalTokens > 0 && (
+                    <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <dt className="text-slate-500">토큰 사용량 (입력/출력/사고/합계)</dt>
+                      <dd className="font-mono text-slate-800">
+                        {testResult.usage.inputTokens} / {testResult.usage.outputTokens} /{' '}
+                        {testResult.usage.thoughtTokens} / {testResult.usage.totalTokens}
+                      </dd>
+                    </div>
+                  )}
+
                   {testResult.requestEndpoint && (
                     <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 text-[11px]">
                       <dt className="text-slate-500">요청 엔드포인트</dt>
                       <dd className="font-mono text-slate-700 break-all">
                         {testResult.requestApiVersion ?? 'v1'} · {testResult.requestEndpoint}
                         {testResult.modelListCached ? ' (목록 캐시)' : ''}
+                      </dd>
+                    </div>
+                  )}
+
+                  {testResult.compatibility && (
+                    <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-2 text-[11px] pt-1 border-t border-slate-200/60">
+                      <dt className="text-slate-500">앱 설정 호환성</dt>
+                      <dd className="text-slate-700">
+                        <span className="font-mono">
+                          {testResult.compatibility.noticeThinkingSummary}
+                        </span>
+                        {' · '}JSON 스키마{' '}
+                        {testResult.compatibility.structuredJsonSupported ? '지원' : '미지원'}
+                        {' · '}출력한도 {testResult.compatibility.plannerMaxOutputTokens}
                       </dd>
                     </div>
                   )}
@@ -733,15 +811,66 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                   </p>
                 )}
 
-                {!testResult.ok &&
-                  testResult.availableGenerateModels &&
+                {testResult.availableGenerateModels &&
                   testResult.availableGenerateModels.length > 0 && (
-                    <p className="text-[11px] text-slate-700 bg-white/80 border border-slate-200 rounded px-2.5 py-1.5 leading-relaxed">
-                      <strong className="font-semibold">계정에서 조회된 generateContent 지원 모델:</strong>{' '}
-                      <span className="font-mono">
-                        {testResult.availableGenerateModels.join(', ')}
-                      </span>
-                    </p>
+                    <div className="text-[11px] text-slate-700 bg-white/90 border border-slate-200 rounded px-2.5 py-2 space-y-2">
+                      <p className="leading-relaxed">
+                        <strong className="font-semibold">
+                          계정에서 조회된 generateContent 지원 모델:
+                        </strong>{' '}
+                        <span className="font-mono">
+                          {testResult.availableGenerateModels.join(', ')}
+                        </span>
+                      </p>
+
+                      {(!testResult.ok || testResult.isCandidateTest) && (
+                        <div className="pt-1.5 border-t border-slate-200/80 space-y-1.5">
+                          <p className="font-semibold text-slate-800">
+                            후보 모델 1회 호환성 검증 (GEMINI_MODEL 변경 없이 테스트)
+                          </p>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <select
+                              aria-label="검증할 후보 모델 선택"
+                              value={candidateModelInput}
+                              onChange={(e) => setCandidateModelInput(e.target.value)}
+                              className="px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                            >
+                              {Array.from(
+                                new Set([
+                                  ...(testResult.recommendedModel
+                                    ? [testResult.recommendedModel]
+                                    : []),
+                                  ...testResult.availableGenerateModels,
+                                ]),
+                              ).map((modelId) => (
+                                <option key={modelId} value={modelId}>
+                                  {modelId}
+                                  {modelId === testResult.recommendedModel ? ' (추천)' : ''}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              disabled={
+                                testingCandidate ||
+                                testingKey ||
+                                savingKey ||
+                                !candidateModelInput
+                              }
+                              onClick={() => void handleTestCandidateModel()}
+                              className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-700 rounded-md hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                            >
+                              {testingCandidate
+                                ? '1회 검증 중...'
+                                : '선택 모델 1회 테스트'}
+                            </button>
+                          </div>
+                          <p className="text-[10px] text-slate-500">
+                            짧은 비개인정보 문장 1회(최소 토큰·JSON 스키마 없음·재시도 없음)만 호출해 실제 동작과 토큰 사용량을 확인합니다.
+                          </p>
+                        </div>
+                      )}
+                    </div>
                   )}
 
                 {testResult.warning && (

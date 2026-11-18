@@ -98,17 +98,32 @@ export interface AiByokSaveResponse {
   usage?: AiTokenUsage;
 }
 
+export interface GeminiModelCompatibilitySummary {
+  family: 'gemini-4' | 'gemini-3-lite' | 'gemini-3' | 'gemini-2.5' | 'other';
+  thinkingParamType: 'thinkingLevel' | 'thinkingBudget' | 'none';
+  probeThinkingSummary: string;
+  noticeThinkingSummary: string;
+  plannerThinkingSummary: string;
+  noticeMaxOutputTokens: number;
+  plannerMaxOutputTokens: number;
+  structuredJsonSupported: boolean;
+}
+
 export interface AiByokTestRequest {
   apiKey?: string;
+  candidateModel?: string;
 }
 
 export interface AiByokTestResponse {
   ok: boolean;
   model: string;
   configuredModel: string;
+  isCandidateTest?: boolean;
   apiKeyAuthOk: boolean;
   modelAccessible: boolean;
   generateContentOk: boolean;
+  httpStatus?: number;
+  finishReason?: string;
   latencyMs: number;
   keyType?: GeminiApiKeyType;
   message: string;
@@ -123,8 +138,11 @@ export interface AiByokTestResponse {
   requestApiVersion?: string;
   requestEndpoint?: string;
   modelListCached?: boolean;
+  targetModelInList?: boolean;
+  targetModelSupportsGenerate?: boolean;
   availableGenerateModels?: string[];
   recommendedModel?: string | null;
+  compatibility?: GeminiModelCompatibilitySummary;
   usage?: AiTokenUsage;
 }
 

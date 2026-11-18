@@ -2,12 +2,245 @@ import crypto from 'node:crypto';
 import {
   AI_LIMITS,
   type GeminiDiagnosticErrorCategory,
+  type GeminiModelCompatibilitySummary,
 } from '../src/lib/aiTypes.ts';
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
 
 const DEPRECATED_MODELS = ['gemini-1.5', 'gemini-2.0', 'gemini-pro'];
 const SAFE_REQUEST_ID_PATTERN = /^[a-zA-Z0-9._:-]{6,64}$/;
+const CANDIDATE_MODEL_PATTERN = /^gemini-[a-z0-9._-]{2,64}$/i;
+
+export interface GeminiOperationSettings {
+  maxOutputTokens: number;
+  thinkingLevel?: 'LOW' | 'MINIMAL';
+  thinkingBudget?: number;
+  timeoutMs: number;
+}
+
+export interface GeminiModelProfile {
+  modelId: string;
+  family: 'gemini-4' | 'gemini-3-lite' | 'gemini-3' | 'gemini-2.5' | 'other';
+  thinkingParamType: 'thinkingLevel' | 'thinkingBudget' | 'none';
+  supportsStructuredJsonSchema: boolean;
+  probe: {
+    maxOutputTokens: number;
+    thinkingLevel?: 'LOW' | 'MINIMAL';
+    thinkingBudget?: number;
+  };
+  operations: {
+    analyze_notice: GeminiOperationSettings;
+    planner: GeminiOperationSettings;
+    briefing: GeminiOperationSettings;
+  };
+}
+
+export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
+  const modelId = modelName.replace(/^models\//, '').trim();
+  const short = modelId.toLowerCase();
+
+  if (short.startsWith('gemini-4-')) {
+    return {
+      modelId,
+      family: 'gemini-4',
+      thinkingParamType: 'thinkingLevel',
+      supportsStructuredJsonSchema: true,
+      probe: {
+        maxOutputTokens: 128,
+        thinkingLevel: 'LOW',
+      },
+      operations: {
+        analyze_notice: {
+          maxOutputTokens: 4096,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        planner: {
+          maxOutputTokens: 4096,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        briefing: {
+          maxOutputTokens: 3072,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+      },
+    };
+  }
+
+  if (
+    short.startsWith('gemini-3.1-flash-lite') ||
+    short.startsWith('gemini-3.5-flash-lite')
+  ) {
+    return {
+      modelId,
+      family: 'gemini-3-lite',
+      thinkingParamType: 'thinkingLevel',
+      supportsStructuredJsonSchema: true,
+      probe: {
+        maxOutputTokens: 64,
+        thinkingLevel: 'MINIMAL',
+      },
+      operations: {
+        analyze_notice: {
+          maxOutputTokens: 3072,
+          thinkingLevel: 'MINIMAL',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        planner: {
+          maxOutputTokens: 3072,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        briefing: {
+          maxOutputTokens: 2048,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+      },
+    };
+  }
+
+  if (short.startsWith('gemini-3')) {
+    return {
+      modelId,
+      family: 'gemini-3',
+      thinkingParamType: 'thinkingLevel',
+      supportsStructuredJsonSchema: true,
+      probe: {
+        maxOutputTokens: 128,
+        thinkingLevel: 'LOW',
+      },
+      operations: {
+        analyze_notice: {
+          maxOutputTokens: 4096,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        planner: {
+          maxOutputTokens: 4096,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        briefing: {
+          maxOutputTokens: 3072,
+          thinkingLevel: 'LOW',
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+      },
+    };
+  }
+
+  if (short.startsWith('gemini-2.5-')) {
+    return {
+      modelId,
+      family: 'gemini-2.5',
+      thinkingParamType: 'thinkingBudget',
+      supportsStructuredJsonSchema: true,
+      probe: {
+        maxOutputTokens: 64,
+      },
+      operations: {
+        analyze_notice: {
+          maxOutputTokens: 3072,
+          thinkingBudget: 128,
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        planner: {
+          maxOutputTokens: 3072,
+          thinkingBudget: 512,
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+        briefing: {
+          maxOutputTokens: 2048,
+          thinkingBudget: 512,
+          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        },
+      },
+    };
+  }
+
+  return {
+    modelId,
+    family: 'other',
+    thinkingParamType: 'none',
+    supportsStructuredJsonSchema: true,
+    probe: {
+      maxOutputTokens: 64,
+    },
+    operations: {
+      analyze_notice: {
+        maxOutputTokens: 3072,
+        timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+      },
+      planner: {
+        maxOutputTokens: 3072,
+        timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+      },
+      briefing: {
+        maxOutputTokens: 2048,
+        timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+      },
+    },
+  };
+}
+
+function formatThinkingSettingSummary(setting: {
+  thinkingLevel?: 'LOW' | 'MINIMAL';
+  thinkingBudget?: number;
+}): string {
+  if (setting.thinkingLevel) return `thinkingLevel=${setting.thinkingLevel}`;
+  if (typeof setting.thinkingBudget === 'number') {
+    return `thinkingBudget=${setting.thinkingBudget}`;
+  }
+  return 'thinkingConfig 미전달';
+}
+
+export function toCompatibilitySummary(
+  profile: GeminiModelProfile,
+): GeminiModelCompatibilitySummary {
+  return {
+    family: profile.family,
+    thinkingParamType: profile.thinkingParamType,
+    probeThinkingSummary: formatThinkingSettingSummary(profile.probe),
+    noticeThinkingSummary: formatThinkingSettingSummary(
+      profile.operations.analyze_notice,
+    ),
+    plannerThinkingSummary: formatThinkingSettingSummary(
+      profile.operations.planner,
+    ),
+    noticeMaxOutputTokens: profile.operations.analyze_notice.maxOutputTokens,
+    plannerMaxOutputTokens: profile.operations.planner.maxOutputTokens,
+    structuredJsonSupported: profile.supportsStructuredJsonSchema,
+  };
+}
+
+export function validateCandidateModelName(
+  raw: unknown,
+): { ok: true; model: string } | { ok: false; message: string } {
+  if (typeof raw !== 'string') {
+    return { ok: false, message: '검증할 모델 ID는 문자열이어야 합니다.' };
+  }
+  const stripped = raw.trim().replace(/^models\//, '');
+  if (!stripped || !CANDIDATE_MODEL_PATTERN.test(stripped)) {
+    return {
+      ok: false,
+      message: '검증할 Gemini 모델 ID 형식이 올바르지 않습니다.',
+    };
+  }
+  if (
+    DEPRECATED_MODELS.some((prefix) =>
+      stripped.toLowerCase().startsWith(prefix),
+    )
+  ) {
+    return {
+      ok: false,
+      message: `지원 종료된 모델(${stripped})은 검증 후보로 사용할 수 없습니다.`,
+    };
+  }
+  return { ok: true, model: stripped };
+}
 
 export function generateSafeRequestId(): string {
   return `req_${crypto.randomBytes(6).toString('hex')}`;

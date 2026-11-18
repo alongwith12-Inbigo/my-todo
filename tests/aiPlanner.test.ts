@@ -41,9 +41,11 @@ import {
   handleTestByokKeyRequest,
 } from '../server/aiRoutes.ts';
 import {
+  getGeminiModelProfile,
   mapGeminiError,
   resolveSafeRequestId,
   sanitizeUpstreamErrorMessage,
+  toCompatibilitySummary,
 } from '../server/aiConfig.ts';
 import { ServerAuthError } from '../server/firebaseServerAuth.ts';
 import {
@@ -2126,6 +2128,228 @@ test('Gemini 404 vs 504 classification, requestId propagation, env apiVersion, a
     else process.env.GOOGLE_GENAI_API_VERSION = prevApiVersion;
   }
 });
+
+test('gemini-4-hydrogen profile separation, thinkingLevel/JSON compatibility, and single-shot candidateModel verification', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  try {
+    clearGeminiModelCacheForTesting();
+
+    // 1. Model profile separation: gemini-4-hydrogen uses thinkingLevel=LOW and 4096 maxOutputTokens,
+    //    while gemini-2.5-flash keeps thinkingBudget=128/512 and 3072 maxOutputTokens
+    const h4Profile = getGeminiModelProfile('gemini-4-hydrogen');
+    assert.equal(h4Profile.family, 'gemini-4');
+    assert.equal(h4Profile.thinkingParamType, 'thinkingLevel');
+    assert.equal(h4Profile.probe.maxOutputTokens, 128);
+    assert.equal(h4Profile.probe.thinkingLevel, 'LOW');
+    assert.equal(h4Profile.operations.analyze_notice.maxOutputTokens, 4096);
+    assert.equal(h4Profile.operations.planner.maxOutputTokens, 4096);
+    const h4Compat = toCompatibilitySummary(h4Profile);
+    assert.equal(h4Compat.noticeThinkingSummary, 'thinkingLevel=LOW');
+    assert.equal(h4Compat.plannerThinkingSummary, 'thinkingLevel=LOW');
+    assert.equal(h4Compat.structuredJsonSupported, true);
+
+    const g25Profile = getGeminiModelProfile('gemini-2.5-flash');
+    assert.equal(g25Profile.family, 'gemini-2.5');
+    assert.equal(g25Profile.thinkingParamType, 'thinkingBudget');
+    assert.equal(g25Profile.operations.analyze_notice.thinkingBudget, 128);
+    assert.equal(g25Profile.operations.planner.thinkingBudget, 512);
+    assert.equal(g25Profile.operations.planner.maxOutputTokens, 3072);
+
+    // 2. When GEMINI_MODEL=gemini-4-hydrogen, notice & planner send thinkingLevel=LOW + responseSchema + 4096 maxOutputTokens (never thinkingBudget)
+    process.env.GEMINI_MODEL = 'gemini-4-hydrogen';
+    const capturedNoticeConfigs: Array<Record<string, unknown> | undefined> = [];
+    const capturedPlannerConfigs: Array<Record<string, unknown> | undefined> = [];
+
+    await analyzeNoticeWithGemini(
+      'AQ.Ab8DummyH4Key_1234567890ABCDEF',
+      { text: '11월 25일까지 학사일정 제출', todayKey: '2026-11-17', existingItems: [] },
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async (params) => {
+            capturedNoticeConfigs.push(params.config);
+            return {
+              text: JSON.stringify({ candidates: [], unparsedSummary: [] }),
+              usageMetadata: { promptTokenCount: 90, candidatesTokenCount: 20, thoughtsTokenCount: 15, totalTokenCount: 125 },
+            };
+          },
+        },
+      },
+      'req_h4_notice',
+    );
+    assert.deepEqual(capturedNoticeConfigs[0]?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
+    assert.equal(capturedNoticeConfigs[0]?.maxOutputTokens, 4096);
+    assert.equal(capturedNoticeConfigs[0]?.responseMimeType, 'application/json');
+    assert.ok(capturedNoticeConfigs[0]?.responseSchema);
+
+    await generateDayPlanWithGemini(
+      'AQ.Ab8DummyH4Key_1234567890ABCDEF',
+      {
+        todayKey: '2026-11-17',
+        currentTimeHhMm: '09:00',
+        totalIncompleteCount: 1,
+        overdueCount: 0,
+        dueTodayCount: 1,
+        timetableConfigured: true,
+        remainingWorkableMinutes: 50,
+        workableSlots: [{ st: '10:00', et: '10:50', min: 50, lb: '2교시 공강' }],
+        blockedEventsSummary: [],
+        academicAlertsSummary: [],
+        tasks: [
+          { id: 't1', t: '학사일정 제출', d: '2026-11-17', ov: false, dd: 0, p: 'u', s: 'td', m: 20, tdy: true },
+        ],
+      },
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async (params) => {
+            capturedPlannerConfigs.push(params.config);
+            return {
+              text: JSON.stringify({
+                coreAdvice: '공강 시간에 처리하세요.',
+                recommendations: [],
+                attentionTasks: [],
+                deferredTasks: [],
+              }),
+              usageMetadata: { promptTokenCount: 140, candidatesTokenCount: 35, thoughtsTokenCount: 40, totalTokenCount: 215 },
+            };
+          },
+        },
+      },
+      'req_h4_planner',
+    );
+    assert.deepEqual(capturedPlannerConfigs[0]?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
+    assert.equal(capturedPlannerConfigs[0]?.maxOutputTokens, 4096);
+    assert.equal(capturedPlannerConfigs[0]?.responseMimeType, 'application/json');
+    assert.ok(capturedPlannerConfigs[0]?.responseSchema);
+
+    // 3. Single-shot candidateModel probe: GEMINI_MODEL stays 'gemini-2.5-flash',
+    //    first test fails 404 on 2.5-flash, then candidate probe tests 'gemini-4-hydrogen' with 1 call,
+    //    0 extra models.list calls (reuses 10m cache), no JSON schema, and minimal output tokens.
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-2.5-flash';
+    let listCalls = 0;
+    const probeCalls: Array<{ model: string; contents: string; config?: Record<string, unknown> }> = [];
+    const probeClient = {
+      models: {
+        list: async () => {
+          listCalls += 1;
+          return {
+            page: [
+              { name: 'models/gemini-2.5-flash', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-4-hydrogen', supportedActions: ['generateContent'] },
+            ],
+          };
+        },
+        generateContent: async (params: { model: string; contents: string; config?: Record<string, unknown> }) => {
+          probeCalls.push(params);
+          if (params.model === 'gemini-2.5-flash') {
+            throw Object.assign(new Error('404 NOT_FOUND: no longer available to new users'), { status: 404 });
+          }
+          return {
+            text: 'OK',
+            candidates: [{ finishReason: 'STOP' }],
+            usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, thoughtsTokenCount: 18, totalTokenCount: 25 },
+          };
+        },
+      },
+    };
+
+    const currentFail = await testGeminiPersonalKey(
+      'AQ.Ab8DummyCandidateProbeKey_123456',
+      undefined,
+      probeClient,
+      'req_probe_25',
+    );
+    assert.equal(currentFail.ok, false);
+    assert.equal(currentFail.configuredModel, 'gemini-2.5-flash');
+    assert.equal(currentFail.recommendedModel, 'gemini-4-hydrogen');
+    assert.equal(listCalls, 1);
+    assert.equal(probeCalls.length, 1);
+
+    const candidatePass = await testGeminiPersonalKey(
+      'AQ.Ab8DummyCandidateProbeKey_123456',
+      undefined,
+      probeClient,
+      'req_probe_h4',
+      { candidateModel: 'gemini-4-hydrogen' },
+    );
+    assert.equal(candidatePass.ok, true);
+    assert.equal(candidatePass.isCandidateTest, true);
+    assert.equal(candidatePass.model, 'gemini-4-hydrogen');
+    assert.equal(candidatePass.configuredModel, 'gemini-2.5-flash');
+    assert.equal(process.env.GEMINI_MODEL, 'gemini-2.5-flash'); // Never mutated
+    assert.equal(candidatePass.httpStatus, 200);
+    assert.equal(candidatePass.finishReason, 'STOP');
+    assert.equal(candidatePass.usage.totalTokens, 25);
+    assert.equal(candidatePass.compatibility?.noticeThinkingSummary, 'thinkingLevel=LOW');
+    assert.equal(listCalls, 1); // Cached models.list reused (0 extra list calls)
+    assert.equal(probeCalls.length, 2); // Strictly 1 generateContent call per test invocation
+    assert.equal(probeCalls[1]?.contents, 'Reply with OK only.');
+    assert.equal(probeCalls[1]?.config?.maxOutputTokens, 128);
+    assert.equal(probeCalls[1]?.config?.responseSchema, undefined);
+    assert.equal(probeCalls[1]?.config?.responseMimeType, undefined);
+    assert.deepEqual(probeCalls[1]?.config?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
+
+    // 4. Route validation rejects deprecated or malformed candidateModel with 400 and forwards valid candidateModel
+    const activeAuth = async () => ({
+      uid: 'teacher-candidate-test',
+      email: 'cand@icedu.kr',
+      emailVerified: true,
+      accessStatus: 'active' as const,
+      role: 'teacher',
+    });
+    const invalidRouteRes = await handleTestByokKeyRequest(
+      {
+        authorizationHeader: 'Bearer token',
+        body: { candidateModel: 'gemini-2.0-flash' },
+      },
+      {
+        verifyAuth: activeAuth,
+        resolveApiKey: async () => ({
+          apiKey: 'AQ.Ab8DummyCandidateRouteKey_123456',
+          keyType: 'auth_aq',
+        }),
+      },
+    );
+    assert.equal(invalidRouteRes.status, 400);
+    assert.equal((invalidRouteRes.body as { errorCode: string }).errorCode, 'invalid_model_name');
+
+    let capturedRouteCandidate: string | undefined;
+    const validRouteRes = await handleTestByokKeyRequest(
+      {
+        authorizationHeader: 'Bearer token',
+        body: { candidateModel: 'models/gemini-4-hydrogen' },
+      },
+      {
+        verifyAuth: activeAuth,
+        resolveApiKey: async () => ({
+          apiKey: 'AQ.Ab8DummyCandidateRouteKey_123456',
+          keyType: 'auth_aq',
+        }),
+        testApiKey: async (_key, _signal, _reqId, opts) => {
+          capturedRouteCandidate = opts?.candidateModel;
+          return candidatePass;
+        },
+      },
+    );
+    assert.equal(validRouteRes.status, 200);
+    assert.equal(capturedRouteCandidate, 'gemini-4-hydrogen');
+    const validRouteBody = validRouteRes.body as Record<string, unknown>;
+    assert.equal(validRouteBody.isCandidateTest, true);
+    assert.equal(validRouteBody.model, 'gemini-4-hydrogen');
+    assert.equal(validRouteBody.configuredModel, 'gemini-2.5-flash');
+    assert.equal(validRouteBody.httpStatus, 200);
+    assert.ok(!JSON.stringify(validRouteBody).includes('AQ.Ab8DummyCandidateRouteKey'));
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
 
 
 
