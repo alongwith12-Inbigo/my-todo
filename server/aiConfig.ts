@@ -319,7 +319,7 @@ export function sanitizeUpstreamErrorMessage(raw: string): string | undefined {
 }
 
 export function logAiServerDiagnostic(
-  level: 'warn' | 'error',
+  level: 'info' | 'warn' | 'error',
   event: string,
   meta: Record<
     string,
@@ -343,8 +343,10 @@ export function logAiServerDiagnostic(
   const line = `[AI_DIAG] ${event} ${JSON.stringify(safeMeta)}`;
   if (level === 'error') {
     console.error(line);
-  } else {
+  } else if (level === 'warn') {
     console.warn(line);
+  } else {
+    console.info(line);
   }
 }
 

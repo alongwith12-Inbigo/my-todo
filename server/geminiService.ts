@@ -299,6 +299,9 @@ export class GeminiServiceError extends Error {
   code: string;
   diagnosticCategory?: GeminiDiagnosticErrorCategory;
   timeoutSource?: AiTimeoutSource;
+  model?: string;
+  timeoutMs?: number;
+  latencyMs?: number;
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
   upstreamErrorMessage?: string;
@@ -315,6 +318,9 @@ export class GeminiServiceError extends Error {
     extra?: {
       diagnosticCategory?: GeminiDiagnosticErrorCategory;
       timeoutSource?: AiTimeoutSource;
+      model?: string;
+      timeoutMs?: number;
+      latencyMs?: number;
       upstreamHttpStatus?: number;
       upstreamApiStatus?: string;
       upstreamErrorMessage?: string;
@@ -331,6 +337,9 @@ export class GeminiServiceError extends Error {
     this.code = code;
     this.diagnosticCategory = extra?.diagnosticCategory;
     this.timeoutSource = extra?.timeoutSource;
+    this.model = extra?.model;
+    this.timeoutMs = extra?.timeoutMs;
+    this.latencyMs = extra?.latencyMs;
     this.upstreamHttpStatus = extra?.upstreamHttpStatus;
     this.upstreamApiStatus = extra?.upstreamApiStatus;
     this.upstreamErrorMessage = extra?.upstreamErrorMessage;
@@ -348,6 +357,9 @@ function toServiceError(
     requestId?: string;
     requestApiVersion?: string;
     requestEndpoint?: string;
+    model?: string;
+    timeoutMs?: number;
+    latencyMs?: number;
     availableGenerateModels?: string[];
     recommendedModel?: string | null;
   },
@@ -355,6 +367,9 @@ function toServiceError(
   return new GeminiServiceError(mapped.status, mapped.code, mapped.message, {
     diagnosticCategory: mapped.diagnosticCategory,
     timeoutSource: mapped.timeoutSource,
+    model: extra?.model,
+    timeoutMs: extra?.timeoutMs,
+    latencyMs: extra?.latencyMs,
     upstreamHttpStatus: mapped.upstreamHttpStatus,
     upstreamApiStatus: mapped.upstreamApiStatus,
     upstreamErrorMessage: mapped.upstreamErrorMessage,
@@ -1180,6 +1195,7 @@ async function generateContentWithModelResolution(params: {
     } catch (err) {
       resolvedModelCache.delete(resolvedCacheKey);
       if (err instanceof GeminiServiceError) throw err;
+      const attemptLatencyMs = Math.max(1, Date.now() - cachedStartedAt);
       const mappedCached = mapGeminiError(err, params.configuredModel);
       logAiServerDiagnostic('warn', 'gemini_cached_compat_attempt_failed', {
         requestId,
@@ -1189,15 +1205,20 @@ async function generateContentWithModelResolution(params: {
         requestEndpoint,
         errorCode: mappedCached.code,
         diagnosticCategory: mappedCached.diagnosticCategory,
+        timeoutSource: mappedCached.timeoutSource,
+        timeoutMs: params.timeoutMs,
         upstreamHttpStatus: mappedCached.upstreamHttpStatus,
         upstreamApiStatus: mappedCached.upstreamApiStatus,
         upstreamErrorMessage: mappedCached.upstreamErrorMessage,
-        latencyMs: Date.now() - cachedStartedAt,
+        latencyMs: attemptLatencyMs,
       });
       throw toServiceError(mappedCached, {
         requestId,
         requestApiVersion: cachedResolved.resolvedApiVersion,
         requestEndpoint,
+        model: params.configuredModel,
+        timeoutMs: params.timeoutMs,
+        latencyMs: attemptLatencyMs,
       });
     }
   }
@@ -1217,6 +1238,7 @@ async function generateContentWithModelResolution(params: {
     return { model: params.configuredModel, response };
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
+    const attemptLatencyMs = Math.max(1, Date.now() - startedAt);
     const mapped = mapGeminiError(err, params.configuredModel);
     const lowerUpstream = (mapped.upstreamErrorMessage ?? '').toLowerCase();
 
@@ -1228,10 +1250,12 @@ async function generateContentWithModelResolution(params: {
       requestEndpoint,
       errorCode: mapped.code,
       diagnosticCategory: mapped.diagnosticCategory,
+      timeoutSource: mapped.timeoutSource,
+      timeoutMs: params.timeoutMs,
       upstreamHttpStatus: mapped.upstreamHttpStatus,
       upstreamApiStatus: mapped.upstreamApiStatus,
       upstreamErrorMessage: mapped.upstreamErrorMessage,
-      latencyMs: Date.now() - startedAt,
+      latencyMs: attemptLatencyMs,
     });
 
     // If v1 rejected thinkingConfig (e.g. "Unknown name 'thinkingConfig'"), switch to v1beta ONCE
@@ -1246,6 +1270,9 @@ async function generateContentWithModelResolution(params: {
           requestId,
           requestApiVersion: apiVersion,
           requestEndpoint,
+          model: params.configuredModel,
+          timeoutMs: params.timeoutMs,
+          latencyMs: attemptLatencyMs,
         });
       }
 
@@ -1275,6 +1302,7 @@ async function generateContentWithModelResolution(params: {
           return { model: params.configuredModel, response: betaResponse };
         } catch (betaErr) {
           if (betaErr instanceof GeminiServiceError) throw betaErr;
+          const betaLatencyMs = Math.max(1, Date.now() - betaStartedAt);
           const betaMapped = mapGeminiError(betaErr, params.configuredModel);
           logAiServerDiagnostic('warn', 'gemini_thinking_compat_retry_failed', {
             requestId,
@@ -1283,15 +1311,20 @@ async function generateContentWithModelResolution(params: {
             fromApiVersion: apiVersion,
             toApiVersion: 'v1beta',
             errorCode: betaMapped.code,
+            timeoutSource: betaMapped.timeoutSource,
+            timeoutMs: remainingMs,
             upstreamHttpStatus: betaMapped.upstreamHttpStatus,
             upstreamApiStatus: betaMapped.upstreamApiStatus,
             upstreamErrorMessage: betaMapped.upstreamErrorMessage,
-            latencyMs: Date.now() - betaStartedAt,
+            latencyMs: betaLatencyMs,
           });
           throw toServiceError(betaMapped, {
             requestId,
             requestApiVersion: 'v1beta',
             requestEndpoint,
+            model: params.configuredModel,
+            timeoutMs: params.timeoutMs,
+            latencyMs: Math.max(1, Date.now() - startedAt),
           });
         }
       }
@@ -1317,6 +1350,7 @@ async function generateContentWithModelResolution(params: {
         return { model: params.configuredModel, response: plainResponse };
       } catch (plainErr) {
         if (plainErr instanceof GeminiServiceError) throw plainErr;
+        const plainLatencyMs = Math.max(1, Date.now() - plainStartedAt);
         const plainMapped = mapGeminiError(plainErr, params.configuredModel);
         logAiServerDiagnostic('warn', 'gemini_thinking_compat_retry_failed', {
           requestId,
@@ -1325,15 +1359,20 @@ async function generateContentWithModelResolution(params: {
           apiVersion,
           omitThinkingConfig: true,
           errorCode: plainMapped.code,
+          timeoutSource: plainMapped.timeoutSource,
+          timeoutMs: remainingMs,
           upstreamHttpStatus: plainMapped.upstreamHttpStatus,
           upstreamApiStatus: plainMapped.upstreamApiStatus,
           upstreamErrorMessage: plainMapped.upstreamErrorMessage,
-          latencyMs: Date.now() - plainStartedAt,
+          latencyMs: plainLatencyMs,
         });
         throw toServiceError(plainMapped, {
           requestId,
           requestApiVersion: apiVersion,
           requestEndpoint,
+          model: params.configuredModel,
+          timeoutMs: params.timeoutMs,
+          latencyMs: Math.max(1, Date.now() - startedAt),
         });
       }
     }
@@ -1347,6 +1386,9 @@ async function generateContentWithModelResolution(params: {
         requestId,
         requestApiVersion: apiVersion,
         requestEndpoint,
+        model: params.configuredModel,
+        timeoutMs: params.timeoutMs,
+        latencyMs: attemptLatencyMs,
       });
     }
 
@@ -1385,6 +1427,7 @@ async function generateContentWithModelResolution(params: {
           return { model: params.configuredModel, response: betaResponse };
         } catch (betaErr) {
           if (betaErr instanceof GeminiServiceError) throw betaErr;
+          const betaLatencyMs = Math.max(1, Date.now() - betaStartedAt);
           const betaMapped = mapGeminiError(betaErr, params.configuredModel);
           logAiServerDiagnostic('warn', 'gemini_api_version_retry_failed', {
             requestId,
@@ -1394,10 +1437,12 @@ async function generateContentWithModelResolution(params: {
             toApiVersion: 'v1beta',
             priorErrorCode: mapped.code,
             errorCode: betaMapped.code,
+            timeoutSource: betaMapped.timeoutSource,
+            timeoutMs: remainingMs,
             upstreamHttpStatus: betaMapped.upstreamHttpStatus,
             upstreamApiStatus: betaMapped.upstreamApiStatus,
             upstreamErrorMessage: betaMapped.upstreamErrorMessage,
-            latencyMs: Date.now() - betaStartedAt,
+            latencyMs: betaLatencyMs,
           });
           // Never mask the prior 404 model error behind a 504 timeout if the version probe itself timed out.
           if (betaMapped.code !== 'ai_timeout' && betaMapped.code !== 'ai_aborted') {
@@ -1405,6 +1450,9 @@ async function generateContentWithModelResolution(params: {
               requestId,
               requestApiVersion: 'v1beta',
               requestEndpoint,
+              model: params.configuredModel,
+              timeoutMs: params.timeoutMs,
+              latencyMs: Math.max(1, Date.now() - startedAt),
             });
           }
         }
@@ -1650,37 +1698,42 @@ export async function generateDayPlanWithGemini(
   const configuredModel = getGeminiModelName();
   const ai = clientOverride ?? createGeminiClient(apiKey);
 
-  const compactInput = {
+  // Client already priority-ranks tasks via scoreTaskForPlanning; keep top 10 tasks
+  // (2x max recommendations) and omit empty arrays to reduce prompt/output bloat.
+  const plannerTasks = input.tasks.slice(0, 10);
+  const compactInput: Record<string, unknown> = {
     today: input.todayKey,
     now: input.currentTimeHhMm,
-    counts: {
-      total: input.totalIncompleteCount,
-      overdue: input.overdueCount,
-      dueToday: input.dueTodayCount,
-    },
-    timetableConfigured: input.timetableConfigured,
     availMin: input.remainingWorkableMinutes,
-    slots: input.workableSlots,
-    events: input.blockedEventsSummary,
-    academic: input.academicAlertsSummary,
-    tasks: input.tasks,
+    totalTasks: input.totalIncompleteCount,
+    overdue: input.overdueCount,
+    dueToday: input.dueTodayCount,
+    ...(input.workableSlots.length > 0 ? { slots: input.workableSlots } : {}),
+    ...(input.blockedEventsSummary.length > 0
+      ? { events: input.blockedEventsSummary }
+      : {}),
+    ...(input.academicAlertsSummary.length > 0
+      ? { academic: input.academicAlertsSummary }
+      : {}),
+    tasks: plannerTasks,
     ...(input.constraint ? { constraint: input.constraint } : {}),
   };
 
   const prompt = [
-    `당신은 한국 교사의 '오늘의 업무 실행 전략 플래너'입니다.`,
+    `한국 교사의 '오늘의 업무 실행 전략 플래너'입니다.`,
     `규칙:`,
-    `1. 제공된 tasks의 id만 사용(최대 5건). 입력에 없는 업무·일정·의존성·근무시간은 절대 만들어내지 마세요.`,
-    `2. recommendedStart/End(HH:MM)는 반드시 slots 구간 내부에만 겹치지 않게 배치하세요. slots가 비어 있거나 시간이 부족하면 null로 두세요.`,
-    `3. estimatedMinutes는 task.m 값이 있으면 그대로 사용하고, null일 때만 15~90 사이 합리적 정수(5단위)로 추정하세요.`,
-    `4. 단순 마감순이 아니라 긴급·공문 마감, 오늘 일정 전 준비(ev:true), 짧은 공강 vs 연속 집중 블록 적합성을 고려해 순서를 정하세요.`,
-    `5. tier는 'must'(오늘 반드시 할 업무)와 'optional'(시간이 남으면 할 업무)로 구분하고, 여력이 없으면 deferredTasks(다음 일정으로 미룰 업무)로 보내세요.`,
-    `6. reason(우선순위/배치 이유 35자 내외), strategy(입력 사실에 근거한 구체적 실행·분할 방법 45자 내외), coreAdvice(전체 전략 1~2문장 95자 내외)를 간결히 작성하세요.`,
+    `1. recommendations: tasks의 id만 사용해 최대 5건 선택(입력 외 항목·시간 창작 금지).`,
+    `2. slots가 있으면 겹치지 않게 recommendedStart/End(HH:MM)를 배치하고, slots가 없거나 시간이 부족/불명확하면 null로 두세요.`,
+    `3. estimatedMinutes: task.m이 있으면 그대로, null이면 15~90 정수(5단위)로 추정.`,
+    `4. 긴급·마감·오늘 일정 전 준비(ev:true)·공강 길이를 반영해 우선순위와 tier('must'|'optional')를 정하세요.`,
+    `5. attentionTasks(핵심 주의 업무 최대 2건, 없으면 [])와 deferredTasks(미룰 업무 최대 3건, 없으면 [])만 간결히 채우세요.`,
+    `6. reason(25자 이내), strategy(35자 이내), coreAdvice(1문장 70자 이내)로 짧게 작성하세요.`,
     `입력JSON:${JSON.stringify(compactInput)}`,
   ].join('\n');
 
   const plannerOpSettings =
     getGeminiModelProfile(configuredModel).operations.planner;
+  const startedAt = Date.now();
 
   const { model, response } = await generateContentWithModelResolution({
     ai,
@@ -1707,6 +1760,20 @@ export async function generateDayPlanWithGemini(
     requestId: reqId,
     emptyMessage: 'AI 모델이 빈 업무 계획 응답을 반환했습니다. 잠시 후 다시 시도해 주세요.',
   });
+  const usage = extractUsageMetadata(response);
+
+  logAiServerDiagnostic('info', 'gemini_planner_completed', {
+    requestId: reqId,
+    operation: 'planner',
+    model,
+    latencyMs: Math.max(1, Date.now() - startedAt),
+    timeoutMs: plannerOpSettings.timeoutMs,
+    promptChars: prompt.length,
+    inputTaskCount: plannerTasks.length,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    thoughtTokens: usage.thoughtTokens,
+  });
 
   return {
     model,
@@ -1723,6 +1790,6 @@ export async function generateDayPlanWithGemini(
         ? parsed.deferredTasks.slice(0, 6)
         : [],
     },
-    usage: extractUsageMetadata(response),
+    usage,
   };
 }

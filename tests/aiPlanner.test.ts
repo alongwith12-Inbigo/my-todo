@@ -2629,6 +2629,236 @@ test('candidate model probe uses 20000ms timeout while standard test stays 8000m
   }
 });
 
+test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloat without breaking schema, and logs requestId/latencyMs/timeoutMs/timeoutSource/model on 25000ms timeout', async (t) => {
+  const prevModel = process.env.GEMINI_MODEL;
+  const capturedWarnings: string[] = [];
+  const capturedInfos: string[] = [];
+  const origWarn = console.warn;
+  const origInfo = console.info;
+  console.warn = (...args: unknown[]) => {
+    capturedWarnings.push(args.map((a) => String(a)).join(' '));
+  };
+  console.info = (...args: unknown[]) => {
+    capturedInfos.push(args.map((a) => String(a)).join(' '));
+  };
+
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+
+    // 1. Profile verification for gemini-3.8-flash
+    const profile38 = getGeminiModelProfile('gemini-3.8-flash');
+    assert.equal(profile38.family, 'gemini-3');
+    assert.equal(profile38.thinkingParamType, 'thinkingLevel');
+    assert.equal(profile38.operations.planner.thinkingLevel, 'LOW');
+    assert.equal(profile38.operations.planner.maxOutputTokens, 4096);
+    assert.equal(profile38.operations.planner.timeoutMs, 25000);
+
+    // 2. Prompt bloat trim: 15 input tasks -> top 10 in compactInput, empty arrays omitted,
+    //    thinkingLevel=LOW + PLANNER_RESPONSE_SCHEMA preserved, 1 Gemini call, safe completion log emitted
+    const fifteenTasks = Array.from({ length: 15 }, (_, idx) => ({
+      id: `task-${idx + 1}`,
+      t: `업무 제목 ${idx + 1}`,
+      d: '2026-11-18',
+      ov: idx === 0,
+      dd: idx === 0 ? -1 : idx,
+      p: (idx < 3 ? 'u' : 'n') as 'u' | 'n',
+      s: 'td' as const,
+      m: 20,
+      tdy: idx < 4,
+    }));
+
+    let capturedContents = '';
+    let capturedConfig: Record<string, unknown> | undefined;
+    let plannerCalls = 0;
+
+    const planRes = await generateDayPlanWithGemini(
+      'AQ.Ab8DummyPlanner38Key_1234567890',
+      {
+        todayKey: '2026-11-18',
+        currentTimeHhMm: '09:00',
+        totalIncompleteCount: 15,
+        overdueCount: 1,
+        dueTodayCount: 3,
+        timetableConfigured: true,
+        remainingWorkableMinutes: 50,
+        workableSlots: [{ st: '10:00', et: '10:50', min: 50, lb: '2교시 공강' }],
+        blockedEventsSummary: [],
+        academicAlertsSummary: [],
+        tasks: fifteenTasks,
+      },
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async (params) => {
+            plannerCalls += 1;
+            capturedContents = params.contents;
+            capturedConfig = params.config;
+            return {
+              text: JSON.stringify({
+                coreAdvice: '2교시 공강에 기한 지난 업무부터 처리하세요.',
+                recommendations: [
+                  {
+                    taskId: 'task-1',
+                    order: 1,
+                    recommendedStart: '10:00',
+                    recommendedEnd: '10:20',
+                    estimatedMinutes: 20,
+                    tier: 'must',
+                    strategy: '서류 양식 먼저 확인 후 기안',
+                    reason: '마감 기한 초과 긴급 업무',
+                  },
+                ],
+                attentionTasks: [{ taskId: 'task-1', reason: '기한 초과' }],
+                deferredTasks: [{ taskId: 'task-6', reason: '오늘 가용 시간 부족' }],
+              }),
+              usageMetadata: {
+                promptTokenCount: 280,
+                candidatesTokenCount: 95,
+                thoughtsTokenCount: 60,
+                totalTokenCount: 435,
+              },
+            };
+          },
+        },
+      },
+      'req_plan_38_ok',
+    );
+
+    assert.equal(plannerCalls, 1);
+    assert.equal(planRes.model, 'gemini-3.8-flash');
+    assert.deepEqual(capturedConfig?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
+    assert.equal(capturedConfig?.maxOutputTokens, 4096);
+    assert.equal(capturedConfig?.responseMimeType, 'application/json');
+    assert.ok(capturedConfig?.responseSchema);
+    assert.equal(planRes.rawPlan.recommendations[0].tier, 'must');
+    assert.equal(planRes.rawPlan.recommendations[0].strategy, '서류 양식 먼저 확인 후 기안');
+
+    const jsonMarker = '입력JSON:';
+    const compactPayload = JSON.parse(
+      capturedContents.slice(capturedContents.indexOf(jsonMarker) + jsonMarker.length),
+    ) as { tasks: Array<{ id: string }>; events?: unknown; academic?: unknown };
+    assert.equal(compactPayload.tasks.length, 10);
+    assert.equal(compactPayload.tasks[0]?.id, 'task-1');
+    assert.equal(compactPayload.tasks[9]?.id, 'task-10');
+    assert.equal('events' in compactPayload, false);
+    assert.equal('academic' in compactPayload, false);
+
+    const completionLog = capturedInfos.find((line) => line.includes('gemini_planner_completed'));
+    assert.ok(completionLog);
+    assert.ok(completionLog.includes('"requestId":"req_plan_38_ok"'));
+    assert.ok(completionLog.includes('"model":"gemini-3.8-flash"'));
+    assert.ok(completionLog.includes('"timeoutMs":25000'));
+    assert.ok(completionLog.includes('"latencyMs":'));
+    assert.ok(!completionLog.includes('AQ.Ab8DummyPlanner38Key'));
+
+    // 3. 25000ms local timeout aborts request cleanly (1 call, 0 retries) and logs all required fields
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    try {
+      let abortedOn25s = false;
+      let timeoutCalls = 0;
+      const pendingRouteRes = handleAiPlannerRequest(
+        {
+          authorizationHeader: 'Bearer test-token',
+          requestId: 'req_plan_38_timeout',
+          body: {
+            todayKey: '2026-11-18',
+            currentTimeHhMm: '09:00',
+            totalIncompleteCount: 1,
+            overdueCount: 0,
+            dueTodayCount: 1,
+            timetableConfigured: true,
+            remainingWorkableMinutes: 50,
+            workableSlots: [{ st: '10:00', et: '10:50', min: 50, lb: '2교시 공강' }],
+            blockedEventsSummary: [],
+            academicAlertsSummary: [],
+            tasks: [fifteenTasks[0]],
+          },
+        },
+        {
+          verifyAuth: async () => ({
+            uid: 'teacher-plan-timeout',
+            email: 'plan@icedu.kr',
+            emailVerified: true,
+            accessStatus: 'active',
+            role: 'teacher',
+          }),
+          resolveApiKey: async () => ({
+            apiKey: 'AQ.Ab8DummyPlannerTimeoutSecret_1234',
+            keyType: 'auth_aq',
+          }),
+          generateDayPlan: async (input, signal, apiKey, reqId) =>
+            generateDayPlanWithGemini(
+              apiKey ?? '',
+              input,
+              signal,
+              {
+                models: {
+                  list: async () => ({ page: [] }),
+                  generateContent: async (params) => {
+                    timeoutCalls += 1;
+                    const sig = params.config?.abortSignal as AbortSignal | undefined;
+                    return await new Promise((_resolve, reject) => {
+                      sig?.addEventListener('abort', () => {
+                        abortedOn25s = true;
+                        reject(new Error('aborted'));
+                      }, { once: true });
+                    });
+                  },
+                },
+              },
+              reqId,
+            ),
+        },
+      );
+
+      for (let i = 0; i < 8; i += 1) {
+        await Promise.resolve();
+      }
+      t.mock.timers.tick(24999);
+      assert.equal(abortedOn25s, false);
+      t.mock.timers.tick(1);
+      const routeOut = await pendingRouteRes;
+
+      assert.equal(abortedOn25s, true);
+      assert.equal(timeoutCalls, 1);
+      assert.equal(routeOut.status, 504);
+      const body = routeOut.body as Record<string, unknown>;
+      assert.equal(body.error, 'ai_timeout');
+      assert.equal(body.requestId, 'req_plan_38_timeout');
+      assert.ok(!JSON.stringify(body).includes('AQ.Ab8DummyPlannerTimeoutSecret'));
+
+      const attemptWarn = capturedWarnings.find((line) =>
+        line.includes('gemini_generate_attempt_failed') && line.includes('req_plan_38_timeout'),
+      );
+      assert.ok(attemptWarn);
+      assert.ok(attemptWarn.includes('"model":"gemini-3.8-flash"'));
+      assert.ok(attemptWarn.includes('"timeoutMs":25000'));
+      assert.ok(attemptWarn.includes('"latencyMs":25000'));
+      assert.ok(attemptWarn.includes('"timeoutSource":"local"'));
+
+      const routeWarn = capturedWarnings.find((line) =>
+        line.includes('ai_route_gemini_error') && line.includes('req_plan_38_timeout'),
+      );
+      assert.ok(routeWarn);
+      assert.ok(routeWarn.includes('"model":"gemini-3.8-flash"'));
+      assert.ok(routeWarn.includes('"timeoutMs":25000'));
+      assert.ok(routeWarn.includes('"latencyMs":25000'));
+      assert.ok(routeWarn.includes('"timeoutSource":"local"'));
+      assert.ok(!routeWarn.includes('AQ.Ab8DummyPlannerTimeoutSecret'));
+    } finally {
+      t.mock.timers.reset();
+    }
+  } finally {
+    console.warn = origWarn;
+    console.info = origInfo;
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
 
 
 

@@ -259,9 +259,13 @@ function handleRouteError(
     logAiServerDiagnostic('warn', 'ai_route_gemini_error', {
       requestId: resolvedReqId,
       route,
+      model: err.model,
       status: err.status,
       errorCode: err.code,
       diagnosticCategory: err.diagnosticCategory,
+      timeoutSource: err.timeoutSource,
+      timeoutMs: err.timeoutMs,
+      latencyMs: err.latencyMs,
       upstreamHttpStatus: err.upstreamHttpStatus,
       upstreamApiStatus: err.upstreamApiStatus,
       upstreamErrorMessage: err.upstreamErrorMessage,
