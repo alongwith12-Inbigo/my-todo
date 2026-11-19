@@ -131,24 +131,6 @@ const BRIEFING_RESPONSE_SCHEMA: Schema = {
   ],
 };
 
-const PLANNER_ADVICE_SCHEMA: Schema = {
-  type: Type.OBJECT,
-  properties: {
-    coreAdvice: { type: Type.STRING },
-    strategies: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          taskId: { type: Type.STRING },
-          strategy: { type: Type.STRING },
-        },
-        required: ['taskId', 'strategy'],
-      },
-    },
-  },
-  required: ['coreAdvice', 'strategies'],
-};
 
 export function getEffectiveGeminiApiVersion(): string {
   const raw = process.env.GOOGLE_GENAI_API_VERSION?.trim();
@@ -1678,6 +1660,7 @@ export async function generateDayPlanWithGemini(
   requestId?: string,
 ): Promise<AiPlannerResponse> {
   const reqId = requestId ?? generateSafeRequestId();
+  const cleanApiKey = normalizeGeminiApiKeyInput(apiKey);
   const configuredModel = getGeminiPlannerModelName();
   const apiVersion = getEffectiveGeminiApiVersion();
   const ai = clientOverride ?? createGeminiClient(apiKey);
@@ -1705,9 +1688,9 @@ export async function generateDayPlanWithGemini(
   };
 
   const prompt = [
-    `한국 교사의 오늘 업무 핵심 조언과 실행 전략을 JSON으로만 작성하세요.`,
-    `1. coreAdvice: 오늘 실행 흐름 핵심 조언 1문장(60자 이내).`,
-    `2. strategies: tasks의 id만 사용해 주요 업무 최대 3건의 구체적 실행 방법(strategy, 40자 이내).`,
+    `한국 교사의 오늘 업무 핵심 조언과 실행 전략을 아래 형식의 순수 JSON 객체로만 응답하세요(설명·마크다운 금지).`,
+    `응답형식:{"coreAdvice":"오늘 실행 흐름 핵심 조언 1문장(60자 이내)","strategies":[{"taskId":"입력 tasks의 id","strategy":"구체적 실행 방법(40자 이내)"}]}`,
+    `규칙: strategies는 입력 tasks에 있는 id만 사용해 최대 3건 작성하세요.`,
     `입력JSON:${JSON.stringify(compactInput)}`,
   ].join('\n');
 
@@ -1715,27 +1698,56 @@ export async function generateDayPlanWithGemini(
     getGeminiModelProfile(configuredModel).operations.planner;
   const startedAt = Date.now();
 
+  const resolvedCacheKey = `${hashKeyForCache(cleanApiKey || 'override')}:${apiVersion}:${configuredModel}`;
+  const cachedCompat = resolvedModelCache.get(resolvedCacheKey);
+  const compatCacheHit = Boolean(
+    cachedCompat &&
+      cachedCompat.expiresAt > Date.now() &&
+      cachedCompat.resolvedModel === configuredModel,
+  );
+  const omitThinkingFromCache = Boolean(
+    compatCacheHit && cachedCompat?.omitThinkingConfig,
+  );
+  const effectiveThinkingConfig = omitThinkingFromCache
+    ? undefined
+    : buildThinkingConfigForModel(configuredModel, 'low_reasoning');
+  const thinkingConfigSummary = omitThinkingFromCache
+    ? 'omitted_compat_cache'
+    : effectiveThinkingConfig && 'thinkingLevel' in effectiveThinkingConfig
+      ? `thinkingLevel=${effectiveThinkingConfig.thinkingLevel}`
+      : effectiveThinkingConfig && 'thinkingBudget' in effectiveThinkingConfig
+        ? `thinkingBudget=${effectiveThinkingConfig.thinkingBudget}`
+        : 'none';
+  const responseMimeType = 'application/json';
+  const hasResponseSchema = false;
+
   logAiServerDiagnostic('info', 'gemini_planner_attempt_started', {
     requestId: reqId,
     operation: 'planner',
     model: configuredModel,
-    apiVersion,
+    apiVersion:
+      compatCacheHit && cachedCompat
+        ? cachedCompat.resolvedApiVersion
+        : apiVersion,
     timeoutMs: plannerOpSettings.timeoutMs,
     maxOutputTokens: plannerOpSettings.maxOutputTokens,
+    thinkingConfigSummary,
+    hasResponseSchema,
+    responseMimeType,
+    compatCacheHit,
     promptChars: prompt.length,
     inputTaskCount: adviceTasks.length,
   });
 
   const { model, response } = await generateContentWithModelResolution({
     ai,
-    apiKey: normalizeGeminiApiKeyInput(apiKey),
+    apiKey: cleanApiKey,
     hasClientOverride: Boolean(clientOverride),
     configuredModel,
     contents: prompt,
     baseConfig: {
       maxOutputTokens: plannerOpSettings.maxOutputTokens,
-      responseMimeType: 'application/json',
-      responseSchema: PLANNER_ADVICE_SCHEMA,
+      responseMimeType,
     },
     timeoutMs: plannerOpSettings.timeoutMs,
     thinkingMode: 'low_reasoning',
@@ -1765,11 +1777,15 @@ export async function generateDayPlanWithGemini(
 
   for (const item of rawStrategySource) {
     if (strategies.length >= AI_LIMITS.MAX_PLANNER_ADVICE_TASKS) break;
-    if (!item || typeof item.taskId !== 'string') continue;
+    if (!item || typeof item !== 'object' || typeof item.taskId !== 'string') {
+      continue;
+    }
     const taskId = item.taskId.trim();
     if (!validTaskIds.has(taskId) || seenStrategyIds.has(taskId)) continue;
     const strategyText =
-      typeof item.strategy === 'string' ? item.strategy.trim() : '';
+      typeof item.strategy === 'string'
+        ? item.strategy.replace(/\s+/g, ' ').trim()
+        : '';
     if (!strategyText) continue;
     seenStrategyIds.add(taskId);
     strategies.push({
@@ -1779,7 +1795,30 @@ export async function generateDayPlanWithGemini(
   }
 
   const coreAdvice =
-    typeof parsed.coreAdvice === 'string' ? parsed.coreAdvice.trim() : '';
+    typeof parsed.coreAdvice === 'string'
+      ? parsed.coreAdvice.replace(/\s+/g, ' ').trim().slice(0, 260)
+      : '';
+
+  if (!coreAdvice && strategies.length === 0) {
+    logAiServerDiagnostic('warn', 'gemini_planner_invalid_payload', {
+      requestId: reqId,
+      operation: 'planner',
+      model,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      thoughtTokens: usage.thoughtTokens,
+    });
+    throw new GeminiServiceError(
+      502,
+      'ai_invalid_json',
+      'AI 모델이 약속된 업무 계획 JSON 형식을 반환하지 못했습니다. 기본 우선순위 계획을 먼저 표시합니다.',
+      {
+        diagnosticCategory: 'server_error',
+        requestId: reqId,
+        model,
+      },
+    );
+  }
 
   logAiServerDiagnostic('info', 'gemini_planner_completed', {
     requestId: reqId,

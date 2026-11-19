@@ -2219,7 +2219,7 @@ test('gemini-4-hydrogen profile separation, thinkingLevel/JSON compatibility, an
     assert.deepEqual(capturedPlannerConfigs[0]?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
     assert.equal(capturedPlannerConfigs[0]?.maxOutputTokens, 1024);
     assert.equal(capturedPlannerConfigs[0]?.responseMimeType, 'application/json');
-    assert.ok(capturedPlannerConfigs[0]?.responseSchema);
+    assert.equal(capturedPlannerConfigs[0]?.responseSchema, undefined);
 
     // 3. Single-shot candidateModel probe: GEMINI_MODEL stays 'gemini-2.5-flash',
     //    first test fails 404 on 2.5-flash, then candidate probe tests 'gemini-4-hydrogen' with 1 call,
@@ -2721,12 +2721,9 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
     assert.deepEqual(capturedConfig?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
     assert.equal(capturedConfig?.maxOutputTokens, 1024);
     assert.equal(capturedConfig?.responseMimeType, 'application/json');
-    const schemaObj = capturedConfig?.responseSchema as {
-      required?: string[];
-      properties?: Record<string, unknown>;
-    };
-    assert.deepEqual(schemaObj?.required, ['coreAdvice', 'strategies']);
-    assert.deepEqual(Object.keys(schemaObj?.properties ?? {}), ['coreAdvice', 'strategies']);
+    assert.equal(capturedConfig?.responseSchema, undefined);
+    assert.ok(capturedContents.includes('"coreAdvice"'));
+    assert.ok(capturedContents.includes('"strategies"'));
     assert.equal(planRes.rawPlan.coreAdvice, '2교시 공강에 기한 지난 업무부터 처리하세요.');
     assert.equal(planRes.rawPlan.strategies?.length, 1);
     assert.equal(planRes.rawPlan.strategies?.[0]?.taskId, 'task-1');
@@ -2753,6 +2750,13 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
     assert.ok(startLog.includes('"requestId":"req_plan_38_ok"'));
     assert.ok(startLog.includes('"maxOutputTokens":1024'));
     assert.ok(startLog.includes('"inputTaskCount":3'));
+    assert.ok(startLog.includes('"thinkingConfigSummary":"thinkingLevel=LOW"'));
+    assert.ok(startLog.includes('"hasResponseSchema":false'));
+    assert.ok(startLog.includes('"responseMimeType":"application/json"'));
+    assert.ok(startLog.includes('"compatCacheHit":false'));
+    assert.ok(!startLog.includes('AQ.Ab8DummyPlanner38Key'));
+    assert.ok(!startLog.includes('업무 제목 1'));
+    assert.ok(!startLog.includes('순수 JSON 객체'));
 
     const completionLog = capturedInfos.find((line) => line.includes('gemini_planner_completed'));
     assert.ok(completionLog);
@@ -3252,4 +3256,94 @@ test('mergeDeterministicPlanWithAiAdvice & session quickFilter use local determi
   assert.equal(mergedEmptyAdvice.mode, 'ai');
   assert.equal(mergedEmptyAdvice.coreAdvice, detBase.coreAdvice);
 });
+
+test('planner without responseSchema safely validates malformed/partial JSON and rejects empty-contract payloads', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+
+    const sampleInput = {
+      todayKey: '2026-11-19',
+      currentTimeHhMm: '09:00',
+      totalIncompleteCount: 2,
+      overdueCount: 0,
+      dueTodayCount: 2,
+      timetableConfigured: true,
+      remainingWorkableMinutes: 60,
+      workableSlots: [{ st: '10:00', et: '11:00', min: 60, lb: '2교시 공강' }],
+      blockedEventsSummary: [],
+      academicAlertsSummary: [],
+      tasks: [
+        { id: 't1', t: '가정통신문 발송', d: '2026-11-19', ov: false, dd: 0, p: 'u' as const, s: 'td' as const, m: 20, tdy: true },
+        { id: 't2', t: '회의록 정리', d: '2026-11-19', ov: false, dd: 0, p: 'n' as const, s: 'td' as const, m: 20, tdy: true },
+      ],
+    };
+
+    // 1. Code-fenced partial JSON with invalid entries, unknown taskId, and overlong strategy is safely sanitized
+    const longStrategy = '가'.repeat(180);
+    const partialRes = await generateDayPlanWithGemini(
+      'AQ.Ab8DummySchemaLessKey_1234',
+      sampleInput,
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async () => ({
+            text: [
+              '```json',
+              JSON.stringify({
+                coreAdvice: 12345, // non-string ignored safely
+                strategies: [
+                  null,
+                  { taskId: 'unknown-id', strategy: '무시됨' },
+                  { taskId: 't1', strategy: '' },
+                  { taskId: 't1', strategy: longStrategy },
+                  { taskId: 't1', strategy: '중복 무시' },
+                ],
+              }),
+              '```',
+            ].join('\n'),
+          }),
+        },
+      },
+      'req_schemaless_partial',
+    );
+    assert.equal(partialRes.rawPlan.coreAdvice, '');
+    assert.equal(partialRes.rawPlan.strategies?.length, 1);
+    assert.equal(partialRes.rawPlan.strategies?.[0]?.taskId, 't1');
+    assert.equal(partialRes.rawPlan.strategies?.[0]?.strategy.length, 140);
+
+    // 2. JSON object lacking both valid coreAdvice and valid strategies triggers safe ai_invalid_json error
+    await assert.rejects(
+      () =>
+        generateDayPlanWithGemini(
+          'AQ.Ab8DummySchemaLessKey_1234',
+          sampleInput,
+          undefined,
+          {
+            models: {
+              list: async () => ({ page: [] }),
+              generateContent: async () => ({
+                text: JSON.stringify({
+                  unexpected: 'no-valid-fields',
+                  strategies: [{ taskId: 'fake', strategy: 'x' }],
+                }),
+              }),
+            },
+          },
+          'req_schemaless_empty_contract',
+        ),
+      (err: unknown) =>
+        err instanceof GeminiServiceError &&
+        err.status === 502 &&
+        err.code === 'ai_invalid_json',
+    );
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
 
