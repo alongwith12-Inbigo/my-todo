@@ -287,9 +287,23 @@ export function getGeminiPlannerModelName(): string {
   return getGeminiModelName();
 }
 
+export function resolveEffectivePlannerModel(
+  requestedOverride?: unknown,
+): { ok: true; model: string } | { ok: false; message: string } {
+  if (
+    requestedOverride !== undefined &&
+    requestedOverride !== null &&
+    String(requestedOverride).trim().length > 0
+  ) {
+    return validateCandidateModelName(requestedOverride);
+  }
+  return { ok: true, model: getGeminiPlannerModelName() };
+}
+
 export function getAiStatusBasePayload() {
   return {
     model: getGeminiModelName(),
+    plannerModel: getGeminiPlannerModelName(),
     rateLimitMaxRequests: AI_LIMITS.RATE_LIMIT_MAX_REQUESTS,
     rateLimitWindowSeconds: Math.round(AI_LIMITS.RATE_LIMIT_WINDOW_MS / 1000),
     maxNoticeChars: AI_LIMITS.MAX_NOTICE_CHARS,

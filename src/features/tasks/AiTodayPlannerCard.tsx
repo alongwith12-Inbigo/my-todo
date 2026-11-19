@@ -21,7 +21,7 @@ import {
   type PlanAdjustmentFilter,
   type ValidatedDayPlan,
 } from '../../lib/aiPlanner';
-import { AI_LIMITS } from '../../lib/aiTypes';
+import { AI_LIMITS, type AiPlannerErrorDetail } from '../../lib/aiTypes';
 import { PRIORITY_LABEL } from '../../lib/briefing';
 import { formatMinutesKorean, type MinuteInterval } from '../../lib/timetable';
 
@@ -30,6 +30,8 @@ interface AiTodayPlannerCardProps {
   loading: boolean;
   error: string | null;
   errorCode: string | null;
+  errorDetail?: AiPlannerErrorDetail | null;
+  activePlannerModel?: string | null;
   plan: ValidatedDayPlan | null;
   hasPersonalKey: boolean;
   aiEnabled: boolean;
@@ -60,6 +62,8 @@ export function AiTodayPlannerCard({
   loading,
   error,
   errorCode,
+  errorDetail,
+  activePlannerModel,
   plan,
   hasPersonalKey,
   aiEnabled,
@@ -181,6 +185,11 @@ export function AiTodayPlannerCard({
           />
           <span>
             오늘 남은 수업 외 가용 시간, 개인 일정, 학사일정, 업무 기한·중요도를 종합하여 실행 순서를 정리하는 중입니다...
+            {activePlannerModel ? (
+              <span className="ml-1.5 font-mono text-[11px] text-slate-500">
+                ({activePlannerModel})
+              </span>
+            ) : null}
           </span>
         </div>
       )}
@@ -234,13 +243,45 @@ export function AiTodayPlannerCard({
           role="alert"
           className="p-3.5 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-950 space-y-2.5"
         >
-          <div>
+          <div className="space-y-1.5">
             <p className="font-semibold text-amber-900">
               {plan
                 ? 'AI 조언을 불러오지 못해 아래에 기본 우선순위 계획을 먼저 표시했습니다'
                 : 'AI 업무 계획을 생성하지 못했습니다'}
             </p>
-            <p className="mt-1 leading-relaxed">{error}</p>
+            <p className="leading-relaxed">{error}</p>
+            {(errorDetail || activePlannerModel) && (
+              <p className="text-[11px] text-amber-900/90 bg-white/75 border border-amber-200/80 rounded px-2.5 py-1.5 font-mono tabular-nums break-words">
+                모델: {errorDetail?.model ?? activePlannerModel ?? '미확인'}
+                {typeof errorDetail?.latencyMs === 'number' ||
+                typeof errorDetail?.timeoutMs === 'number'
+                  ? ` · 경과 ${
+                      typeof errorDetail?.latencyMs === 'number'
+                        ? `${errorDetail.latencyMs}ms`
+                        : '-'
+                    }${
+                      typeof errorDetail?.timeoutMs === 'number'
+                        ? ` / 제한 ${errorDetail.timeoutMs}ms`
+                        : ''
+                    }`
+                  : ''}
+                {errorDetail?.timeoutSource
+                  ? ` (${errorDetail.timeoutSource === 'local' ? '앱 로컬 제한' : 'Google API 시간 초과'})`
+                  : ''}
+                {errorDetail?.streamed
+                  ? ` · 스트리밍 청크 ${errorDetail.chunkCount ?? 0}건${
+                      typeof errorDetail.firstChunkLatencyMs === 'number'
+                        ? ` (첫 응답 ${errorDetail.firstChunkLatencyMs}ms)`
+                        : ' (첫 응답 미도착)'
+                    }`
+                  : ''}
+              </p>
+            )}
+            {errorCode === 'ai_timeout' && (
+              <p className="text-[11px] text-amber-900 leading-relaxed">
+                현재 모델의 응답이 길어 시간 내에 첫 결과가 도착하지 않았습니다. [설정 확인]에서 다른 모델(예: <span className="font-mono">gemini-3.1-flash-lite</span> 등)을 1회 테스트한 뒤 <strong>「AI 업무 계획에 적용」</strong>하면 서버 재배포 없이 바로 전환해 사용할 수 있습니다.
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {!plan && (

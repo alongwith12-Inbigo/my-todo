@@ -10,8 +10,10 @@ import {
 } from 'react';
 import {
   getStoredAiEnabled,
+  getStoredPreferredPlannerModel,
   setStoredAiEnabled,
   subscribeAiEnabledChange,
+  subscribePreferredPlannerModelChange,
 } from '../../lib/aiPreferences';
 import {
   buildAiPlannerContext,
@@ -27,6 +29,7 @@ import type {
   AiAnalyzeNoticeResponse,
   AiBriefingRequest,
   AiBriefingResponse,
+  AiPlannerErrorDetail,
   AiStatusResponse,
   AiUsageSnapshot,
 } from '../../lib/aiTypes';
@@ -68,6 +71,8 @@ interface AiWorkspaceContextValue {
   plannerLoading: boolean;
   plannerError: string | null;
   plannerErrorCode: string | null;
+  plannerErrorDetail: AiPlannerErrorDetail | null;
+  activePlannerModel: string | null;
   plannerPlan: ValidatedDayPlan | null;
   plannerFilter: PlanAdjustmentFilter;
   generatedDataFingerprint: string | null;
@@ -137,11 +142,16 @@ export function AiWorkspaceProvider({
   const [aiStatusLoading, setAiStatusLoading] = useState(false);
   const [aiStatusError, setAiStatusError] = useState<string | null>(null);
   const [aiEnabled, setAiEnabled] = useState(() => getStoredAiEnabled(uid));
+  const [preferredPlannerModel, setPreferredPlannerModel] = useState<string | null>(() =>
+    getStoredPreferredPlannerModel(uid),
+  );
   const [hasPersonalKey, setHasPersonalKey] = useState(false);
 
   const [plannerLoading, setPlannerLoading] = useState(false);
   const [plannerError, setPlannerError] = useState<string | null>(null);
   const [plannerErrorCode, setPlannerErrorCode] = useState<string | null>(null);
+  const [plannerErrorDetail, setPlannerErrorDetail] =
+    useState<AiPlannerErrorDetail | null>(null);
 
   const [aiBriefingLoading, setAiBriefingLoading] = useState(false);
   const [aiBriefingError, setAiBriefingError] = useState<string | null>(null);
@@ -171,6 +181,7 @@ export function AiWorkspaceProvider({
       setPlannerLoading(false);
       setPlannerError(null);
       setPlannerErrorCode(null);
+      setPlannerErrorDetail(null);
       setAiBriefingLoading(false);
       setAiBriefingError(null);
       setAiStatus(null);
@@ -189,8 +200,20 @@ export function AiWorkspaceProvider({
 
   useEffect(() => {
     setAiEnabled(getStoredAiEnabled(uid));
-    return subscribeAiEnabledChange(uid, setAiEnabled);
+    setPreferredPlannerModel(getStoredPreferredPlannerModel(uid));
+    const unsubEnabled = subscribeAiEnabledChange(uid, setAiEnabled);
+    const unsubModel = subscribePreferredPlannerModelChange(
+      uid,
+      setPreferredPlannerModel,
+    );
+    return () => {
+      unsubEnabled();
+      unsubModel();
+    };
   }, [uid]);
+
+  const activePlannerModel =
+    preferredPlannerModel || aiStatus?.plannerModel || aiStatus?.model || null;
 
   const refreshAiStatus = useCallback(
     async (force = false): Promise<AiStatusResponse | null> => {
@@ -352,6 +375,7 @@ export function AiWorkspaceProvider({
       controllerRef.current.setDeterministicPlan(ctx);
       setPlannerError(null);
       setPlannerErrorCode(null);
+      setPlannerErrorDetail(null);
       syncSnapshotState(controllerRef.current.getSnapshot());
     },
     [uid, sessionState.plannerFilter, buildContext, syncSnapshotState],
@@ -385,6 +409,7 @@ export function AiWorkspaceProvider({
       syncSnapshotState(controllerRef.current.getSnapshot());
       setPlannerError(null);
       setPlannerErrorCode(null);
+      setPlannerErrorDetail(null);
 
       let currentHasKey = hasPersonalKey;
       let currentEnabled = aiEnabled;
@@ -411,9 +436,18 @@ export function AiWorkspaceProvider({
       }
 
       const ctx = buildContext(inputs, nextFilter);
+      const effectiveForceRefresh =
+        forceRefresh ||
+        Boolean(
+          preferredPlannerModel &&
+            controllerRef.current.getSnapshot().validatedPlan?.mode === 'ai' &&
+            controllerRef.current.getSnapshot().validatedPlan?.model &&
+            controllerRef.current.getSnapshot().validatedPlan?.model !==
+              preferredPlannerModel,
+        );
 
       // Reuse cached/persisted plan immediately without touching loading or network
-      if (!forceRefresh) {
+      if (!effectiveForceRefresh) {
         const currentSnap = controllerRef.current.getSnapshot();
         if (
           ctx.compressedRequest.tasks.length > 0 &&
@@ -448,9 +482,12 @@ export function AiWorkspaceProvider({
       try {
         await controllerRef.current.runAiPlan({
           context: ctx,
-          forceRefresh,
+          forceRefresh: effectiveForceRefresh,
           executeGemini: async (compressedRequest) => {
-            const res = await requestAiDayPlan(compressedRequest, controller.signal);
+            const payload = preferredPlannerModel
+              ? { ...compressedRequest, modelOverride: preferredPlannerModel }
+              : compressedRequest;
+            const res = await requestAiDayPlan(payload, controller.signal);
             latestUsageSnapshot = res.usageSnapshot;
             return {
               rawPlan: res.rawPlan,
@@ -503,6 +540,7 @@ export function AiWorkspaceProvider({
         if (err instanceof AiClientError) {
           setPlannerError(err.message);
           setPlannerErrorCode(err.code);
+          setPlannerErrorDetail(err.errorDetail ?? null);
           if (err.code === 'personal_key_required') {
             setHasPersonalKey(false);
             setAiStatus((prev) =>
@@ -516,6 +554,7 @@ export function AiWorkspaceProvider({
               : 'AI 조언을 생성하지 못해 기본 우선순위 계획을 먼저 표시했습니다.',
           );
           setPlannerErrorCode('unknown_error');
+          setPlannerErrorDetail(null);
         }
       } finally {
         plannerInFlightRef.current = false;
@@ -530,6 +569,7 @@ export function AiWorkspaceProvider({
       isActive,
       hasPersonalKey,
       aiEnabled,
+      preferredPlannerModel,
       aiStatusLoaded,
       refreshAiStatus,
       buildContext,
@@ -548,6 +588,7 @@ export function AiWorkspaceProvider({
     controllerRef.current.setPlannerVisible(false);
     setPlannerError(null);
     setPlannerErrorCode(null);
+    setPlannerErrorDetail(null);
     syncSnapshotState(controllerRef.current.getSnapshot());
   }, [syncSnapshotState]);
 
@@ -679,6 +720,8 @@ export function AiWorkspaceProvider({
       plannerLoading,
       plannerError,
       plannerErrorCode,
+      plannerErrorDetail,
+      activePlannerModel,
       plannerPlan: sessionState.validatedPlan,
       plannerFilter: sessionState.plannerFilter,
       generatedDataFingerprint: sessionState.generatedDataFingerprint,
@@ -714,6 +757,8 @@ export function AiWorkspaceProvider({
       plannerLoading,
       plannerError,
       plannerErrorCode,
+      plannerErrorDetail,
+      activePlannerModel,
       aiBriefingLoading,
       aiBriefingError,
       ensureTodayKeySynced,

@@ -15,6 +15,11 @@ import {
   validateGeminiApiKeyFormat,
 } from '../../lib/byokKeyFormat';
 import {
+  getStoredPreferredPlannerModel,
+  setStoredPreferredPlannerModel,
+  subscribePreferredPlannerModelChange,
+} from '../../lib/aiPreferences';
+import {
   AI_LIMITS,
   type AiByokTestResponse,
   type AiErrorCategory,
@@ -65,6 +70,9 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
   const [savingPrefs, setSavingPrefs] = useState(false);
 
   const [testResult, setTestResult] = useState<AiByokTestResponse | null>(null);
+  const [preferredPlannerModel, setPreferredPlannerModel] = useState<string | null>(() =>
+    getStoredPreferredPlannerModel(uid),
+  );
   const [sectionFeedback, setSectionFeedback] = useState<{
     type: 'success' | 'error';
     categoryLabel?: string;
@@ -162,6 +170,29 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
       void refreshAiStatus(false);
     }
   }, [uid, aiStatusLoaded, refreshAiStatus]);
+
+  useEffect(() => {
+    setPreferredPlannerModel(getStoredPreferredPlannerModel(uid));
+    return subscribePreferredPlannerModelChange(uid, setPreferredPlannerModel);
+  }, [uid]);
+
+  function handleApplyModelForPlanner(modelId: string) {
+    setStoredPreferredPlannerModel(uid, modelId);
+    setPreferredPlannerModel(modelId);
+    setSectionFeedback({
+      type: 'success',
+      message: `업무 계획(planner) 모델을 ${modelId}로 적용했습니다. 이제 「오늘의 브리핑 > AI로 오늘 업무 계획 세우기」에서 해당 모델이 우선 사용됩니다. (업무 등록 AI 분석 모델은 기존 서버 설정 유지)`,
+    });
+  }
+
+  function handleResetPlannerModelOverride() {
+    setStoredPreferredPlannerModel(uid, null);
+    setPreferredPlannerModel(null);
+    setSectionFeedback({
+      type: 'success',
+      message: '업무 계획(planner) 모델을 서버 기본 설정으로 되돌렸습니다.',
+    });
+  }
 
   async function handleSaveKey(e: FormEvent) {
     e.preventDefault();
@@ -923,6 +954,35 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                     </div>
                   )}
 
+                {testResult.ok && testResult.generateContentOk && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-teal-200/70">
+                    <span className="text-[11px] text-teal-900">
+                      {preferredPlannerModel === testResult.model
+                        ? `현재 이 모델(${testResult.model})이 AI 업무 계획에 적용되어 있습니다.`
+                        : `검증에 성공한 ${testResult.model} 모델을 서버 재배포 없이 AI 업무 계획에 바로 적용할 수 있습니다.`}
+                    </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {preferredPlannerModel === testResult.model ? (
+                        <button
+                          type="button"
+                          onClick={handleResetPlannerModelOverride}
+                          className="px-2.5 py-1 text-[11px] font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 cursor-pointer"
+                        >
+                          서버 기본으로 복원
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => handleApplyModelForPlanner(testResult.model)}
+                          className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-700 rounded-md hover:bg-teal-800 whitespace-nowrap cursor-pointer"
+                        >
+                          이 모델을 AI 업무 계획에 적용
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {testResult.warning && (
                   <p className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5 leading-relaxed">
                     {testResult.warning}
@@ -1015,13 +1075,37 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
         {/* Right Column: Live Usage / Tokens + Quota & Privacy Notices */}
         <div className="space-y-5">
           <div className="p-4 rounded-xl border border-slate-200 space-y-3">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-semibold text-slate-900">
                 내 AI 사용량 및 토큰 현황
               </h3>
-              <span className="font-mono text-[11px] text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
-                {aiStatus?.model ?? 'gemini-4-hydrogen'}
-              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-mono text-[11px] text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
+                  서버: {aiStatus?.model ?? 'gemini-4-hydrogen'}
+                </span>
+                <span
+                  className={`font-mono text-[11px] px-2 py-0.5 rounded border ${
+                    preferredPlannerModel
+                      ? 'text-teal-800 bg-teal-50 border-teal-200 font-semibold'
+                      : 'text-slate-600 bg-slate-50 border-slate-200'
+                  }`}
+                >
+                  계획:{' '}
+                  {preferredPlannerModel ??
+                    aiStatus?.plannerModel ??
+                    aiStatus?.model ??
+                    'gemini-4-hydrogen'}
+                </span>
+                {preferredPlannerModel && (
+                  <button
+                    type="button"
+                    onClick={handleResetPlannerModelOverride}
+                    className="text-[11px] font-medium text-slate-600 underline underline-offset-2 hover:text-slate-900 cursor-pointer"
+                  >
+                    기본 복원
+                  </button>
+                )}
+              </div>
             </div>
 
             {statusLoading && !aiStatus ? (

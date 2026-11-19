@@ -9,10 +9,12 @@ import type {
   AiByokTestRequest,
   AiByokTestResponse,
   AiErrorCategory,
+  AiPlannerErrorDetail,
   AiPlannerRequest,
   AiPlannerResponse,
   AiPreferencesUpdateRequest,
   AiStatusResponse,
+  AiTimeoutSource,
   AiUsageSnapshot,
 } from '../lib/aiTypes';
 
@@ -22,6 +24,7 @@ export class AiClientError extends Error {
   category?: AiErrorCategory;
   detailCode?: string;
   diagnostic?: AiByokTestResponse;
+  errorDetail?: AiPlannerErrorDetail;
 
   constructor(
     status: number,
@@ -30,6 +33,7 @@ export class AiClientError extends Error {
     category?: AiErrorCategory,
     detailCode?: string,
     diagnostic?: AiByokTestResponse,
+    errorDetail?: AiPlannerErrorDetail,
   ) {
     super(message);
     this.name = 'AiClientError';
@@ -38,6 +42,7 @@ export class AiClientError extends Error {
     this.category = category;
     this.detailCode = detailCode;
     this.diagnostic = diagnostic;
+    this.errorDetail = errorDetail;
   }
 }
 
@@ -109,6 +114,15 @@ async function fetchAiJson<T>(
             detailCode?: unknown;
             category?: unknown;
             message?: unknown;
+            model?: unknown;
+            timeoutSource?: unknown;
+            timeoutMs?: unknown;
+            latencyMs?: unknown;
+            firstChunkLatencyMs?: unknown;
+            chunkCount?: unknown;
+            streamed?: unknown;
+            requestId?: unknown;
+            requestEndpoint?: unknown;
           })
         : {};
     const code =
@@ -142,6 +156,42 @@ async function fetchAiJson<T>(
       'apiKeyAuthOk' in payload
         ? (payload as AiByokTestResponse)
         : undefined;
+    const errorDetail: AiPlannerErrorDetail | undefined =
+      typeof errObj.model === 'string' ||
+      typeof errObj.timeoutSource === 'string' ||
+      typeof errObj.timeoutMs === 'number' ||
+      typeof errObj.latencyMs === 'number' ||
+      typeof errObj.chunkCount === 'number' ||
+      typeof errObj.streamed === 'boolean' ||
+      typeof errObj.requestId === 'string'
+        ? {
+            ...(typeof errObj.model === 'string' ? { model: errObj.model } : {}),
+            ...(errObj.timeoutSource === 'local' || errObj.timeoutSource === 'upstream'
+              ? { timeoutSource: errObj.timeoutSource as AiTimeoutSource }
+              : {}),
+            ...(typeof errObj.timeoutMs === 'number'
+              ? { timeoutMs: errObj.timeoutMs }
+              : {}),
+            ...(typeof errObj.latencyMs === 'number'
+              ? { latencyMs: errObj.latencyMs }
+              : {}),
+            ...(typeof errObj.firstChunkLatencyMs === 'number'
+              ? { firstChunkLatencyMs: errObj.firstChunkLatencyMs }
+              : {}),
+            ...(typeof errObj.chunkCount === 'number'
+              ? { chunkCount: errObj.chunkCount }
+              : {}),
+            ...(typeof errObj.streamed === 'boolean'
+              ? { streamed: errObj.streamed }
+              : {}),
+            ...(typeof errObj.requestId === 'string'
+              ? { requestId: errObj.requestId }
+              : {}),
+            ...(typeof errObj.requestEndpoint === 'string'
+              ? { requestEndpoint: errObj.requestEndpoint }
+              : {}),
+          }
+        : undefined;
     throw new AiClientError(
       res.status,
       code,
@@ -149,6 +199,7 @@ async function fetchAiJson<T>(
       category,
       detailCode,
       diagnostic,
+      errorDetail,
     );
   }
 

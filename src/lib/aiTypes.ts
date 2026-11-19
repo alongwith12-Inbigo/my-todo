@@ -80,6 +80,7 @@ export interface AiStatusResponse {
   encryptionConfigured?: boolean;
   serverlessRuntime?: boolean;
   model: string;
+  plannerModel?: string;
   aiEnabled: boolean;
   dailyPlanLimit: number;
   dailyTotalLimit: number;
@@ -87,6 +88,18 @@ export interface AiStatusResponse {
   rateLimitMaxRequests: number;
   rateLimitWindowSeconds: number;
   maxNoticeChars: number;
+}
+
+export interface AiPlannerErrorDetail {
+  model?: string;
+  timeoutSource?: AiTimeoutSource;
+  timeoutMs?: number;
+  latencyMs?: number;
+  firstChunkLatencyMs?: number;
+  chunkCount?: number;
+  streamed?: boolean;
+  requestId?: string;
+  requestEndpoint?: string;
 }
 
 export interface AiByokSaveRequest {
@@ -295,6 +308,7 @@ export interface AiPlannerRequest {
   academicAlertsSummary: string[];
   tasks: MinimalPlannerTask[];
   constraint?: string;
+  modelOverride?: string;
 }
 
 export interface AiPlannerRawRecommendation {

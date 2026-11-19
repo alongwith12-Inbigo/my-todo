@@ -266,6 +266,9 @@ function handleRouteError(
       timeoutSource: err.timeoutSource,
       timeoutMs: err.timeoutMs,
       latencyMs: err.latencyMs,
+      streamed: err.streamed,
+      firstChunkLatencyMs: err.firstChunkLatencyMs,
+      chunkCount: err.chunkCount,
       upstreamHttpStatus: err.upstreamHttpStatus,
       upstreamApiStatus: err.upstreamApiStatus,
       upstreamErrorMessage: err.upstreamErrorMessage,
@@ -279,6 +282,17 @@ function handleRouteError(
         error: err.code,
         category: 'gemini_api' satisfies AiErrorCategory,
         requestId: resolvedReqId,
+        ...(err.model ? { model: err.model } : {}),
+        ...(err.timeoutSource ? { timeoutSource: err.timeoutSource } : {}),
+        ...(typeof err.timeoutMs === 'number' ? { timeoutMs: err.timeoutMs } : {}),
+        ...(typeof err.latencyMs === 'number' ? { latencyMs: err.latencyMs } : {}),
+        ...(typeof err.streamed === 'boolean' ? { streamed: err.streamed } : {}),
+        ...(typeof err.firstChunkLatencyMs === 'number'
+          ? { firstChunkLatencyMs: err.firstChunkLatencyMs }
+          : {}),
+        ...(typeof err.chunkCount === 'number'
+          ? { chunkCount: err.chunkCount }
+          : {}),
         ...(err.diagnosticCategory
           ? { diagnosticCategory: err.diagnosticCategory }
           : {}),
@@ -402,6 +416,7 @@ export async function handleAiStatusRequest(
       encryptionConfigured: persistenceMode === 'encrypted_vault',
       serverlessRuntime: isVercelServerlessRuntime(),
       model: base.model,
+      plannerModel: base.plannerModel,
       aiEnabled: userState.aiEnabled,
       dailyPlanLimit: userState.dailyPlanLimit,
       dailyTotalLimit: userState.dailyTotalLimit,
@@ -1226,6 +1241,28 @@ export async function handleAiPlannerRequest(
       };
     }
 
+    let modelOverride: string | undefined;
+    if (
+      rawBody.modelOverride !== undefined &&
+      rawBody.modelOverride !== null &&
+      String(rawBody.modelOverride).trim().length > 0
+    ) {
+      const modelCheck = validateCandidateModelName(rawBody.modelOverride);
+      if (!modelCheck.ok) {
+        return {
+          status: 400,
+          headers: { 'Cache-Control': 'no-store', 'X-Request-Id': reqId },
+          body: {
+            error: 'invalid_model_name',
+            category: 'input_format' satisfies AiErrorCategory,
+            requestId: reqId,
+            message: modelCheck.message,
+          },
+        };
+      }
+      modelOverride = modelCheck.model;
+    }
+
     if (!acquireUidInFlightLock(user.uid)) {
       return {
         status: 429,
@@ -1275,6 +1312,7 @@ export async function handleAiPlannerRequest(
               .slice(0, AI_LIMITS.MAX_ADJUST_CONSTRAINT_CHARS),
           }
         : {}),
+      ...(modelOverride ? { modelOverride } : {}),
     };
 
     const result = await resolved.generateDayPlan(

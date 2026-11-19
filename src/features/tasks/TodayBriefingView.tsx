@@ -212,6 +212,8 @@ export function TodayBriefingView({
     plannerLoading,
     plannerError,
     plannerErrorCode,
+    plannerErrorDetail,
+    activePlannerModel,
     plannerPlan,
     plannerFilter,
     generatedDataFingerprint,
@@ -521,6 +523,8 @@ export function TodayBriefingView({
           loading={plannerLoading}
           error={plannerError}
           errorCode={plannerErrorCode}
+          errorDetail={plannerErrorDetail}
+          activePlannerModel={activePlannerModel}
           plan={plannerPlan}
           hasPersonalKey={hasPersonalKey}
           aiEnabled={aiEnabled}

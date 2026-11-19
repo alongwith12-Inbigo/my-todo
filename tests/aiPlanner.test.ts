@@ -3346,4 +3346,289 @@ test('planner without responseSchema safely validates malformed/partial JSON and
   }
 });
 
+test('generateDayPlanWithGemini streams chunks cleanly via generateContentStream, ignores thought chunks, and logs stream telemetry', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  const origConsoleInfo = console.info;
+  const infoLogs: string[] = [];
+  console.info = (...args: unknown[]) => {
+    infoLogs.push(args.map((a) => String(a)).join(' '));
+  };
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+
+    let unaryCalled = 0;
+    let streamCalled = 0;
+    let capturedConfig: Record<string, unknown> | undefined;
+
+    const res = await generateDayPlanWithGemini(
+      'AQ.Ab8DummyStreamKey_1234',
+      {
+        todayKey: '2026-11-19',
+        currentTimeHhMm: '09:00',
+        totalIncompleteCount: 2,
+        overdueCount: 0,
+        dueTodayCount: 2,
+        timetableConfigured: true,
+        remainingWorkableMinutes: 60,
+        workableSlots: [{ st: '10:00', et: '11:00', min: 60, lb: '2교시 공강' }],
+        blockedEventsSummary: [],
+        academicAlertsSummary: [],
+        tasks: [
+          { id: 't1', t: '가정통신문 발송', d: '2026-11-19', ov: false, dd: 0, p: 'u', s: 'td', m: 20, tdy: true },
+          { id: 't2', t: '회의록 정리', d: '2026-11-19', ov: false, dd: 0, p: 'n', s: 'td', m: 20, tdy: true },
+        ],
+      },
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async () => {
+            unaryCalled += 1;
+            return { text: '{}' };
+          },
+          generateContentStream: async (params) => {
+            streamCalled += 1;
+            capturedConfig = params.config;
+            async function* gen() {
+              // Thought chunk (text is undefined because SDK filters thought parts)
+              yield { text: undefined };
+              yield { text: '{"coreAdvice":"오전 1교시 직후 공강에 ' };
+              yield { text: '가정통신문을 먼저 발송하세요.","strategies":[{"taskId":"t1",' };
+              yield {
+                text: '"strategy":"초안 검토 후 학급 일괄 발송"}]}',
+                candidates: [{ finishReason: 'STOP' }],
+                usageMetadata: {
+                  promptTokenCount: 140,
+                  candidatesTokenCount: 48,
+                  thoughtsTokenCount: 22,
+                  totalTokenCount: 210,
+                },
+              };
+            }
+            return gen();
+          },
+        },
+      },
+      'req_planner_stream_ok',
+    );
+
+    assert.equal(streamCalled, 1);
+    assert.equal(unaryCalled, 0);
+    assert.equal(capturedConfig?.maxOutputTokens, 1024);
+    assert.equal(capturedConfig?.responseMimeType, 'application/json');
+    assert.equal(res.model, 'gemini-3.8-flash');
+    assert.equal(
+      res.rawPlan.coreAdvice,
+      '오전 1교시 직후 공강에 가정통신문을 먼저 발송하세요.',
+    );
+    assert.equal(res.rawPlan.strategies?.length, 1);
+    assert.equal(res.usage?.totalTokens, 210);
+
+    const startLog = infoLogs.find((l) => l.includes('gemini_planner_attempt_started'));
+    const doneLog = infoLogs.find((l) => l.includes('gemini_planner_completed'));
+    assert.ok(startLog?.includes('"streamMode":true'));
+    assert.ok(doneLog?.includes('"chunkCount":4'));
+    assert.ok(doneLog?.includes('"streamMode":true'));
+  } finally {
+    console.info = origConsoleInfo;
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
+test('generateDayPlanWithGemini recovers complete streamed JSON on tail LocalTimeoutError and fails safely with diagnostics on 0-chunk timeout', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+
+    const sampleInput = {
+      todayKey: '2026-11-19',
+      currentTimeHhMm: '09:00',
+      totalIncompleteCount: 1,
+      overdueCount: 0,
+      dueTodayCount: 1,
+      timetableConfigured: true,
+      remainingWorkableMinutes: 40,
+      workableSlots: [{ st: '10:00', et: '10:40', min: 40, lb: '공강' }],
+      blockedEventsSummary: [],
+      academicAlertsSummary: [],
+      tasks: [
+        { id: 't1', t: '공문 결재 확인', d: '2026-11-19', ov: false, dd: 0, p: 'u' as const, s: 'td' as const, m: 20, tdy: true },
+      ],
+    };
+
+    // 1. Tail stall after valid complete JSON was streamed -> recover without error
+    const recovered = await generateDayPlanWithGemini(
+      'AQ.Ab8DummyTailRecover_1234',
+      sampleInput,
+      undefined,
+      {
+        models: {
+          list: async () => ({ page: [] }),
+          generateContent: async () => ({ text: '{}' }),
+          generateContentStream: async () => {
+            async function* gen() {
+              yield {
+                text: JSON.stringify({
+                  coreAdvice: '오전 공강 시작 즉시 공문 결재를 처리하세요.',
+                  strategies: [{ taskId: 't1', strategy: '첨부 서류 체크 후 바로 결재 상신' }],
+                }),
+                usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 32, totalTokenCount: 132 },
+              };
+              throw Object.assign(new Error('Request timed out'), { name: 'LocalTimeoutError' });
+            }
+            return gen();
+          },
+        },
+      },
+      'req_tail_recover',
+    );
+    assert.equal(recovered.rawPlan.coreAdvice, '오전 공강 시작 즉시 공문 결재를 처리하세요.');
+    assert.equal(recovered.rawPlan.strategies?.length, 1);
+
+    // 2. 0-chunk local timeout propagates model, timeoutSource, chunkCount, streamed in GeminiServiceError & HTTP 504 response
+    let capturedErr: unknown;
+    try {
+      await generateDayPlanWithGemini(
+        'AQ.Ab8DummyZeroChunk_1234',
+        sampleInput,
+        undefined,
+        {
+          models: {
+            list: async () => ({ page: [] }),
+            generateContent: async () => ({ text: '{}' }),
+            generateContentStream: async () => {
+              throw Object.assign(new Error('Request timed out'), { name: 'LocalTimeoutError' });
+            },
+          },
+        },
+        'req_zero_chunk_timeout',
+      );
+    } catch (err) {
+      capturedErr = err;
+    }
+
+    assert.ok(capturedErr instanceof GeminiServiceError);
+    assert.equal(capturedErr.status, 504);
+    assert.equal(capturedErr.code, 'ai_timeout');
+    assert.equal(capturedErr.model, 'gemini-3.8-flash');
+    assert.equal(capturedErr.timeoutSource, 'local');
+    assert.equal(capturedErr.timeoutMs, 45000);
+    assert.equal(capturedErr.streamed, true);
+    assert.equal(capturedErr.chunkCount, 0);
+    assert.equal(
+      capturedErr.requestEndpoint,
+      'models/gemini-3.8-flash:streamGenerateContent',
+    );
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
+test('handleAiStatusRequest exposes plannerModel and handleAiPlannerRequest validates modelOverride & surfaces 504 diagnostic metadata without leaking secrets', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  const prevPlannerModel = process.env.GEMINI_PLANNER_MODEL;
+  try {
+    process.env.GEMINI_MODEL = 'gemini-4-hydrogen';
+    process.env.GEMINI_PLANNER_MODEL = 'gemini-3.8-flash';
+
+    const statusRes = await handleAiStatusRequest('Bearer token', {
+      verifyAuth: async () => ({
+        uid: 'u-status',
+        email: 'teacher@school.kr',
+        accessStatus: 'active',
+        role: 'teacher',
+        emailVerified: true,
+      }),
+      isConfigured: () => true,
+    });
+    assert.equal(statusRes.status, 200);
+    const statusBody = statusRes.body as { model: string; plannerModel?: string };
+    assert.equal(statusBody.model, 'gemini-4-hydrogen');
+    assert.equal(statusBody.plannerModel, 'gemini-3.8-flash');
+
+    const basePlannerBody = {
+      todayKey: '2026-11-19',
+      currentTimeHhMm: '09:00',
+      tasks: [
+        { id: 't1', t: '업무 1', d: '2026-11-19', ov: false, dd: 0, p: 'u', s: 'td', m: 20, tdy: true },
+      ],
+    };
+
+    // Invalid modelOverride -> 400
+    const badModelRes = await handleAiPlannerRequest(
+      {
+        authorizationHeader: 'Bearer token',
+        body: { ...basePlannerBody, modelOverride: 'gemini-1.5-pro' },
+      },
+      {
+        verifyAuth: async () => ({
+          uid: 'u-override',
+          email: 'teacher@school.kr',
+          accessStatus: 'active',
+          role: 'teacher',
+          emailVerified: true,
+        }),
+        isConfigured: () => true,
+      },
+    );
+    assert.equal(badModelRes.status, 400);
+    assert.equal((badModelRes.body as { error: string }).error, 'invalid_model_name');
+
+    // Valid modelOverride -> forwarded to generateDayPlan and propagates 504 diagnostics safely
+    let forwardedOverride: string | undefined;
+    const timeoutRes = await handleAiPlannerRequest(
+      {
+        authorizationHeader: 'Bearer token',
+        body: { ...basePlannerBody, modelOverride: 'gemini-3.1-flash-lite' },
+      },
+      {
+        verifyAuth: async () => ({
+          uid: 'u-override-ok',
+          email: 'teacher@school.kr',
+          accessStatus: 'active',
+          role: 'teacher',
+          emailVerified: true,
+        }),
+        isConfigured: () => true,
+        generateDayPlan: async (input) => {
+          forwardedOverride = input.modelOverride;
+          throw new GeminiServiceError(504, 'ai_timeout', '로컬 제한 시간 초과', {
+            model: input.modelOverride,
+            timeoutSource: 'local',
+            timeoutMs: 45000,
+            latencyMs: 45001,
+            streamed: true,
+            chunkCount: 0,
+            requestEndpoint: `models/${input.modelOverride}:streamGenerateContent`,
+          });
+        },
+      },
+    );
+
+    assert.equal(forwardedOverride, 'gemini-3.1-flash-lite');
+    assert.equal(timeoutRes.status, 504);
+    const errBody = timeoutRes.body as Record<string, unknown>;
+    assert.equal(errBody.error, 'ai_timeout');
+    assert.equal(errBody.model, 'gemini-3.1-flash-lite');
+    assert.equal(errBody.timeoutSource, 'local');
+    assert.equal(errBody.timeoutMs, 45000);
+    assert.equal(errBody.latencyMs, 45001);
+    assert.equal(errBody.streamed, true);
+    assert.equal(errBody.chunkCount, 0);
+    assert.equal(JSON.stringify(errBody).includes('test-injected-key'), false);
+  } finally {
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+    if (prevPlannerModel === undefined) delete process.env.GEMINI_PLANNER_MODEL;
+    else process.env.GEMINI_PLANNER_MODEL = prevPlannerModel;
+  }
+});
+
+
 

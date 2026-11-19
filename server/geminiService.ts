@@ -28,6 +28,7 @@ import {
   getGeminiPlannerModelName,
   logAiServerDiagnostic,
   mapGeminiError,
+  resolveEffectivePlannerModel,
   toCompatibilitySummary,
   type MappedGeminiError,
 } from './aiConfig.ts';
@@ -252,6 +253,10 @@ export class GeminiServiceError extends Error {
   model?: string;
   timeoutMs?: number;
   latencyMs?: number;
+  streamed?: boolean;
+  firstChunkLatencyMs?: number;
+  chunkCount?: number;
+  streamedChars?: number;
   upstreamHttpStatus?: number;
   upstreamApiStatus?: string;
   upstreamErrorMessage?: string;
@@ -271,6 +276,10 @@ export class GeminiServiceError extends Error {
       model?: string;
       timeoutMs?: number;
       latencyMs?: number;
+      streamed?: boolean;
+      firstChunkLatencyMs?: number;
+      chunkCount?: number;
+      streamedChars?: number;
       upstreamHttpStatus?: number;
       upstreamApiStatus?: string;
       upstreamErrorMessage?: string;
@@ -290,6 +299,10 @@ export class GeminiServiceError extends Error {
     this.model = extra?.model;
     this.timeoutMs = extra?.timeoutMs;
     this.latencyMs = extra?.latencyMs;
+    this.streamed = extra?.streamed;
+    this.firstChunkLatencyMs = extra?.firstChunkLatencyMs;
+    this.chunkCount = extra?.chunkCount;
+    this.streamedChars = extra?.streamedChars;
     this.upstreamHttpStatus = extra?.upstreamHttpStatus;
     this.upstreamApiStatus = extra?.upstreamApiStatus;
     this.upstreamErrorMessage = extra?.upstreamErrorMessage;
@@ -310,6 +323,10 @@ function toServiceError(
     model?: string;
     timeoutMs?: number;
     latencyMs?: number;
+    streamed?: boolean;
+    firstChunkLatencyMs?: number;
+    chunkCount?: number;
+    streamedChars?: number;
     availableGenerateModels?: string[];
     recommendedModel?: string | null;
   },
@@ -320,6 +337,10 @@ function toServiceError(
     model: extra?.model,
     timeoutMs: extra?.timeoutMs,
     latencyMs: extra?.latencyMs,
+    streamed: extra?.streamed,
+    firstChunkLatencyMs: extra?.firstChunkLatencyMs,
+    chunkCount: extra?.chunkCount,
+    streamedChars: extra?.streamedChars,
     upstreamHttpStatus: mapped.upstreamHttpStatus,
     upstreamApiStatus: mapped.upstreamApiStatus,
     upstreamErrorMessage: mapped.upstreamErrorMessage,
@@ -360,6 +381,17 @@ export function buildThinkingConfigForModel(
   return undefined;
 }
 
+export interface GeminiStreamChunkLike {
+  text?: string;
+  candidates?: Array<{ finishReason?: string }>;
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    thoughtsTokenCount?: number;
+    totalTokenCount?: number;
+  };
+}
+
 export interface GeminiTestClientLike {
   models: {
     list: (params?: { config?: { pageSize?: number } }) => Promise<{
@@ -379,6 +411,11 @@ export interface GeminiTestClientLike {
         totalTokenCount?: number;
       };
     }>;
+    generateContentStream?: (params: {
+      model: string;
+      contents: string;
+      config?: Record<string, unknown>;
+    }) => Promise<AsyncIterable<GeminiStreamChunkLike>>;
   };
 }
 
@@ -618,9 +655,14 @@ async function getCachedOrFetchModelList(params: {
   };
 }
 
-function buildGenerateEndpointPath(modelName: string): string {
+function buildGenerateEndpointPath(
+  modelName: string,
+  streamed = false,
+): string {
   const short = modelName.replace(/^models\//, '').trim();
-  return `models/${short}:generateContent`;
+  return streamed
+    ? `models/${short}:streamGenerateContent`
+    : `models/${short}:generateContent`;
 }
 
 /**
@@ -1065,6 +1107,47 @@ export function parseGeminiJsonResponse<T extends object>(params: {
   }
 }
 
+interface GeminiAttemptTelemetry {
+  streamed: boolean;
+  firstChunkLatencyMs?: number;
+  chunkCount: number;
+  streamedChars: number;
+  endpoint: string;
+}
+
+function isLocalTimeoutErrorInstance(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (err.name === 'LocalTimeoutError' || err.message === 'Request timed out')
+  );
+}
+
+function tryRecoverCompletePlannerJsonFromStream(rawText: string): boolean {
+  const cleaned = stripJsonCodeFence(rawText);
+  if (!cleaned) return false;
+  try {
+    const parsed = JSON.parse(cleaned) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return false;
+    }
+    const hasCoreAdvice =
+      typeof parsed.coreAdvice === 'string' && parsed.coreAdvice.trim().length > 0;
+    const hasStrategies =
+      Array.isArray(parsed.strategies) &&
+      parsed.strategies.some(
+        (item) =>
+          item &&
+          typeof item === 'object' &&
+          typeof (item as { taskId?: unknown }).taskId === 'string' &&
+          typeof (item as { strategy?: unknown }).strategy === 'string' &&
+          (item as { strategy: string }).strategy.trim().length > 0,
+      );
+    return hasCoreAdvice || hasStrategies;
+  } catch {
+    return false;
+  }
+}
+
 async function generateContentWithModelResolution(params: {
   ai: GeminiTestClientLike;
   apiKey: string;
@@ -1089,9 +1172,9 @@ async function generateContentWithModelResolution(params: {
       totalTokenCount?: number;
     };
   };
+  telemetry: GeminiAttemptTelemetry;
 }> {
   const apiVersion = getEffectiveGeminiApiVersion();
-  const requestEndpoint = buildGenerateEndpointPath(params.configuredModel);
   const requestId = params.requestId ?? generateSafeRequestId();
   const keyHash = hashKeyForCache(params.apiKey || 'override');
   const resolvedCacheKey = `${keyHash}:${apiVersion}:${params.configuredModel}`;
@@ -1113,6 +1196,175 @@ async function generateContentWithModelResolution(params: {
     };
   };
 
+  const executeAttempt = async (
+    targetClient: GeminiTestClientLike,
+    omitThinkingConfig: boolean,
+    budgetMs: number,
+  ): Promise<{
+    response: {
+      text?: string;
+      candidates?: Array<{ finishReason?: string }>;
+      usageMetadata?: {
+        promptTokenCount?: number;
+        candidatesTokenCount?: number;
+        thoughtsTokenCount?: number;
+        totalTokenCount?: number;
+      };
+    };
+    telemetry: GeminiAttemptTelemetry;
+  }> => {
+    const useStream =
+      params.operation === 'planner' &&
+      typeof targetClient.models.generateContentStream === 'function';
+    const endpoint = buildGenerateEndpointPath(params.configuredModel, useStream);
+    const telemetry: GeminiAttemptTelemetry = {
+      streamed: useStream,
+      chunkCount: 0,
+      streamedChars: 0,
+      endpoint,
+    };
+
+    if (!useStream) {
+      const response = await runWithTimeoutAndAbort(
+        (attemptSignal) =>
+          targetClient.models.generateContent({
+            model: params.configuredModel,
+            contents: params.contents,
+            config: buildConfigFor(
+              params.configuredModel,
+              omitThinkingConfig,
+              attemptSignal,
+            ),
+          }),
+        budgetMs,
+        params.signal,
+      );
+      return { response, telemetry };
+    }
+
+    const attemptStartedAt = Date.now();
+    let accumulatedText = '';
+    let lastFinishReason: string | undefined;
+    let lastUsageMetadata:
+      | {
+          promptTokenCount?: number;
+          candidatesTokenCount?: number;
+          thoughtsTokenCount?: number;
+          totalTokenCount?: number;
+        }
+      | undefined;
+
+    try {
+      const response = await runWithTimeoutAndAbort(
+        async (attemptSignal) => {
+          const stream = await targetClient.models.generateContentStream!({
+            model: params.configuredModel,
+            contents: params.contents,
+            config: buildConfigFor(
+              params.configuredModel,
+              omitThinkingConfig,
+              attemptSignal,
+            ),
+          });
+          const closeStream = async () => {
+            const ret = (stream as { return?: () => Promise<unknown> }).return;
+            if (typeof ret === 'function') {
+              try {
+                await ret.call(stream);
+              } catch {
+                // ignore stream teardown errors
+              }
+            }
+          };
+          try {
+            for await (const chunk of stream) {
+              if (attemptSignal.aborted) break;
+              telemetry.chunkCount += 1;
+              if (telemetry.firstChunkLatencyMs === undefined) {
+                telemetry.firstChunkLatencyMs = Math.max(
+                  1,
+                  Date.now() - attemptStartedAt,
+                );
+              }
+              if (typeof chunk?.text === 'string' && chunk.text.length > 0) {
+                accumulatedText += chunk.text;
+                telemetry.streamedChars = accumulatedText.length;
+              }
+              const chunkFinish = chunk?.candidates?.[0]?.finishReason;
+              if (chunkFinish) {
+                lastFinishReason = chunkFinish;
+              }
+              if (chunk?.usageMetadata) {
+                lastUsageMetadata = chunk.usageMetadata;
+              }
+            }
+          } finally {
+            await closeStream();
+          }
+          return {
+            text: accumulatedText,
+            ...(lastFinishReason
+              ? { candidates: [{ finishReason: lastFinishReason }] }
+              : {}),
+            ...(lastUsageMetadata ? { usageMetadata: lastUsageMetadata } : {}),
+          };
+        },
+        budgetMs,
+        params.signal,
+      );
+      return { response, telemetry };
+    } catch (err) {
+      if (
+        isLocalTimeoutErrorInstance(err) &&
+        tryRecoverCompletePlannerJsonFromStream(accumulatedText)
+      ) {
+        logAiServerDiagnostic('info', 'gemini_planner_stream_recovered_on_tail_timeout', {
+          requestId,
+          operation: params.operation ?? 'unknown',
+          model: params.configuredModel,
+          chunkCount: telemetry.chunkCount,
+          firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+          streamedChars: telemetry.streamedChars,
+          latencyMs: Math.max(1, Date.now() - attemptStartedAt),
+        });
+        return {
+          response: {
+            text: accumulatedText,
+            ...(lastFinishReason
+              ? { candidates: [{ finishReason: lastFinishReason }] }
+              : {}),
+            ...(lastUsageMetadata ? { usageMetadata: lastUsageMetadata } : {}),
+          },
+          telemetry,
+        };
+      }
+      if (err && typeof err === 'object') {
+        Object.assign(err, { _geminiTelemetry: telemetry });
+      }
+      throw err;
+    }
+  };
+
+  const extractErrorTelemetry = (err: unknown): GeminiAttemptTelemetry => {
+    if (
+      err &&
+      typeof err === 'object' &&
+      '_geminiTelemetry' in err &&
+      (err as { _geminiTelemetry?: GeminiAttemptTelemetry })._geminiTelemetry
+    ) {
+      return (err as { _geminiTelemetry: GeminiAttemptTelemetry })._geminiTelemetry;
+    }
+    const useStream =
+      params.operation === 'planner' &&
+      typeof params.ai.models.generateContentStream === 'function';
+    return {
+      streamed: useStream,
+      chunkCount: 0,
+      streamedChars: 0,
+      endpoint: buildGenerateEndpointPath(params.configuredModel, useStream),
+    };
+  };
+
   // Reuse cached API version / thinkingConfig compatibility ONLY for the configured model (never switch models silently)
   const cachedResolved = resolvedModelCache.get(resolvedCacheKey);
   if (
@@ -1127,32 +1379,28 @@ async function generateContentWithModelResolution(params: {
         : params.ai;
     const cachedStartedAt = Date.now();
     try {
-      const response = await runWithTimeoutAndAbort(
-        (attemptSignal) =>
-          targetClient.models.generateContent({
-            model: params.configuredModel,
-            contents: params.contents,
-            config: buildConfigFor(
-              params.configuredModel,
-              Boolean(cachedResolved.omitThinkingConfig),
-              attemptSignal,
-            ),
-          }),
+      const { response, telemetry } = await executeAttempt(
+        targetClient,
+        Boolean(cachedResolved.omitThinkingConfig),
         params.timeoutMs,
-        params.signal,
       );
-      return { model: params.configuredModel, response };
+      return { model: params.configuredModel, response, telemetry };
     } catch (err) {
       resolvedModelCache.delete(resolvedCacheKey);
       if (err instanceof GeminiServiceError) throw err;
       const attemptLatencyMs = Math.max(1, Date.now() - cachedStartedAt);
       const mappedCached = mapGeminiError(err, params.configuredModel);
+      const telemetry = extractErrorTelemetry(err);
       logAiServerDiagnostic('warn', 'gemini_cached_compat_attempt_failed', {
         requestId,
         operation: params.operation ?? 'unknown',
         model: params.configuredModel,
         apiVersion: cachedResolved.resolvedApiVersion,
-        requestEndpoint,
+        requestEndpoint: telemetry.endpoint,
+        streamed: telemetry.streamed,
+        firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+        chunkCount: telemetry.chunkCount,
+        streamedChars: telemetry.streamedChars,
         errorCode: mappedCached.code,
         diagnosticCategory: mappedCached.diagnosticCategory,
         timeoutSource: mappedCached.timeoutSource,
@@ -1165,39 +1413,43 @@ async function generateContentWithModelResolution(params: {
       throw toServiceError(mappedCached, {
         requestId,
         requestApiVersion: cachedResolved.resolvedApiVersion,
-        requestEndpoint,
+        requestEndpoint: telemetry.endpoint,
         model: params.configuredModel,
         timeoutMs: params.timeoutMs,
         latencyMs: attemptLatencyMs,
+        streamed: telemetry.streamed,
+        firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+        chunkCount: telemetry.chunkCount,
+        streamedChars: telemetry.streamedChars,
       });
     }
   }
 
   const startedAt = Date.now();
   try {
-    const response = await runWithTimeoutAndAbort(
-      (attemptSignal) =>
-        params.ai.models.generateContent({
-          model: params.configuredModel,
-          contents: params.contents,
-          config: buildConfigFor(params.configuredModel, false, attemptSignal),
-        }),
+    const { response, telemetry } = await executeAttempt(
+      params.ai,
+      false,
       params.timeoutMs,
-      params.signal,
     );
-    return { model: params.configuredModel, response };
+    return { model: params.configuredModel, response, telemetry };
   } catch (err) {
     if (err instanceof GeminiServiceError) throw err;
     const attemptLatencyMs = Math.max(1, Date.now() - startedAt);
     const mapped = mapGeminiError(err, params.configuredModel);
     const lowerUpstream = (mapped.upstreamErrorMessage ?? '').toLowerCase();
+    const telemetry = extractErrorTelemetry(err);
 
     logAiServerDiagnostic('warn', 'gemini_generate_attempt_failed', {
       requestId,
       operation: params.operation ?? 'unknown',
       model: params.configuredModel,
       apiVersion,
-      requestEndpoint,
+      requestEndpoint: telemetry.endpoint,
+      streamed: telemetry.streamed,
+      firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+      chunkCount: telemetry.chunkCount,
+      streamedChars: telemetry.streamedChars,
       errorCode: mapped.code,
       diagnosticCategory: mapped.diagnosticCategory,
       timeoutSource: mapped.timeoutSource,
@@ -1219,10 +1471,14 @@ async function generateContentWithModelResolution(params: {
         throw toServiceError(mapped, {
           requestId,
           requestApiVersion: apiVersion,
-          requestEndpoint,
+          requestEndpoint: telemetry.endpoint,
           model: params.configuredModel,
           timeoutMs: params.timeoutMs,
           latencyMs: attemptLatencyMs,
+          streamed: telemetry.streamed,
+          firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+          chunkCount: telemetry.chunkCount,
+          streamedChars: telemetry.streamedChars,
         });
       }
 
@@ -1230,36 +1486,32 @@ async function generateContentWithModelResolution(params: {
         const betaStartedAt = Date.now();
         try {
           const betaClient = createGeminiClient(params.apiKey, 'v1beta');
-          const betaResponse = await runWithTimeoutAndAbort(
-            (attemptSignal) =>
-              betaClient.models.generateContent({
-                model: params.configuredModel,
-                contents: params.contents,
-                config: buildConfigFor(
-                  params.configuredModel,
-                  false,
-                  attemptSignal,
-                ),
-              }),
-            remainingMs,
-            params.signal,
-          );
+          const { response: betaResponse, telemetry: betaTelemetry } =
+            await executeAttempt(betaClient, false, remainingMs);
           setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
             expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
             resolvedModel: params.configuredModel,
             resolvedApiVersion: 'v1beta',
           });
-          return { model: params.configuredModel, response: betaResponse };
+          return {
+            model: params.configuredModel,
+            response: betaResponse,
+            telemetry: betaTelemetry,
+          };
         } catch (betaErr) {
           if (betaErr instanceof GeminiServiceError) throw betaErr;
           const betaLatencyMs = Math.max(1, Date.now() - betaStartedAt);
           const betaMapped = mapGeminiError(betaErr, params.configuredModel);
+          const betaTelemetry = extractErrorTelemetry(betaErr);
           logAiServerDiagnostic('warn', 'gemini_thinking_compat_retry_failed', {
             requestId,
             operation: params.operation ?? 'unknown',
             model: params.configuredModel,
             fromApiVersion: apiVersion,
             toApiVersion: 'v1beta',
+            streamed: betaTelemetry.streamed,
+            firstChunkLatencyMs: betaTelemetry.firstChunkLatencyMs,
+            chunkCount: betaTelemetry.chunkCount,
             errorCode: betaMapped.code,
             timeoutSource: betaMapped.timeoutSource,
             timeoutMs: remainingMs,
@@ -1271,43 +1523,47 @@ async function generateContentWithModelResolution(params: {
           throw toServiceError(betaMapped, {
             requestId,
             requestApiVersion: 'v1beta',
-            requestEndpoint,
+            requestEndpoint: betaTelemetry.endpoint,
             model: params.configuredModel,
             timeoutMs: params.timeoutMs,
             latencyMs: Math.max(1, Date.now() - startedAt),
+            streamed: betaTelemetry.streamed,
+            firstChunkLatencyMs: betaTelemetry.firstChunkLatencyMs,
+            chunkCount: betaTelemetry.chunkCount,
+            streamedChars: betaTelemetry.streamedChars,
           });
         }
       }
 
       const plainStartedAt = Date.now();
       try {
-        const plainResponse = await runWithTimeoutAndAbort(
-          (attemptSignal) =>
-            params.ai.models.generateContent({
-              model: params.configuredModel,
-              contents: params.contents,
-              config: buildConfigFor(params.configuredModel, true, attemptSignal),
-            }),
-          remainingMs,
-          params.signal,
-        );
+        const { response: plainResponse, telemetry: plainTelemetry } =
+          await executeAttempt(params.ai, true, remainingMs);
         setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
           expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
           resolvedModel: params.configuredModel,
           resolvedApiVersion: apiVersion,
           omitThinkingConfig: true,
         });
-        return { model: params.configuredModel, response: plainResponse };
+        return {
+          model: params.configuredModel,
+          response: plainResponse,
+          telemetry: plainTelemetry,
+        };
       } catch (plainErr) {
         if (plainErr instanceof GeminiServiceError) throw plainErr;
         const plainLatencyMs = Math.max(1, Date.now() - plainStartedAt);
         const plainMapped = mapGeminiError(plainErr, params.configuredModel);
+        const plainTelemetry = extractErrorTelemetry(plainErr);
         logAiServerDiagnostic('warn', 'gemini_thinking_compat_retry_failed', {
           requestId,
           operation: params.operation ?? 'unknown',
           model: params.configuredModel,
           apiVersion,
           omitThinkingConfig: true,
+          streamed: plainTelemetry.streamed,
+          firstChunkLatencyMs: plainTelemetry.firstChunkLatencyMs,
+          chunkCount: plainTelemetry.chunkCount,
           errorCode: plainMapped.code,
           timeoutSource: plainMapped.timeoutSource,
           timeoutMs: remainingMs,
@@ -1319,10 +1575,14 @@ async function generateContentWithModelResolution(params: {
         throw toServiceError(plainMapped, {
           requestId,
           requestApiVersion: apiVersion,
-          requestEndpoint,
+          requestEndpoint: plainTelemetry.endpoint,
           model: params.configuredModel,
           timeoutMs: params.timeoutMs,
           latencyMs: Math.max(1, Date.now() - startedAt),
+          streamed: plainTelemetry.streamed,
+          firstChunkLatencyMs: plainTelemetry.firstChunkLatencyMs,
+          chunkCount: plainTelemetry.chunkCount,
+          streamedChars: plainTelemetry.streamedChars,
         });
       }
     }
@@ -1335,10 +1595,14 @@ async function generateContentWithModelResolution(params: {
       throw toServiceError(mapped, {
         requestId,
         requestApiVersion: apiVersion,
-        requestEndpoint,
+        requestEndpoint: telemetry.endpoint,
         model: params.configuredModel,
         timeoutMs: params.timeoutMs,
         latencyMs: attemptLatencyMs,
+        streamed: telemetry.streamed,
+        firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+        chunkCount: telemetry.chunkCount,
+        streamedChars: telemetry.streamedChars,
       });
     }
 
@@ -1355,30 +1619,23 @@ async function generateContentWithModelResolution(params: {
         const betaStartedAt = Date.now();
         try {
           const betaClient = createGeminiClient(params.apiKey, 'v1beta');
-          const betaResponse = await runWithTimeoutAndAbort(
-            (attemptSignal) =>
-              betaClient.models.generateContent({
-                model: params.configuredModel,
-                contents: params.contents,
-                config: buildConfigFor(
-                  params.configuredModel,
-                  false,
-                  attemptSignal,
-                ),
-              }),
-            remainingMs,
-            params.signal,
-          );
+          const { response: betaResponse, telemetry: betaTelemetry } =
+            await executeAttempt(betaClient, false, remainingMs);
           setBoundedCacheEntry(resolvedModelCache, resolvedCacheKey, {
             expiresAt: Date.now() + MODEL_CACHE_TTL_MS,
             resolvedModel: params.configuredModel,
             resolvedApiVersion: 'v1beta',
           });
-          return { model: params.configuredModel, response: betaResponse };
+          return {
+            model: params.configuredModel,
+            response: betaResponse,
+            telemetry: betaTelemetry,
+          };
         } catch (betaErr) {
           if (betaErr instanceof GeminiServiceError) throw betaErr;
           const betaLatencyMs = Math.max(1, Date.now() - betaStartedAt);
           const betaMapped = mapGeminiError(betaErr, params.configuredModel);
+          const betaTelemetry = extractErrorTelemetry(betaErr);
           logAiServerDiagnostic('warn', 'gemini_api_version_retry_failed', {
             requestId,
             operation: params.operation ?? 'unknown',
@@ -1399,10 +1656,14 @@ async function generateContentWithModelResolution(params: {
             throw toServiceError(betaMapped, {
               requestId,
               requestApiVersion: 'v1beta',
-              requestEndpoint,
+              requestEndpoint: betaTelemetry.endpoint,
               model: params.configuredModel,
               timeoutMs: params.timeoutMs,
               latencyMs: Math.max(1, Date.now() - startedAt),
+              streamed: betaTelemetry.streamed,
+              firstChunkLatencyMs: betaTelemetry.firstChunkLatencyMs,
+              chunkCount: betaTelemetry.chunkCount,
+              streamedChars: betaTelemetry.streamedChars,
             });
           }
         }
@@ -1434,7 +1695,7 @@ async function generateContentWithModelResolution(params: {
       operation: params.operation ?? 'unknown',
       model: params.configuredModel,
       apiVersion,
-      requestEndpoint,
+      requestEndpoint: telemetry.endpoint,
       upstreamHttpStatus: mapped.upstreamHttpStatus,
       upstreamApiStatus: mapped.upstreamApiStatus,
       upstreamErrorMessage: mapped.upstreamErrorMessage,
@@ -1460,13 +1721,14 @@ async function generateContentWithModelResolution(params: {
       mapped.code,
       `${mapped.message}${modelHint}`,
       {
+        model: params.configuredModel,
         diagnosticCategory: mapped.diagnosticCategory,
         upstreamHttpStatus: mapped.upstreamHttpStatus,
         upstreamApiStatus: mapped.upstreamApiStatus,
         upstreamErrorMessage: mapped.upstreamErrorMessage,
         requestId,
         requestApiVersion: apiVersion,
-        requestEndpoint,
+        requestEndpoint: telemetry.endpoint,
         availableGenerateModels: availableList,
         recommendedModel: recommended,
       },
@@ -1661,7 +1923,19 @@ export async function generateDayPlanWithGemini(
 ): Promise<AiPlannerResponse> {
   const reqId = requestId ?? generateSafeRequestId();
   const cleanApiKey = normalizeGeminiApiKeyInput(apiKey);
-  const configuredModel = getGeminiPlannerModelName();
+  const modelResolution = resolveEffectivePlannerModel(input.modelOverride);
+  if (!modelResolution.ok) {
+    throw new GeminiServiceError(
+      400,
+      'invalid_model_name',
+      modelResolution.message,
+      {
+        diagnosticCategory: 'invalid_request_format',
+        requestId: reqId,
+      },
+    );
+  }
+  const configuredModel = modelResolution.model;
   const apiVersion = getEffectiveGeminiApiVersion();
   const ai = clientOverride ?? createGeminiClient(apiKey);
 
@@ -1720,11 +1994,13 @@ export async function generateDayPlanWithGemini(
         : 'none';
   const responseMimeType = 'application/json';
   const hasResponseSchema = false;
+  const streamMode = typeof ai.models.generateContentStream === 'function';
 
   logAiServerDiagnostic('info', 'gemini_planner_attempt_started', {
     requestId: reqId,
     operation: 'planner',
     model: configuredModel,
+    modelOverrideApplied: configuredModel !== getGeminiPlannerModelName(),
     apiVersion:
       compatCacheHit && cachedCompat
         ? cachedCompat.resolvedApiVersion
@@ -1734,12 +2010,13 @@ export async function generateDayPlanWithGemini(
     thinkingConfigSummary,
     hasResponseSchema,
     responseMimeType,
+    streamMode,
     compatCacheHit,
     promptChars: prompt.length,
     inputTaskCount: adviceTasks.length,
   });
 
-  const { model, response } = await generateContentWithModelResolution({
+  const { model, response, telemetry } = await generateContentWithModelResolution({
     ai,
     apiKey: cleanApiKey,
     hasClientOverride: Boolean(clientOverride),
@@ -1804,6 +2081,8 @@ export async function generateDayPlanWithGemini(
       requestId: reqId,
       operation: 'planner',
       model,
+      streamMode: telemetry.streamed,
+      chunkCount: telemetry.chunkCount,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       thoughtTokens: usage.thoughtTokens,
@@ -1816,6 +2095,10 @@ export async function generateDayPlanWithGemini(
         diagnosticCategory: 'server_error',
         requestId: reqId,
         model,
+        streamed: telemetry.streamed,
+        firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+        chunkCount: telemetry.chunkCount,
+        streamedChars: telemetry.streamedChars,
       },
     );
   }
@@ -1824,6 +2107,10 @@ export async function generateDayPlanWithGemini(
     requestId: reqId,
     operation: 'planner',
     model,
+    streamMode: telemetry.streamed,
+    firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
+    chunkCount: telemetry.chunkCount,
+    streamedChars: telemetry.streamedChars,
     latencyMs: Math.max(1, Date.now() - startedAt),
     timeoutMs: plannerOpSettings.timeoutMs,
     promptChars: prompt.length,

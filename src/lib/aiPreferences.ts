@@ -47,3 +47,61 @@ export function subscribeAiEnabledChange(
     window.removeEventListener(AI_PREF_CHANGED_EVENT, handler);
   };
 }
+
+const PLANNER_MODEL_STORAGE_PREFIX = 'school_partner_ai_planner_model_v1_';
+const PLANNER_MODEL_CHANGED_EVENT = 'school-partner:planner-model-changed';
+
+export function getStoredPreferredPlannerModel(
+  uid: string | undefined | null,
+): string | null {
+  if (!uid || typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(`${PLANNER_MODEL_STORAGE_PREFIX}${uid}`);
+    const trimmed = raw?.trim();
+    return trimmed ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredPreferredPlannerModel(
+  uid: string | undefined | null,
+  model: string | null,
+): void {
+  if (!uid || typeof window === 'undefined') return;
+  const clean = model?.replace(/^models\//, '').trim() || null;
+  try {
+    if (clean) {
+      window.localStorage.setItem(`${PLANNER_MODEL_STORAGE_PREFIX}${uid}`, clean);
+    } else {
+      window.localStorage.removeItem(`${PLANNER_MODEL_STORAGE_PREFIX}${uid}`);
+    }
+    window.dispatchEvent(
+      new CustomEvent(PLANNER_MODEL_CHANGED_EVENT, {
+        detail: { uid, model: clean },
+      }),
+    );
+  } catch {
+    // Ignore storage quota/private-mode errors
+  }
+}
+
+export function subscribePreferredPlannerModelChange(
+  uid: string | undefined | null,
+  callback: (model: string | null) => void,
+): () => void {
+  if (!uid || typeof window === 'undefined') return () => {};
+  const handler = (event: Event) => {
+    const detail = (
+      event as CustomEvent<{ uid?: string; model?: string | null }>
+    ).detail;
+    if (detail?.uid === uid && 'model' in (detail ?? {})) {
+      callback(detail.model ?? null);
+    }
+  };
+  window.addEventListener(PLANNER_MODEL_CHANGED_EVENT, handler);
+  return () => {
+    window.removeEventListener(PLANNER_MODEL_CHANGED_EVENT, handler);
+  };
+}
+
