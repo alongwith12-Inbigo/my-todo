@@ -251,35 +251,90 @@ export function AiTodayPlannerCard({
             </p>
             <p className="leading-relaxed">{error}</p>
             {(errorDetail || activePlannerModel) && (
-              <p className="text-[11px] text-amber-900/90 bg-white/75 border border-amber-200/80 rounded px-2.5 py-1.5 font-mono tabular-nums break-words">
-                모델: {errorDetail?.model ?? activePlannerModel ?? '미확인'}
-                {typeof errorDetail?.latencyMs === 'number' ||
-                typeof errorDetail?.timeoutMs === 'number'
-                  ? ` · 경과 ${
-                      typeof errorDetail?.latencyMs === 'number'
-                        ? `${errorDetail.latencyMs}ms`
-                        : '-'
-                    }${
-                      typeof errorDetail?.timeoutMs === 'number'
-                        ? ` / 제한 ${errorDetail.timeoutMs}ms`
-                        : ''
-                    }`
-                  : ''}
-                {errorDetail?.timeoutSource
-                  ? ` (${errorDetail.timeoutSource === 'local' ? '앱 로컬 제한' : 'Google API 시간 초과'})`
-                  : ''}
-                {errorDetail?.streamed
-                  ? ` · 스트리밍 청크 ${errorDetail.chunkCount ?? 0}건${
-                      typeof errorDetail.firstChunkLatencyMs === 'number'
-                        ? ` (첫 응답 ${errorDetail.firstChunkLatencyMs}ms)`
-                        : ' (첫 응답 미도착)'
-                    }`
-                  : ''}
-              </p>
+              <div className="space-y-1">
+                <p className="text-[11px] text-amber-900/90 bg-white/75 border border-amber-200/80 rounded px-2.5 py-1.5 font-mono tabular-nums break-words">
+                  모델: {errorDetail?.model ?? activePlannerModel ?? '미확인'}
+                  {typeof errorDetail?.upstreamHttpStatus === 'number'
+                    ? ` · HTTP ${errorDetail.upstreamHttpStatus}${
+                        errorDetail.upstreamApiStatus
+                          ? ` (${errorDetail.upstreamApiStatus})`
+                          : ''
+                      }`
+                    : errorDetail?.upstreamApiStatus
+                      ? ` · ${errorDetail.upstreamApiStatus}`
+                      : ''}
+                  {typeof errorDetail?.latencyMs === 'number' ||
+                  typeof errorDetail?.timeoutMs === 'number'
+                    ? ` · 경과 ${
+                        typeof errorDetail?.latencyMs === 'number'
+                          ? `${errorDetail.latencyMs}ms`
+                          : '-'
+                      }${
+                        typeof errorDetail?.timeoutMs === 'number'
+                          ? ` / 제한 ${errorDetail.timeoutMs}ms`
+                          : ''
+                      }`
+                    : ''}
+                  {errorDetail?.timeoutSource
+                    ? ` (${errorDetail.timeoutSource === 'local' ? '앱 로컬 제한' : 'Google API 시간 초과'})`
+                    : ''}
+                  {errorDetail?.streamed
+                    ? ` · 스트리밍 청크 ${errorDetail.chunkCount ?? 0}건${
+                        typeof errorDetail.firstChunkLatencyMs === 'number'
+                          ? ` (첫 응답 ${errorDetail.firstChunkLatencyMs}ms)`
+                          : ' (첫 응답 미도착)'
+                      }`
+                    : ''}
+                  {errorDetail?.requestEndpoint
+                    ? ` · ${errorDetail.requestApiVersion ? `${errorDetail.requestApiVersion} ` : ''}${errorDetail.requestEndpoint}`
+                    : ''}
+                </p>
+                {errorDetail?.upstreamErrorMessage && (
+                  <p className="text-[11px] text-amber-950 bg-white/85 border border-amber-200/80 rounded px-2.5 py-1.5 break-words">
+                    <span className="font-semibold">Google API 응답 상세:</span>{' '}
+                    <span className="font-mono">{errorDetail.upstreamErrorMessage}</span>
+                  </p>
+                )}
+              </div>
             )}
-            {errorCode === 'ai_timeout' && (
+            {activePlannerModel &&
+              errorDetail?.model &&
+              activePlannerModel !== errorDetail.model && (
+                <p className="text-[11px] font-medium text-teal-900 bg-teal-50 border border-teal-200 rounded px-2.5 py-1.5 leading-relaxed">
+                  업무 계획 모델이 <span className="font-mono font-semibold">{activePlannerModel}</span>(으)로 변경되었습니다. 위 <strong>「AI로 계획 세우기」</strong> 버튼을 눌러 새 모델로 다시 실행해 보세요.
+                </p>
+              )}
+            {(errorCode === 'ai_timeout' ||
+              errorCode === 'ai_upstream_error' ||
+              errorCode === 'ai_empty_response' ||
+              errorCode === 'ai_invalid_json' ||
+              errorCode === 'ai_response_truncated' ||
+              errorCode === 'model_not_found' ||
+              errorCode === 'invalid_request_format') && (
               <p className="text-[11px] text-amber-900 leading-relaxed">
-                현재 모델의 응답이 길어 시간 내에 첫 결과가 도착하지 않았습니다. [설정 확인]에서 다른 모델(예: <span className="font-mono">gemini-3.1-flash-lite</span> 등)을 1회 테스트한 뒤 <strong>「AI 업무 계획에 적용」</strong>하면 서버 재배포 없이 바로 전환해 사용할 수 있습니다.
+                {errorCode === 'ai_upstream_error'
+                  ? '현재 모델이 Google 서버 내부 오류(5xx)를 반환했습니다. '
+                  : errorCode === 'ai_timeout'
+                    ? '현재 모델의 응답이 길어 제한 시간 내에 도착하지 않았습니다. '
+                    : '현재 모델에서 정상적인 계획 응답을 받지 못했습니다. '}
+                <strong>[설정에서 모델 테스트·전환]</strong>으로 이동해 <strong>「등록된 키 테스트」</strong>를 누른 뒤, 다른 모델
+                {errorDetail?.availableGenerateModels &&
+                errorDetail.availableGenerateModels.length > 0 ? (
+                  <>
+                    (확인된 모델:{' '}
+                    <span className="font-mono">
+                      {errorDetail.availableGenerateModels.slice(0, 3).join(', ')}
+                    </span>
+                    )
+                  </>
+                ) : (
+                  <>
+                    (예: <span className="font-mono">gemini-4-hydrogen</span>,{' '}
+                    <span className="font-mono">gemini-3.1-flash-lite</span>,{' '}
+                    <span className="font-mono">gemini-2.5-flash</span>)
+                  </>
+                )}
+                을 1회 테스트하고 <strong>「이 모델을 AI 업무 계획에 적용」</strong>하면 서버 재배포 없이 바로 전환할 수 있습니다.
               </p>
             )}
           </div>
@@ -297,9 +352,9 @@ export function AiTodayPlannerCard({
               <button
                 type="button"
                 onClick={onOpenSettings}
-                className="px-3 py-1.5 text-xs font-medium text-amber-900 underline underline-offset-2 cursor-pointer"
+                className="px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 rounded-md hover:bg-amber-100 whitespace-nowrap cursor-pointer"
               >
-                설정 확인
+                설정에서 모델 테스트·전환
               </button>
             )}
           </div>

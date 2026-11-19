@@ -50,6 +50,10 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
     refreshAiStatus,
     patchAiStatus,
     setLocalAiEnabled,
+    plannerError,
+    plannerErrorCode,
+    plannerErrorDetail,
+    activePlannerModel,
   } = useAiWorkspace();
 
   const [apiKeyInput, setApiKeyInput] = useState('');
@@ -560,6 +564,37 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
               </p>
             )}
 
+            {hasPersonalKey &&
+              plannerError &&
+              (plannerErrorCode === 'ai_upstream_error' ||
+                plannerErrorCode === 'ai_timeout' ||
+                plannerErrorCode === 'ai_empty_response' ||
+                plannerErrorCode === 'ai_invalid_json' ||
+                plannerErrorCode === 'ai_response_truncated' ||
+                plannerErrorCode === 'model_not_found') &&
+              (!activePlannerModel ||
+                !plannerErrorDetail?.model ||
+                activePlannerModel === plannerErrorDetail.model) && (
+                <div className="p-3 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-950 space-y-1 leading-relaxed">
+                  <p className="font-semibold text-amber-900">
+                    최근 AI 업무 계획(
+                    <span className="font-mono">
+                      {plannerErrorDetail?.model ?? activePlannerModel ?? '현재 모델'}
+                    </span>
+                    ) 호출 오류 안내
+                    {typeof plannerErrorDetail?.upstreamHttpStatus === 'number'
+                      ? ` · HTTP ${plannerErrorDetail.upstreamHttpStatus}`
+                      : ''}
+                  </p>
+                  <p>
+                    단순 연결 테스트는 통과하더라도 특정 모델이 업무 계획(JSON) 요청에서 오류나 지연을 반환할 수 있습니다. 아래 <strong>「등록된 키 테스트」</strong>를 누른 뒤 나타나는 모델 목록에서 다른 모델(예:{' '}
+                    <span className="font-mono">gemini-4-hydrogen</span>,{' '}
+                    <span className="font-mono">gemini-3.1-flash-lite</span>,{' '}
+                    <span className="font-mono">gemini-2.5-flash</span>)을 1회 검증하고 <strong>「이 모델을 AI 업무 계획에 적용」</strong>을 눌러 보세요.
+                  </p>
+                </div>
+              )}
+
             <form onSubmit={handleSaveKey} className="space-y-3">
               <div>
                 <label
@@ -904,53 +939,52 @@ export function AiByokSettingsSection({ uid }: AiByokSettingsSectionProps) {
                         </span>
                       </p>
 
-                      {(!testResult.ok || testResult.isCandidateTest) && (
-                        <div className="pt-1.5 border-t border-slate-200/80 space-y-1.5">
-                          <p className="font-semibold text-slate-800">
-                            후보 모델 1회 호환성 검증 (GEMINI_MODEL 변경 없이 테스트)
-                          </p>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <select
-                              aria-label="검증할 후보 모델 선택"
-                              value={candidateModelInput}
-                              onChange={(e) => setCandidateModelInput(e.target.value)}
-                              className="px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
-                            >
-                              {Array.from(
-                                new Set([
-                                  ...(testResult.recommendedModel
-                                    ? [testResult.recommendedModel]
-                                    : []),
-                                  ...testResult.availableGenerateModels,
-                                ]),
-                              ).map((modelId) => (
-                                <option key={modelId} value={modelId}>
-                                  {modelId}
-                                  {modelId === testResult.recommendedModel ? ' (추천)' : ''}
-                                </option>
-                              ))}
-                            </select>
-                            <button
-                              type="button"
-                              disabled={
-                                testingCandidate ||
-                                testingKey ||
-                                savingKey ||
-                                !candidateModelInput
-                              }
-                              onClick={() => void handleTestCandidateModel()}
-                              className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-700 rounded-md hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
-                            >
-                              {testingCandidate
-                                ? '1회 검증 중...'
-                                : '선택 모델 1회 테스트'}
-                            </button>
-                          </div>
-                          <p className="text-[10px] text-slate-500">
-                            짧은 비개인정보 문장 1회(최소 토큰·JSON 스키마 없음·재시도 없음)만 호출해 실제 동작과 토큰 사용량을 확인합니다.
-                          </p>
+                      <div className="pt-1.5 border-t border-slate-200/80 space-y-1.5">
+                        <p className="font-semibold text-slate-800">
+                          다른 모델 1회 호환성 검증 및 AI 업무 계획 모델 전환 (GEMINI_MODEL 변경 없이 테스트)
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <select
+                            aria-label="검증할 후보 모델 선택"
+                            value={candidateModelInput}
+                            onChange={(e) => setCandidateModelInput(e.target.value)}
+                            className="px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:border-teal-700"
+                          >
+                            {Array.from(
+                              new Set([
+                                ...(testResult.recommendedModel
+                                  ? [testResult.recommendedModel]
+                                  : []),
+                                ...testResult.availableGenerateModels,
+                              ]),
+                            ).map((modelId) => (
+                              <option key={modelId} value={modelId}>
+                                {modelId}
+                                {modelId === testResult.recommendedModel ? ' (추천)' : ''}
+                                {modelId === testResult.configuredModel ? ' (서버 기본)' : ''}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            disabled={
+                              testingCandidate ||
+                              testingKey ||
+                              savingKey ||
+                              !candidateModelInput
+                            }
+                            onClick={() => void handleTestCandidateModel()}
+                            className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-700 rounded-md hover:bg-teal-800 disabled:opacity-50 whitespace-nowrap cursor-pointer"
+                          >
+                            {testingCandidate
+                              ? '1회 검증 중...'
+                              : '선택 모델 1회 테스트'}
+                          </button>
                         </div>
-                      )}
+                        <p className="text-[10px] text-slate-500">
+                          짧은 비개인정보 문장 1회(최소 토큰·JSON 스키마 없음·재시도 없음)만 호출해 실제 동작과 토큰 사용량을 확인한 뒤 AI 업무 계획에 바로 적용할 수 있습니다.
+                        </p>
+                      </div>
                     </div>
                   )}
 

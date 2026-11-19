@@ -91,6 +91,7 @@ export interface AiStatusResponse {
 }
 
 export interface AiPlannerErrorDetail {
+  errorCode?: string;
   model?: string;
   timeoutSource?: AiTimeoutSource;
   timeoutMs?: number;
@@ -99,7 +100,13 @@ export interface AiPlannerErrorDetail {
   chunkCount?: number;
   streamed?: boolean;
   requestId?: string;
+  requestApiVersion?: string;
   requestEndpoint?: string;
+  upstreamHttpStatus?: number;
+  upstreamApiStatus?: string;
+  upstreamErrorMessage?: string;
+  availableGenerateModels?: string[];
+  recommendedModel?: string | null;
 }
 
 export interface AiByokSaveRequest {

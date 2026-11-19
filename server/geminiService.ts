@@ -655,6 +655,20 @@ async function getCachedOrFetchModelList(params: {
   };
 }
 
+function getWarmCachedModelInspection(
+  apiKey: string,
+  apiVersion: string,
+  configuredModel: string,
+): ListedModelInspection | null {
+  const keyHash = apiKey ? hashKeyForCache(apiKey) : 'override';
+  const cacheKey = `${keyHash}:${apiVersion}`;
+  const hit = modelListCache.get(cacheKey);
+  if (!hit || hit.expiresAt <= Date.now()) {
+    return null;
+  }
+  return inspectListedGeminiModels(hit.models, configuredModel);
+}
+
 function buildGenerateEndpointPath(
   modelName: string,
   streamed = false,
@@ -1191,6 +1205,7 @@ async function generateContentWithModelResolution(params: {
       : buildThinkingConfigForModel(targetModel, thinkingMode);
     return {
       ...params.baseConfig,
+      ...(params.operation === 'planner' ? { automaticContinuation: false } : {}),
       ...(thinkingConfig ? { thinkingConfig } : {}),
       ...(attemptSignal ? { abortSignal: attemptSignal } : {}),
     };
@@ -1410,6 +1425,11 @@ async function generateContentWithModelResolution(params: {
         upstreamErrorMessage: mappedCached.upstreamErrorMessage,
         latencyMs: attemptLatencyMs,
       });
+      const warmInspection = getWarmCachedModelInspection(
+        params.apiKey,
+        cachedResolved.resolvedApiVersion,
+        params.configuredModel,
+      );
       throw toServiceError(mappedCached, {
         requestId,
         requestApiVersion: cachedResolved.resolvedApiVersion,
@@ -1421,6 +1441,12 @@ async function generateContentWithModelResolution(params: {
         firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
         chunkCount: telemetry.chunkCount,
         streamedChars: telemetry.streamedChars,
+        ...(warmInspection?.availableGenerateModels.length
+          ? {
+              availableGenerateModels: warmInspection.availableGenerateModels,
+              recommendedModel: warmInspection.recommendedFallbackModel,
+            }
+          : {}),
       });
     }
   }
@@ -1592,6 +1618,11 @@ async function generateContentWithModelResolution(params: {
       mapped.code !== 'model_not_found' &&
       mapped.code !== 'model_generate_unsupported'
     ) {
+      const warmInspection = getWarmCachedModelInspection(
+        params.apiKey,
+        apiVersion,
+        params.configuredModel,
+      );
       throw toServiceError(mapped, {
         requestId,
         requestApiVersion: apiVersion,
@@ -1603,6 +1634,12 @@ async function generateContentWithModelResolution(params: {
         firstChunkLatencyMs: telemetry.firstChunkLatencyMs,
         chunkCount: telemetry.chunkCount,
         streamedChars: telemetry.streamedChars,
+        ...(warmInspection?.availableGenerateModels.length
+          ? {
+              availableGenerateModels: warmInspection.availableGenerateModels,
+              recommendedModel: warmInspection.recommendedFallbackModel,
+            }
+          : {}),
       });
     }
 

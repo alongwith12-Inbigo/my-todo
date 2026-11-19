@@ -280,6 +280,7 @@ function handleRouteError(
       headers: { 'Cache-Control': 'no-store', 'X-Request-Id': resolvedReqId },
       body: {
         error: err.code,
+        errorCode: err.code,
         category: 'gemini_api' satisfies AiErrorCategory,
         requestId: resolvedReqId,
         ...(err.model ? { model: err.model } : {}),
@@ -300,6 +301,9 @@ function handleRouteError(
           ? { upstreamHttpStatus: err.upstreamHttpStatus }
           : {}),
         ...(err.upstreamApiStatus ? { upstreamApiStatus: err.upstreamApiStatus } : {}),
+        ...(err.upstreamErrorMessage
+          ? { upstreamErrorMessage: err.upstreamErrorMessage }
+          : {}),
         ...(err.requestApiVersion ? { requestApiVersion: err.requestApiVersion } : {}),
         ...(err.requestEndpoint ? { requestEndpoint: err.requestEndpoint } : {}),
         ...(err.availableGenerateModels?.length

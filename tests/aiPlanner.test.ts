@@ -3417,6 +3417,7 @@ test('generateDayPlanWithGemini streams chunks cleanly via generateContentStream
     assert.equal(unaryCalled, 0);
     assert.equal(capturedConfig?.maxOutputTokens, 1024);
     assert.equal(capturedConfig?.responseMimeType, 'application/json');
+    assert.equal(capturedConfig?.automaticContinuation, false);
     assert.equal(res.model, 'gemini-3.8-flash');
     assert.equal(
       res.rawPlan.coreAdvice,
@@ -3627,6 +3628,146 @@ test('handleAiStatusRequest exposes plannerModel and handleAiPlannerRequest vali
     else process.env.GEMINI_MODEL = prevModel;
     if (prevPlannerModel === undefined) delete process.env.GEMINI_PLANNER_MODEL;
     else process.env.GEMINI_PLANNER_MODEL = prevPlannerModel;
+  }
+});
+
+test('planner upstream 5xx error surfaces sanitized upstreamHttpStatus, upstreamApiStatus, upstreamErrorMessage, and warm-cached model suggestions with zero extra network calls', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+
+    const dummyKey = 'AQ.Ab8DummyUpstreamDiagKey_0011223344';
+    let listCallCount = 0;
+
+    // Warm modelListCache via 1 key auth verification (0 generation tokens)
+    await testGeminiPersonalKey(dummyKey, undefined, {
+      models: {
+        list: async () => {
+          listCallCount += 1;
+          return {
+            page: [
+              { name: 'models/gemini-3.8-flash', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-4-hydrogen', supportedActions: ['generateContent'] },
+              { name: 'models/gemini-3.1-flash-lite', supportedActions: ['generateContent'] },
+            ],
+          };
+        },
+        generateContent: async () => ({
+          text: 'OK',
+          candidates: [{ finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 1, totalTokenCount: 5 },
+        }),
+      },
+    });
+    assert.equal(listCallCount, 1);
+
+    // Trigger upstream 500 on planner stream -> should NOT call models.list again, yet attach warm-cached suggestions
+    let plannerErr: unknown;
+    try {
+      await generateDayPlanWithGemini(
+        dummyKey,
+        {
+          todayKey: '2026-11-19',
+          currentTimeHhMm: '09:00',
+          totalIncompleteCount: 1,
+          overdueCount: 0,
+          dueTodayCount: 1,
+          timetableConfigured: true,
+          remainingWorkableMinutes: 40,
+          workableSlots: [{ st: '10:00', et: '10:40', min: 40, lb: '공강' }],
+          blockedEventsSummary: [],
+          academicAlertsSummary: [],
+          tasks: [
+            { id: 't1', t: '업무 1', d: '2026-11-19', ov: false, dd: 0, p: 'u', s: 'td', m: 20, tdy: true },
+          ],
+        },
+        undefined,
+        {
+          models: {
+            list: async () => {
+              listCallCount += 1;
+              return { page: [] };
+            },
+            generateContent: async () => ({ text: '{}' }),
+            generateContentStream: async () => {
+              throw Object.assign(
+                new Error(
+                  '{"error":{"code":500,"message":"Internal error encountered for key AQ.Ab8SecretLeak_999","status":"INTERNAL"}}',
+                ),
+                { status: 500 },
+              );
+            },
+          },
+        },
+        'req_upstream_500_diag',
+      );
+    } catch (err) {
+      plannerErr = err;
+    }
+
+    assert.equal(listCallCount, 1);
+    assert.ok(plannerErr instanceof GeminiServiceError);
+    assert.equal(plannerErr.status, 502);
+    assert.equal(plannerErr.code, 'ai_upstream_error');
+    assert.equal(plannerErr.upstreamHttpStatus, 500);
+    assert.equal(plannerErr.upstreamApiStatus, 'INTERNAL');
+    assert.ok(
+      plannerErr.upstreamErrorMessage?.includes('Internal error encountered') &&
+        !plannerErr.upstreamErrorMessage.includes('AQ.Ab8SecretLeak_999'),
+    );
+    assert.deepEqual(plannerErr.availableGenerateModels, [
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'gemini-3.1-flash-lite',
+    ]);
+    assert.equal(plannerErr.recommendedModel, 'gemini-4-hydrogen');
+
+    // Route handler propagates upstreamHttpStatus, upstreamApiStatus, and sanitized upstreamErrorMessage in HTTP 502 JSON
+    const routeRes = await handleAiPlannerRequest(
+      {
+        authorizationHeader: 'Bearer token',
+        body: {
+          todayKey: '2026-11-19',
+          currentTimeHhMm: '09:00',
+          tasks: [
+            { id: 't1', t: '업무 1', d: '2026-11-19', ov: false, dd: 0, p: 'u', s: 'td', m: 20, tdy: true },
+          ],
+        },
+      },
+      {
+        verifyAuth: async () => ({
+          uid: 'u-upstream-502',
+          email: 'teacher@school.kr',
+          accessStatus: 'active',
+          role: 'teacher',
+          emailVerified: true,
+        }),
+        isConfigured: () => true,
+        generateDayPlan: async () => {
+          throw plannerErr;
+        },
+      },
+    );
+
+    assert.equal(routeRes.status, 502);
+    const body = routeRes.body as Record<string, unknown>;
+    assert.equal(body.error, 'ai_upstream_error');
+    assert.equal(body.errorCode, 'ai_upstream_error');
+    assert.equal(body.upstreamHttpStatus, 500);
+    assert.equal(body.upstreamApiStatus, 'INTERNAL');
+    assert.equal(body.requestApiVersion, 'v1');
+    assert.equal(body.requestEndpoint, 'models/gemini-3.8-flash:streamGenerateContent');
+    assert.ok(
+      typeof body.upstreamErrorMessage === 'string' &&
+        body.upstreamErrorMessage.includes('[REDACTED_KEY]') &&
+        !body.upstreamErrorMessage.includes('SecretLeak'),
+    );
+    assert.equal(body.recommendedModel, 'gemini-4-hydrogen');
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
   }
 });
 

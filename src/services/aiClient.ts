@@ -122,7 +122,13 @@ async function fetchAiJson<T>(
             chunkCount?: unknown;
             streamed?: unknown;
             requestId?: unknown;
+            requestApiVersion?: unknown;
             requestEndpoint?: unknown;
+            upstreamHttpStatus?: unknown;
+            upstreamApiStatus?: unknown;
+            upstreamErrorMessage?: unknown;
+            availableGenerateModels?: unknown;
+            recommendedModel?: unknown;
           })
         : {};
     const code =
@@ -156,42 +162,71 @@ async function fetchAiJson<T>(
       'apiKeyAuthOk' in payload
         ? (payload as AiByokTestResponse)
         : undefined;
-    const errorDetail: AiPlannerErrorDetail | undefined =
+    const availableGenerateModels = Array.isArray(errObj.availableGenerateModels)
+      ? errObj.availableGenerateModels.filter(
+          (item): item is string => typeof item === 'string' && item.trim().length > 0,
+        )
+      : undefined;
+    const hasDiagnosticFields =
       typeof errObj.model === 'string' ||
       typeof errObj.timeoutSource === 'string' ||
       typeof errObj.timeoutMs === 'number' ||
       typeof errObj.latencyMs === 'number' ||
       typeof errObj.chunkCount === 'number' ||
       typeof errObj.streamed === 'boolean' ||
-      typeof errObj.requestId === 'string'
-        ? {
-            ...(typeof errObj.model === 'string' ? { model: errObj.model } : {}),
-            ...(errObj.timeoutSource === 'local' || errObj.timeoutSource === 'upstream'
-              ? { timeoutSource: errObj.timeoutSource as AiTimeoutSource }
-              : {}),
-            ...(typeof errObj.timeoutMs === 'number'
-              ? { timeoutMs: errObj.timeoutMs }
-              : {}),
-            ...(typeof errObj.latencyMs === 'number'
-              ? { latencyMs: errObj.latencyMs }
-              : {}),
-            ...(typeof errObj.firstChunkLatencyMs === 'number'
-              ? { firstChunkLatencyMs: errObj.firstChunkLatencyMs }
-              : {}),
-            ...(typeof errObj.chunkCount === 'number'
-              ? { chunkCount: errObj.chunkCount }
-              : {}),
-            ...(typeof errObj.streamed === 'boolean'
-              ? { streamed: errObj.streamed }
-              : {}),
-            ...(typeof errObj.requestId === 'string'
-              ? { requestId: errObj.requestId }
-              : {}),
-            ...(typeof errObj.requestEndpoint === 'string'
-              ? { requestEndpoint: errObj.requestEndpoint }
-              : {}),
-          }
-        : undefined;
+      typeof errObj.requestId === 'string' ||
+      typeof errObj.upstreamHttpStatus === 'number' ||
+      typeof errObj.upstreamApiStatus === 'string' ||
+      typeof errObj.upstreamErrorMessage === 'string';
+    const errorDetail: AiPlannerErrorDetail | undefined = hasDiagnosticFields
+      ? {
+          errorCode: code,
+          ...(typeof errObj.model === 'string' ? { model: errObj.model } : {}),
+          ...(errObj.timeoutSource === 'local' || errObj.timeoutSource === 'upstream'
+            ? { timeoutSource: errObj.timeoutSource as AiTimeoutSource }
+            : {}),
+          ...(typeof errObj.timeoutMs === 'number'
+            ? { timeoutMs: errObj.timeoutMs }
+            : {}),
+          ...(typeof errObj.latencyMs === 'number'
+            ? { latencyMs: errObj.latencyMs }
+            : {}),
+          ...(typeof errObj.firstChunkLatencyMs === 'number'
+            ? { firstChunkLatencyMs: errObj.firstChunkLatencyMs }
+            : {}),
+          ...(typeof errObj.chunkCount === 'number'
+            ? { chunkCount: errObj.chunkCount }
+            : {}),
+          ...(typeof errObj.streamed === 'boolean'
+            ? { streamed: errObj.streamed }
+            : {}),
+          ...(typeof errObj.requestId === 'string'
+            ? { requestId: errObj.requestId }
+            : {}),
+          ...(typeof errObj.requestApiVersion === 'string'
+            ? { requestApiVersion: errObj.requestApiVersion }
+            : {}),
+          ...(typeof errObj.requestEndpoint === 'string'
+            ? { requestEndpoint: errObj.requestEndpoint }
+            : {}),
+          ...(typeof errObj.upstreamHttpStatus === 'number'
+            ? { upstreamHttpStatus: errObj.upstreamHttpStatus }
+            : {}),
+          ...(typeof errObj.upstreamApiStatus === 'string'
+            ? { upstreamApiStatus: errObj.upstreamApiStatus }
+            : {}),
+          ...(typeof errObj.upstreamErrorMessage === 'string'
+            ? { upstreamErrorMessage: errObj.upstreamErrorMessage }
+            : {}),
+          ...(availableGenerateModels && availableGenerateModels.length > 0
+            ? { availableGenerateModels }
+            : {}),
+          ...(errObj.recommendedModel === null ||
+          typeof errObj.recommendedModel === 'string'
+            ? { recommendedModel: errObj.recommendedModel }
+            : {}),
+        }
+      : undefined;
     throw new AiClientError(
       res.status,
       code,
