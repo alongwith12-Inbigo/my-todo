@@ -7,6 +7,7 @@ export const AI_LIMITS = {
   MAX_CANDIDATES: 50,
   MAX_PLANNER_TASKS: 15,
   MAX_PLANNER_AI_TASKS: 8,
+  MAX_PLANNER_ADVICE_TASKS: 3,
   MAX_PLANNER_SLOTS: 8,
   MAX_PLANNER_RECOMMENDATIONS: 5,
   MAX_ADJUST_CONSTRAINT_CHARS: 180,
@@ -317,11 +318,17 @@ export interface AiPlannerRawDeferredItem {
   reason: string;
 }
 
+export interface AiPlannerRawStrategyItem {
+  taskId: string;
+  strategy: string;
+}
+
 export interface AiPlannerRawResult {
   coreAdvice: string;
   recommendations: AiPlannerRawRecommendation[];
   attentionTasks: AiPlannerRawAttentionItem[];
   deferredTasks: AiPlannerRawDeferredItem[];
+  strategies?: AiPlannerRawStrategyItem[];
 }
 
 export interface AiPlannerResponse {

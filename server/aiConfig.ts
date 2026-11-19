@@ -57,7 +57,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
           timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
         },
         planner: {
-          maxOutputTokens: 4096,
+          maxOutputTokens: 1024,
           thinkingLevel: 'LOW',
           timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
@@ -90,7 +90,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
           timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
         },
         planner: {
-          maxOutputTokens: 3072,
+          maxOutputTokens: 1024,
           thinkingLevel: 'LOW',
           timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
@@ -120,7 +120,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
           timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
         },
         planner: {
-          maxOutputTokens: 4096,
+          maxOutputTokens: 1024,
           thinkingLevel: 'LOW',
           timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
@@ -149,7 +149,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
           timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
         },
         planner: {
-          maxOutputTokens: 3072,
+          maxOutputTokens: 1024,
           thinkingBudget: 512,
           timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
@@ -176,7 +176,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
         timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
       },
       planner: {
-        maxOutputTokens: 3072,
+        maxOutputTokens: 1024,
         timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
       },
       briefing: {

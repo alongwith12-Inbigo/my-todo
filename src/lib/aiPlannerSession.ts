@@ -8,9 +8,9 @@ import {
 import {
   buildDeterministicDayPlan,
   excludePlanItemFromToday,
+  mergeDeterministicPlanWithAiAdvice,
   movePlanItemOrder,
   reassignPlanItemSlot,
-  validateAndRepairAiPlan,
   type PlanAdjustmentFilter,
   type PlannerContextResult,
   type ValidatedDayPlan,
@@ -286,11 +286,15 @@ export class AiPlannerSessionController {
         generatedAtIso: res.generatedAtIso,
         usage: res.usage,
       };
-      const validated = validateAndRepairAiPlan(res.rawPlan, context, {
-        model: res.model,
-        generatedAtIso: res.generatedAtIso,
-        usage: res.usage,
-      });
+      const validated = mergeDeterministicPlanWithAiAdvice(
+        res.rawPlan,
+        context,
+        {
+          model: res.model,
+          generatedAtIso: res.generatedAtIso,
+          usage: res.usage,
+        },
+      );
       this.cacheByFingerprint.set(context.fingerprint, validated);
       this.snapshot = {
         ...this.snapshot,
@@ -320,11 +324,15 @@ export class AiPlannerSessionController {
       this.snapshot.validatedPlan?.mode === 'ai' &&
       this.snapshot.rawAiPlan
     ) {
-      nextPlan = validateAndRepairAiPlan(this.snapshot.rawAiPlan.raw, context, {
-        model: this.snapshot.rawAiPlan.model,
-        generatedAtIso: this.snapshot.rawAiPlan.generatedAtIso,
-        usage: this.snapshot.rawAiPlan.usage,
-      });
+      nextPlan = mergeDeterministicPlanWithAiAdvice(
+        this.snapshot.rawAiPlan.raw,
+        context,
+        {
+          model: this.snapshot.rawAiPlan.model,
+          generatedAtIso: this.snapshot.rawAiPlan.generatedAtIso,
+          usage: this.snapshot.rawAiPlan.usage,
+        },
+      );
       if (this.snapshot.validatedPlan.fromCache) {
         nextPlan = { ...nextPlan, fromCache: true };
       }

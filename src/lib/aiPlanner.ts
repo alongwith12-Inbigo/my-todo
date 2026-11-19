@@ -1169,19 +1169,28 @@ export function validateAndRepairAiPlan(
 
 /**
  * Pure algorithmic deterministic day plan (0 AI calls).
- * Used when no API key is registered or as a rule-based fallback.
+ * Serves as the primary engine for scoring, tiering, slot placement, collision checking,
+ * attentionTasks, and deferredTasks.
  */
 export function buildDeterministicDayPlan(
   context: PlannerContextResult,
 ): ValidatedDayPlan {
   let freeWindows = context.remainingWorkableIntervals.map((seg) => ({ ...seg }));
+  const slotPreference = parseConstraintSlotPreference(
+    context.compressedRequest.constraint,
+  );
   const recommendations: ValidatedPlanItem[] = [];
   const attentionTasks: ValidatedPlanTaskNote[] = [];
   const deferredTasks: ValidatedPlanTaskNote[] = [];
+  const selectedIds = new Set<string>();
 
   for (const task of context.rankedTasks) {
     const dueKey = getKstDateInputValue(timestampToDate(task.dueAt)) || null;
+    const remindKey = getKstDateInputValue(timestampToDate(task.remindAt)) || null;
     const isOverdue = Boolean(dueKey && dueKey < context.todayKey);
+    const isDueToday = dueKey === context.todayKey;
+    const isRemindDue = Boolean(remindKey && remindKey <= context.todayKey);
+    const isUrgent = task.priority === 'urgent';
     const hasUserDuration = typeof task.estimatedMinutes === 'number';
     const estimatedMinutes = hasUserDuration
       ? (task.estimatedMinutes as number)
@@ -1190,7 +1199,12 @@ export function buildDeterministicDayPlan(
         : 30;
 
     if (recommendations.length < AI_LIMITS.MAX_PLANNER_RECOMMENDATIONS) {
-      const allocated = allocateSlotDeterministically(estimatedMinutes, freeWindows);
+      selectedIds.add(task.id);
+      const allocated = allocateSlotWithConstraint(
+        estimatedMinutes,
+        freeWindows,
+        slotPreference,
+      );
       const slotStart = allocated ? minutesToHhMm(allocated.startMin) : null;
       const slotEnd = allocated ? minutesToHhMm(allocated.endMin) : null;
       if (allocated) {
@@ -1199,7 +1213,7 @@ export function buildDeterministicDayPlan(
 
       const reasonParts: string[] = [];
       if (isOverdue) reasonParts.push('기한이 지나 즉시 처리 필요');
-      else if (dueKey === context.todayKey) reasonParts.push('오늘 마감 예정');
+      else if (isDueToday) reasonParts.push('오늘 마감 예정');
       else if (task.priority === 'urgent' || task.priority === 'high') reasonParts.push('중요도 높음');
       if (task.status === 'doing') reasonParts.push('현재 진행 중');
 
@@ -1212,7 +1226,7 @@ export function buildDeterministicDayPlan(
           : 0;
       const tier: ValidatedPlanItem['tier'] =
         isOverdue ||
-        dueKey === context.todayKey ||
+        isDueToday ||
         task.priority === 'urgent' ||
         task.priority === 'high' ||
         task.status === 'doing'
@@ -1248,23 +1262,35 @@ export function buildDeterministicDayPlan(
           ? null
           : getDefaultUnscheduledNote(context.availabilityReason),
       });
-
-      if (isOverdue || dueKey === context.todayKey) {
-        attentionTasks.push({
-          taskId: task.id,
-          title: task.title,
-          priority: task.priority,
-          dueDateKey: dueKey,
-          reason: isOverdue ? '마감 기한 초과' : '오늘 마감 도래',
-        });
-      }
-    } else if (deferredTasks.length < 5) {
+    } else if (deferredTasks.length < 6 && !selectedIds.has(task.id)) {
       deferredTasks.push({
         taskId: task.id,
         title: task.title,
         priority: task.priority,
         dueDateKey: dueKey,
-        reason: '상위 우선순위 5건 처리 후 다음 일정으로 미루어 진행 권장',
+        reason:
+          context.remainingWorkableMinutes <= 0 || freeWindows.length === 0
+            ? '오늘 가용 시간 부족으로 다음 일정 권장'
+            : '상위 우선순위 5건 처리 후 다음 일정으로 미루어 진행 권장',
+      });
+    }
+
+    if (
+      attentionTasks.length < 5 &&
+      (isOverdue || isDueToday || isRemindDue || isUrgent)
+    ) {
+      attentionTasks.push({
+        taskId: task.id,
+        title: task.title,
+        priority: task.priority,
+        dueDateKey: dueKey,
+        reason: isOverdue
+          ? '마감 기한 초과'
+          : isDueToday
+            ? '오늘 마감 도래'
+            : isRemindDue
+              ? '재확인 날짜 도래'
+              : '긴급 우선순위',
       });
     }
   }
@@ -1285,7 +1311,7 @@ export function buildDeterministicDayPlan(
     todayKey: context.todayKey,
     coreAdvice,
     recommendations,
-    attentionTasks: attentionTasks.slice(0, 5),
+    attentionTasks,
     deferredTasks,
     totalPlannedMinutes: 0,
     remainingWorkableMinutes: context.remainingWorkableMinutes,
@@ -1295,6 +1321,75 @@ export function buildDeterministicDayPlan(
     overloadWarning: null,
     academicWarnings: context.unconfirmedAcademicWarnings,
     validationRepairs: [],
+  });
+}
+
+/**
+ * Uses the local deterministic plan as the structural foundation (scoring, tiering,
+ * slot placement, collision safety, attentionTasks, deferredTasks) and overlays only
+ * Gemini's coreAdvice + up to 3 task-specific execution strategies.
+ */
+export function mergeDeterministicPlanWithAiAdvice(
+  rawPlan: AiPlannerRawResult,
+  context: PlannerContextResult,
+  meta: { model: string; generatedAtIso: string; usage?: AiTokenUsage },
+): ValidatedDayPlan {
+  const basePlan = buildDeterministicDayPlan(context);
+  const strategyByTaskId = new Map<string, string>();
+
+  if (Array.isArray(rawPlan.strategies)) {
+    for (const entry of rawPlan.strategies) {
+      if (strategyByTaskId.size >= AI_LIMITS.MAX_PLANNER_ADVICE_TASKS) break;
+      if (!entry || typeof entry.taskId !== 'string') continue;
+      const taskId = entry.taskId.trim();
+      const strategy =
+        typeof entry.strategy === 'string'
+          ? sanitizeSingleLine(entry.strategy, 140)
+          : '';
+      if (!taskId || !strategy || strategyByTaskId.has(taskId)) continue;
+      strategyByTaskId.set(taskId, strategy);
+    }
+  }
+
+  if (
+    strategyByTaskId.size < AI_LIMITS.MAX_PLANNER_ADVICE_TASKS &&
+    Array.isArray(rawPlan.recommendations)
+  ) {
+    for (const rec of rawPlan.recommendations) {
+      if (strategyByTaskId.size >= AI_LIMITS.MAX_PLANNER_ADVICE_TASKS) break;
+      if (!rec || typeof rec.taskId !== 'string') continue;
+      const taskId = rec.taskId.trim();
+      const strategy =
+        typeof rec.strategy === 'string'
+          ? sanitizeSingleLine(rec.strategy, 140)
+          : '';
+      if (!taskId || !strategy || strategyByTaskId.has(taskId)) continue;
+      strategyByTaskId.set(taskId, strategy);
+    }
+  }
+
+  const coreAdvice =
+    sanitizeSingleLine(rawPlan.coreAdvice || '', 260) || basePlan.coreAdvice;
+
+  const recommendations = basePlan.recommendations.map((item) => {
+    const aiStrategy = strategyByTaskId.get(item.taskId);
+    return aiStrategy
+      ? {
+          ...item,
+          strategy: aiStrategy,
+        }
+      : item;
+  });
+
+  return recomputePlanTotals({
+    ...basePlan,
+    mode: 'ai',
+    model: meta.model,
+    generatedAtIso: meta.generatedAtIso,
+    coreAdvice,
+    recommendations,
+    validationRepairs: [],
+    usage: meta.usage,
   });
 }
 

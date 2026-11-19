@@ -131,56 +131,23 @@ const BRIEFING_RESPONSE_SCHEMA: Schema = {
   ],
 };
 
-const PLANNER_RESPONSE_SCHEMA: Schema = {
+const PLANNER_ADVICE_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
     coreAdvice: { type: Type.STRING },
-    recommendations: {
+    strategies: {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
         properties: {
           taskId: { type: Type.STRING },
-          order: { type: Type.INTEGER },
-          recommendedStart: { type: Type.STRING, nullable: true },
-          recommendedEnd: { type: Type.STRING, nullable: true },
-          estimatedMinutes: { type: Type.INTEGER },
-          reason: { type: Type.STRING },
-          tier: { type: Type.STRING, enum: ['must', 'optional'] },
-          strategy: { type: Type.STRING, nullable: true },
+          strategy: { type: Type.STRING },
         },
-        required: ['taskId', 'order', 'estimatedMinutes', 'reason'],
-      },
-    },
-    attentionTasks: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          taskId: { type: Type.STRING },
-          reason: { type: Type.STRING },
-        },
-        required: ['taskId', 'reason'],
-      },
-    },
-    deferredTasks: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          taskId: { type: Type.STRING },
-          reason: { type: Type.STRING },
-        },
-        required: ['taskId', 'reason'],
+        required: ['taskId', 'strategy'],
       },
     },
   },
-  required: [
-    'coreAdvice',
-    'recommendations',
-    'attentionTasks',
-    'deferredTasks',
-  ],
+  required: ['coreAdvice', 'strategies'],
 };
 
 export function getEffectiveGeminiApiVersion(): string {
@@ -1688,6 +1655,21 @@ export async function generateBriefingWithGemini(
   };
 }
 
+interface GeminiPlannerAdvicePayload {
+  coreAdvice?: unknown;
+  strategies?: Array<{ taskId?: unknown; strategy?: unknown }>;
+  recommendations?: Array<{
+    taskId?: unknown;
+    strategy?: unknown;
+    order?: unknown;
+    recommendedStart?: unknown;
+    recommendedEnd?: unknown;
+    estimatedMinutes?: unknown;
+    reason?: unknown;
+    tier?: unknown;
+  }>;
+}
+
 export async function generateDayPlanWithGemini(
   apiKey: string,
   input: AiPlannerRequest,
@@ -1697,48 +1679,52 @@ export async function generateDayPlanWithGemini(
 ): Promise<AiPlannerResponse> {
   const reqId = requestId ?? generateSafeRequestId();
   const configuredModel = getGeminiPlannerModelName();
+  const apiVersion = getEffectiveGeminiApiVersion();
   const ai = clientOverride ?? createGeminiClient(apiKey);
 
-  // Client already priority-ranks tasks via scoreTaskForPlanning; keep top 8 tasks
-  // for Gemini (max 5 recommendations) and offload exact slot placement & attention/deferred lists to local logic.
-  const plannerTasks = input.tasks.slice(0, AI_LIMITS.MAX_PLANNER_AI_TASKS);
-  const compactSlots = input.workableSlots.map(
-    (s) => `${s.st}~${s.et}(${s.min}m)`,
-  );
+  // Local deterministic engine handles priority scoring, tier, slot placement,
+  // collision checks, attentionTasks, and deferredTasks.
+  // Gemini receives only the top 3 prioritized tasks to generate 1 coreAdvice + up to 3 strategies.
+  const adviceTasks = input.tasks
+    .slice(0, AI_LIMITS.MAX_PLANNER_ADVICE_TASKS)
+    .map((task) => ({
+      id: task.id,
+      t: task.t,
+      dd: task.dd,
+      ov: task.ov,
+      p: task.p,
+      ...(task.ev ? { ev: true } : {}),
+    }));
+
   const compactInput: Record<string, unknown> = {
-    today: input.todayKey,
-    now: input.currentTimeHhMm,
     availMin: input.remainingWorkableMinutes,
-    totalTasks: input.totalIncompleteCount,
     overdue: input.overdueCount,
     dueToday: input.dueTodayCount,
-    ...(compactSlots.length > 0 ? { slots: compactSlots } : {}),
-    ...(input.blockedEventsSummary.length > 0
-      ? { events: input.blockedEventsSummary }
-      : {}),
-    ...(input.academicAlertsSummary.length > 0
-      ? { academic: input.academicAlertsSummary }
-      : {}),
-    tasks: plannerTasks,
+    tasks: adviceTasks,
     ...(input.constraint ? { constraint: input.constraint } : {}),
   };
 
   const prompt = [
-    `한국 교사의 '오늘의 업무 실행 전략 플래너'입니다.`,
-    `역할: 우선순위 판단, tier('must'|'optional') 구분, 짧은 실행 전략(strategy), 핵심 조언(coreAdvice)에 집중하세요.`,
-    `규칙:`,
-    `1. recommendations: tasks의 id만 사용해 최대 5건 선택(입력 외 항목·시간 창작 금지).`,
-    `2. 시간대 배치·충돌 검사는 로컬에서 처리하므로 recommendedStart/recommendedEnd는 기본 null로 두세요(단, constraint가 특정 시간대 선호를 요구할 때만 slots 안에서 선택 가능).`,
-    `3. estimatedMinutes: task.m이 있으면 그대로, null이면 15~90 정수(5단위)로 추정.`,
-    `4. 긴급·마감·오늘 일정 전 준비(ev:true)·가용 시간(availMin/slots)·constraint를 반영해 우선순위와 tier('must'|'optional')를 정하세요.`,
-    `5. attentionTasks와 deferredTasks는 로컬에서 보완하므로 빈 배열 []로 두세요.`,
-    `6. reason(25자 이내), strategy(35자 이내), coreAdvice(1문장 70자 이내)로 간결히 작성하세요.`,
+    `한국 교사의 오늘 업무 핵심 조언과 실행 전략을 JSON으로만 작성하세요.`,
+    `1. coreAdvice: 오늘 실행 흐름 핵심 조언 1문장(60자 이내).`,
+    `2. strategies: tasks의 id만 사용해 주요 업무 최대 3건의 구체적 실행 방법(strategy, 40자 이내).`,
     `입력JSON:${JSON.stringify(compactInput)}`,
   ].join('\n');
 
   const plannerOpSettings =
     getGeminiModelProfile(configuredModel).operations.planner;
   const startedAt = Date.now();
+
+  logAiServerDiagnostic('info', 'gemini_planner_attempt_started', {
+    requestId: reqId,
+    operation: 'planner',
+    model: configuredModel,
+    apiVersion,
+    timeoutMs: plannerOpSettings.timeoutMs,
+    maxOutputTokens: plannerOpSettings.maxOutputTokens,
+    promptChars: prompt.length,
+    inputTaskCount: adviceTasks.length,
+  });
 
   const { model, response } = await generateContentWithModelResolution({
     ai,
@@ -1749,7 +1735,7 @@ export async function generateDayPlanWithGemini(
     baseConfig: {
       maxOutputTokens: plannerOpSettings.maxOutputTokens,
       responseMimeType: 'application/json',
-      responseSchema: PLANNER_RESPONSE_SCHEMA,
+      responseSchema: PLANNER_ADVICE_SCHEMA,
     },
     timeoutMs: plannerOpSettings.timeoutMs,
     thinkingMode: 'low_reasoning',
@@ -1758,7 +1744,7 @@ export async function generateDayPlanWithGemini(
     signal,
   });
 
-  const parsed = parseGeminiJsonResponse<AiPlannerRawResult>({
+  const parsed = parseGeminiJsonResponse<GeminiPlannerAdvicePayload>({
     response,
     model,
     operation: 'planner',
@@ -1767,6 +1753,34 @@ export async function generateDayPlanWithGemini(
   });
   const usage = extractUsageMetadata(response);
 
+  const validTaskIds = new Set(adviceTasks.map((t) => t.id));
+  const strategies: Array<{ taskId: string; strategy: string }> = [];
+  const seenStrategyIds = new Set<string>();
+
+  const rawStrategySource = Array.isArray(parsed.strategies)
+    ? parsed.strategies
+    : Array.isArray(parsed.recommendations)
+      ? parsed.recommendations
+      : [];
+
+  for (const item of rawStrategySource) {
+    if (strategies.length >= AI_LIMITS.MAX_PLANNER_ADVICE_TASKS) break;
+    if (!item || typeof item.taskId !== 'string') continue;
+    const taskId = item.taskId.trim();
+    if (!validTaskIds.has(taskId) || seenStrategyIds.has(taskId)) continue;
+    const strategyText =
+      typeof item.strategy === 'string' ? item.strategy.trim() : '';
+    if (!strategyText) continue;
+    seenStrategyIds.add(taskId);
+    strategies.push({
+      taskId,
+      strategy: strategyText.slice(0, 140),
+    });
+  }
+
+  const coreAdvice =
+    typeof parsed.coreAdvice === 'string' ? parsed.coreAdvice.trim() : '';
+
   logAiServerDiagnostic('info', 'gemini_planner_completed', {
     requestId: reqId,
     operation: 'planner',
@@ -1774,7 +1788,8 @@ export async function generateDayPlanWithGemini(
     latencyMs: Math.max(1, Date.now() - startedAt),
     timeoutMs: plannerOpSettings.timeoutMs,
     promptChars: prompt.length,
-    inputTaskCount: plannerTasks.length,
+    inputTaskCount: adviceTasks.length,
+    strategyCount: strategies.length,
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
     thoughtTokens: usage.thoughtTokens,
@@ -1784,16 +1799,19 @@ export async function generateDayPlanWithGemini(
     model,
     generatedAtIso: new Date().toISOString(),
     rawPlan: {
-      coreAdvice: typeof parsed.coreAdvice === 'string' ? parsed.coreAdvice : '',
-      recommendations: Array.isArray(parsed.recommendations)
-        ? parsed.recommendations.slice(0, AI_LIMITS.MAX_PLANNER_RECOMMENDATIONS)
-        : [],
-      attentionTasks: Array.isArray(parsed.attentionTasks)
-        ? parsed.attentionTasks.slice(0, 6)
-        : [],
-      deferredTasks: Array.isArray(parsed.deferredTasks)
-        ? parsed.deferredTasks.slice(0, 6)
-        : [],
+      coreAdvice,
+      strategies,
+      recommendations: strategies.map((entry, idx) => ({
+        taskId: entry.taskId,
+        order: idx + 1,
+        recommendedStart: null,
+        recommendedEnd: null,
+        estimatedMinutes: 30,
+        reason: '',
+        strategy: entry.strategy,
+      })),
+      attentionTasks: [],
+      deferredTasks: [],
     },
     usage,
   };

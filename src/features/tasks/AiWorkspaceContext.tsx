@@ -498,6 +498,8 @@ export function AiWorkspaceProvider({
         });
       } catch (err) {
         if (controller.signal.aborted) return;
+        controllerRef.current.setDeterministicPlan(ctx);
+        syncSnapshotState(controllerRef.current.getSnapshot());
         if (err instanceof AiClientError) {
           setPlannerError(err.message);
           setPlannerErrorCode(err.code);
@@ -511,7 +513,7 @@ export function AiWorkspaceProvider({
           setPlannerError(
             err instanceof Error
               ? err.message
-              : 'AI 업무 계획을 생성하지 못했습니다.',
+              : 'AI 조언을 생성하지 못해 기본 우선순위 계획을 먼저 표시했습니다.',
           );
           setPlannerErrorCode('unknown_error');
         }

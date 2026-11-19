@@ -6,10 +6,12 @@ import {
   buildDeterministicDayPlan,
   clipIntervalsToCurrentTime,
   excludePlanItemFromToday,
+  mergeDeterministicPlanWithAiAdvice,
   movePlanItemOrder,
   reassignPlanItemSlot,
   validateAndRepairAiPlan,
 } from '../src/lib/aiPlanner.ts';
+import { AiPlannerSessionController } from '../src/lib/aiPlannerSession.ts';
 import { AI_LIMITS } from '../src/lib/aiTypes.ts';
 import {
   buildCreateTaskPayload,
@@ -1172,20 +1174,12 @@ test('thinkingConfig uses bounded thinkingBudget on gemini-2.5-flash, avoids MIN
             return {
               text: JSON.stringify({
                 coreAdvice: '2교시 공강에 긴급 결재를 완료하세요.',
-                recommendations: [
+                strategies: [
                   {
                     taskId: 't1',
-                    order: 1,
-                    recommendedStart: '10:00',
-                    recommendedEnd: '10:25',
-                    estimatedMinutes: 25,
-                    tier: 'must',
                     strategy: '공문 양식 확인 후 즉시 결재 상신',
-                    reason: '오늘 마감 긴급 업무입니다.',
                   },
                 ],
-                attentionTasks: [],
-                deferredTasks: [],
               }),
               usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 40, totalTokenCount: 160 },
             };
@@ -1196,9 +1190,10 @@ test('thinkingConfig uses bounded thinkingBudget on gemini-2.5-flash, avoids MIN
     assert.equal(planOk.model, 'gemini-2.5-flash');
     assert.equal(capturedConfigs.length, 1);
     assert.deepEqual(capturedConfigs[0]?.thinkingConfig, { thinkingBudget: 512 });
-    assert.equal(capturedConfigs[0]?.maxOutputTokens, 3072);
+    assert.equal(capturedConfigs[0]?.maxOutputTokens, 1024);
+    assert.equal(planOk.rawPlan.strategies?.[0]?.taskId, 't1');
     assert.equal(planOk.rawPlan.recommendations[0].taskId, 't1');
-    assert.equal(planOk.rawPlan.recommendations[0].tier, 'must');
+    assert.equal(planOk.rawPlan.recommendations[0].strategy, '공문 양식 확인 후 즉시 결재 상신');
 
     // 4. When configured model returns 404 NOT_FOUND, planner does NOT silently switch models or retry blindly;
     //    it queries models.list (0-token diagnostic) once and throws 502 model_not_found with recommendedModel metadata.
@@ -2040,7 +2035,7 @@ test('Gemini 404 vs 504 classification, requestId propagation, env apiVersion, a
 
     assert.equal(noticeReqCaptured[0]?.model, plannerReqCaptured[0]?.model);
     assert.equal(noticeReqCaptured[0]?.config?.maxOutputTokens, 3072);
-    assert.equal(plannerReqCaptured[0]?.config?.maxOutputTokens, 3072);
+    assert.equal(plannerReqCaptured[0]?.config?.maxOutputTokens, 1024);
     assert.equal(noticeReqCaptured[0]?.config?.responseMimeType, 'application/json');
     assert.equal(plannerReqCaptured[0]?.config?.responseMimeType, 'application/json');
     assert.deepEqual(noticeReqCaptured[0]?.config?.thinkingConfig, { thinkingBudget: 128 });
@@ -2145,7 +2140,7 @@ test('gemini-4-hydrogen profile separation, thinkingLevel/JSON compatibility, an
     assert.equal(h4Profile.probe.maxOutputTokens, 128);
     assert.equal(h4Profile.probe.thinkingLevel, 'LOW');
     assert.equal(h4Profile.operations.analyze_notice.maxOutputTokens, 4096);
-    assert.equal(h4Profile.operations.planner.maxOutputTokens, 4096);
+    assert.equal(h4Profile.operations.planner.maxOutputTokens, 1024);
     const h4Compat = toCompatibilitySummary(h4Profile);
     assert.equal(h4Compat.noticeThinkingSummary, 'thinkingLevel=LOW');
     assert.equal(h4Compat.plannerThinkingSummary, 'thinkingLevel=LOW');
@@ -2156,9 +2151,9 @@ test('gemini-4-hydrogen profile separation, thinkingLevel/JSON compatibility, an
     assert.equal(g25Profile.thinkingParamType, 'thinkingBudget');
     assert.equal(g25Profile.operations.analyze_notice.thinkingBudget, 128);
     assert.equal(g25Profile.operations.planner.thinkingBudget, 512);
-    assert.equal(g25Profile.operations.planner.maxOutputTokens, 3072);
+    assert.equal(g25Profile.operations.planner.maxOutputTokens, 1024);
 
-    // 2. When GEMINI_MODEL=gemini-4-hydrogen, notice & planner send thinkingLevel=LOW + responseSchema + 4096 maxOutputTokens (never thinkingBudget)
+    // 2. When GEMINI_MODEL=gemini-4-hydrogen, notice keeps 4096 maxOutputTokens while planner uses lightweight 1024 maxOutputTokens
     process.env.GEMINI_MODEL = 'gemini-4-hydrogen';
     const capturedNoticeConfigs: Array<Record<string, unknown> | undefined> = [];
     const capturedPlannerConfigs: Array<Record<string, unknown> | undefined> = [];
@@ -2212,9 +2207,7 @@ test('gemini-4-hydrogen profile separation, thinkingLevel/JSON compatibility, an
             return {
               text: JSON.stringify({
                 coreAdvice: '공강 시간에 처리하세요.',
-                recommendations: [],
-                attentionTasks: [],
-                deferredTasks: [],
+                strategies: [{ taskId: 't1', strategy: '양식 먼저 점검 후 기안' }],
               }),
               usageMetadata: { promptTokenCount: 140, candidatesTokenCount: 35, thoughtsTokenCount: 40, totalTokenCount: 215 },
             };
@@ -2224,7 +2217,7 @@ test('gemini-4-hydrogen profile separation, thinkingLevel/JSON compatibility, an
       'req_h4_planner',
     );
     assert.deepEqual(capturedPlannerConfigs[0]?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
-    assert.equal(capturedPlannerConfigs[0]?.maxOutputTokens, 4096);
+    assert.equal(capturedPlannerConfigs[0]?.maxOutputTokens, 1024);
     assert.equal(capturedPlannerConfigs[0]?.responseMimeType, 'application/json');
     assert.ok(capturedPlannerConfigs[0]?.responseSchema);
 
@@ -2632,7 +2625,7 @@ test('candidate model probe uses 20000ms timeout while standard test stays 8000m
   }
 });
 
-test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloat to 8 tasks without breaking schema, and logs requestId/latencyMs/timeoutMs/timeoutSource/model on 45000ms timeout', async (t) => {
+test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloat to 3 tasks with flat 2-field advice schema, and logs requestId/latencyMs/timeoutMs/timeoutSource/model on 45000ms timeout', async (t) => {
   const prevModel = process.env.GEMINI_MODEL;
   const prevPlannerModel = process.env.GEMINI_PLANNER_MODEL;
   const capturedWarnings: string[] = [];
@@ -2656,13 +2649,13 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
     assert.equal(profile38.family, 'gemini-3');
     assert.equal(profile38.thinkingParamType, 'thinkingLevel');
     assert.equal(profile38.operations.planner.thinkingLevel, 'LOW');
-    assert.equal(profile38.operations.planner.maxOutputTokens, 4096);
+    assert.equal(profile38.operations.planner.maxOutputTokens, 1024);
     assert.equal(profile38.operations.planner.timeoutMs, 45000);
     assert.equal(profile38.operations.analyze_notice.timeoutMs, 25000);
     assert.equal(plannerRouteConfig.maxDuration, 60);
 
-    // 2. Prompt bloat trim: 15 input tasks -> top 8 in compactInput, compact slots, empty arrays omitted,
-    //    thinkingLevel=LOW + PLANNER_RESPONSE_SCHEMA preserved, 1 Gemini call, safe completion log emitted
+    // 2. Ultra-lightweight planner request: 15 input tasks -> top 3 in compactInput, no slots/events/academic,
+    //    flat 2-field PLANNER_ADVICE_SCHEMA, 1 Gemini call, safe attempt_started + completion logs emitted
     const fifteenTasks = Array.from({ length: 15 }, (_, idx) => ({
       id: `task-${idx + 1}`,
       t: `업무 제목 ${idx + 1}`,
@@ -2705,26 +2698,16 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
             return {
               text: JSON.stringify({
                 coreAdvice: '2교시 공강에 기한 지난 업무부터 처리하세요.',
-                recommendations: [
-                  {
-                    taskId: 'task-1',
-                    order: 1,
-                    recommendedStart: '10:00',
-                    recommendedEnd: '10:20',
-                    estimatedMinutes: 20,
-                    tier: 'must',
-                    strategy: '서류 양식 먼저 확인 후 기안',
-                    reason: '마감 기한 초과 긴급 업무',
-                  },
+                strategies: [
+                  { taskId: 'task-1', strategy: '서류 양식 먼저 확인 후 기안' },
+                  { taskId: 'hallucinated-id', strategy: '무시되어야 함' },
                 ],
-                attentionTasks: [{ taskId: 'task-1', reason: '기한 초과' }],
-                deferredTasks: [{ taskId: 'task-6', reason: '오늘 가용 시간 부족' }],
               }),
               usageMetadata: {
-                promptTokenCount: 280,
-                candidatesTokenCount: 95,
-                thoughtsTokenCount: 60,
-                totalTokenCount: 435,
+                promptTokenCount: 160,
+                candidatesTokenCount: 45,
+                thoughtsTokenCount: 30,
+                totalTokenCount: 235,
               },
             };
           },
@@ -2736,27 +2719,40 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
     assert.equal(plannerCalls, 1);
     assert.equal(planRes.model, 'gemini-3.8-flash');
     assert.deepEqual(capturedConfig?.thinkingConfig, { thinkingLevel: ThinkingLevel.LOW });
-    assert.equal(capturedConfig?.maxOutputTokens, 4096);
+    assert.equal(capturedConfig?.maxOutputTokens, 1024);
     assert.equal(capturedConfig?.responseMimeType, 'application/json');
-    assert.ok(capturedConfig?.responseSchema);
-    assert.equal(planRes.rawPlan.recommendations[0].tier, 'must');
-    assert.equal(planRes.rawPlan.recommendations[0].strategy, '서류 양식 먼저 확인 후 기안');
+    const schemaObj = capturedConfig?.responseSchema as {
+      required?: string[];
+      properties?: Record<string, unknown>;
+    };
+    assert.deepEqual(schemaObj?.required, ['coreAdvice', 'strategies']);
+    assert.deepEqual(Object.keys(schemaObj?.properties ?? {}), ['coreAdvice', 'strategies']);
+    assert.equal(planRes.rawPlan.coreAdvice, '2교시 공강에 기한 지난 업무부터 처리하세요.');
+    assert.equal(planRes.rawPlan.strategies?.length, 1);
+    assert.equal(planRes.rawPlan.strategies?.[0]?.taskId, 'task-1');
+    assert.equal(planRes.rawPlan.strategies?.[0]?.strategy, '서류 양식 먼저 확인 후 기안');
 
     const jsonMarker = '입력JSON:';
     const compactPayload = JSON.parse(
       capturedContents.slice(capturedContents.indexOf(jsonMarker) + jsonMarker.length),
     ) as {
       tasks: Array<{ id: string }>;
-      slots?: string[];
+      slots?: unknown;
       events?: unknown;
       academic?: unknown;
     };
-    assert.equal(compactPayload.tasks.length, 8);
+    assert.equal(compactPayload.tasks.length, 3);
     assert.equal(compactPayload.tasks[0]?.id, 'task-1');
-    assert.equal(compactPayload.tasks[7]?.id, 'task-8');
-    assert.deepEqual(compactPayload.slots, ['10:00~10:50(50m)']);
+    assert.equal(compactPayload.tasks[2]?.id, 'task-3');
+    assert.equal('slots' in compactPayload, false);
     assert.equal('events' in compactPayload, false);
     assert.equal('academic' in compactPayload, false);
+
+    const startLog = capturedInfos.find((line) => line.includes('gemini_planner_attempt_started'));
+    assert.ok(startLog);
+    assert.ok(startLog.includes('"requestId":"req_plan_38_ok"'));
+    assert.ok(startLog.includes('"maxOutputTokens":1024'));
+    assert.ok(startLog.includes('"inputTaskCount":3'));
 
     const completionLog = capturedInfos.find((line) => line.includes('gemini_planner_completed'));
     assert.ok(completionLog);
@@ -3098,3 +3094,162 @@ test('validateAndRepairAiPlan offloads slots/attention/deferred locally, respect
   assert.equal(fallbackValidated.coreAdvice, '핵심 조언 유지');
   assert.ok(fallbackValidated.validationRepairs.some((msg) => msg.includes('기본 우선순위')));
 });
+
+test('mergeDeterministicPlanWithAiAdvice & session quickFilter use local deterministic base and overlay coreAdvice + max 3 strategies', async () => {
+  const now = new Date('2026-11-16T08:40:00+09:00');
+  const timetable = makeTimetable();
+  const tasks: TaskRecord[] = [
+    makeTask({
+      id: 't-heavy-overdue',
+      title: '생기부 마감 점검',
+      priority: 'urgent',
+      dueAt: Timestamp.fromDate(new Date('2026-11-15T17:00:00+09:00')),
+      estimatedMinutes: 40,
+    }),
+    makeTask({
+      id: 't-light-today',
+      title: '학부모 안내 문자 발송',
+      priority: 'normal',
+      dueAt: Timestamp.fromDate(new Date('2026-11-16T17:00:00+09:00')),
+      estimatedMinutes: 15,
+    }),
+    makeTask({
+      id: 't-short-1',
+      title: '출결 통계 입력',
+      priority: 'high',
+      dueAt: Timestamp.fromDate(new Date('2026-11-16T17:00:00+09:00')),
+      estimatedMinutes: 20,
+    }),
+    makeTask({
+      id: 't-short-2',
+      title: '교과협의회 회의록 공유',
+      priority: 'normal',
+      estimatedMinutes: 25,
+    }),
+    makeTask({
+      id: 't-short-3',
+      title: '안전점검 체크리스트 제출',
+      priority: 'normal',
+      estimatedMinutes: 20,
+    }),
+    makeTask({
+      id: 't-deferred-extra',
+      title: '차주 현장체험학습 사전답사 문의',
+      priority: 'low',
+      estimatedMinutes: 30,
+    }),
+  ];
+
+  const context = buildAiPlannerContext({
+    uid: 'teacher-merge',
+    now,
+    todayKey: '2026-11-16',
+    timetables: [timetable],
+    overridesByDate: {},
+    academicEvents: [],
+    events: [],
+    tasks,
+    filter: {
+      constraintText: '오후에는 가벼운 업무만',
+    },
+  });
+
+  // 1. Local deterministic base already honors constraint, tiers, slots, attentionTasks, deferredTasks
+  const detBase = buildDeterministicDayPlan(context);
+  assert.equal(detBase.mode, 'deterministic');
+  assert.equal(detBase.recommendations.length, 5);
+  assert.ok(detBase.attentionTasks.some((t) => t.taskId === 't-heavy-overdue'));
+  assert.ok(detBase.deferredTasks.some((t) => t.taskId === 't-deferred-extra'));
+  const detHeavy = detBase.recommendations.find((r) => r.taskId === 't-heavy-overdue');
+  const detLight = detBase.recommendations.find((r) => r.taskId === 't-light-today');
+  assert.ok(detHeavy?.slotStart && detHeavy.slotEnd && detHeavy.slotStart >= '10:00' && detHeavy.slotEnd <= '10:50');
+  assert.ok(detLight?.slotStart && detLight.slotStart >= '13:20');
+
+  // 2. Session controller merges simple Gemini response onto deterministic base + reapplies on quickFilter with 0 AI calls
+  const controller = new AiPlannerSessionController(null);
+  controller.syncSession('teacher-merge', '2026-11-16');
+
+  let aiCalls = 0;
+  const runOutcome = await controller.runAiPlan({
+    context,
+    executeGemini: async () => {
+      aiCalls += 1;
+      return {
+        model: 'gemini-3.8-flash',
+        generatedAtIso: now.toISOString(),
+        rawPlan: {
+          coreAdvice: '오전에 생기부 마감 점검을 끝내고, 오후에는 20분 내 짧은 업무를 묶어 처리하세요.',
+          strategies: [
+            { taskId: 't-heavy-overdue', strategy: '미입력 학반 필터로 누락 항목만 먼저 추출' },
+            { taskId: 't-short-1', strategy: '나이스 출결 마감 화면과 대조 후 일괄 저장' },
+            { taskId: 't-light-today', strategy: '문자 템플릿 복사 후 학부모 일괄 발송' },
+            { taskId: 't-short-2', strategy: '최대 3건 제한으로 이 전략은 적용되지 않아야 함' },
+          ],
+          recommendations: [],
+          attentionTasks: [],
+          deferredTasks: [],
+        },
+        usage: { inputTokens: 120, outputTokens: 40, thoughtTokens: 20, totalTokens: 180 },
+      };
+    },
+  });
+
+  assert.equal(aiCalls, 1);
+  assert.equal(runOutcome.executedAiCall, true);
+  assert.equal(runOutcome.plan?.mode, 'ai');
+  assert.equal(runOutcome.plan?.coreAdvice, '오전에 생기부 마감 점검을 끝내고, 오후에는 20분 내 짧은 업무를 묶어 처리하세요.');
+  assert.equal(runOutcome.plan?.recommendations.length, 5);
+  assert.equal(
+    runOutcome.plan?.recommendations.find((r) => r.taskId === 't-heavy-overdue')?.strategy,
+    '미입력 학반 필터로 누락 항목만 먼저 추출',
+  );
+  // 4th strategy ignored (capped at 3)
+  assert.equal(
+    runOutcome.plan?.recommendations.find((r) => r.taskId === 't-short-2')?.strategy,
+    null,
+  );
+  assert.equal(runOutcome.plan?.usage?.totalTokens, 180);
+
+  // 3. Quick filter ("30분 이내만") excludes 40m heavy task deterministically while keeping AI coreAdvice & matching strategies (0 extra calls)
+  const filteredCtx = buildAiPlannerContext({
+    uid: 'teacher-merge',
+    now,
+    todayKey: '2026-11-16',
+    timetables: [timetable],
+    overridesByDate: {},
+    academicEvents: [],
+    events: [],
+    tasks,
+    filter: {
+      maxTaskMinutes: 30,
+      constraintText: '오후에는 가벼운 업무만',
+    },
+  });
+  const filteredPlan = controller.applyQuickFilter(
+    { maxTaskMinutes: 30, constraintText: '오후에는 가벼운 업무만' },
+    filteredCtx,
+  );
+  assert.equal(aiCalls, 1);
+  assert.equal(filteredPlan.mode, 'ai');
+  assert.ok(!filteredPlan.recommendations.some((r) => r.taskId === 't-heavy-overdue'));
+  assert.equal(
+    filteredPlan.recommendations.find((r) => r.taskId === 't-light-today')?.strategy,
+    '문자 템플릿 복사 후 학부모 일괄 발송',
+  );
+
+  // 4. Direct merge helper falls back to deterministic coreAdvice if AI coreAdvice is blank
+  const mergedEmptyAdvice = mergeDeterministicPlanWithAiAdvice(
+    {
+      coreAdvice: '   ',
+      strategies: [],
+      recommendations: [],
+      attentionTasks: [],
+      deferredTasks: [],
+    },
+    context,
+    { model: 'gemini-3.8-flash', generatedAtIso: now.toISOString() },
+  );
+  assert.equal(mergedEmptyAdvice.mode, 'ai');
+  assert.equal(mergedEmptyAdvice.coreAdvice, detBase.coreAdvice);
+});
+

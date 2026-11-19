@@ -228,7 +228,7 @@ export function AiTodayPlannerCard({
         </div>
       )}
 
-      {/* General Error (with deterministic fallback) */}
+      {/* General Error (with automatic deterministic fallback) */}
       {error && !loading && !showKeySetupPrompt && (
         <div
           role="alert"
@@ -236,18 +236,22 @@ export function AiTodayPlannerCard({
         >
           <div>
             <p className="font-semibold text-amber-900">
-              AI 업무 계획을 생성하지 못했습니다
+              {plan
+                ? 'AI 조언을 불러오지 못해 아래에 기본 우선순위 계획을 먼저 표시했습니다'
+                : 'AI 업무 계획을 생성하지 못했습니다'}
             </p>
             <p className="mt-1 leading-relaxed">{error}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onRunDeterministicPlan}
-              className="px-3 py-1.5 text-xs font-semibold bg-white border border-amber-300 text-amber-950 rounded-md hover:bg-amber-100 whitespace-nowrap cursor-pointer"
-            >
-              기본 우선순위 계획으로 보기 (AI 호출 없음)
-            </button>
+            {!plan && (
+              <button
+                type="button"
+                onClick={onRunDeterministicPlan}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-amber-300 text-amber-950 rounded-md hover:bg-amber-100 whitespace-nowrap cursor-pointer"
+              >
+                기본 우선순위 계획으로 보기 (AI 호출 없음)
+              </button>
+            )}
             {onOpenSettings && (
               <button
                 type="button"
