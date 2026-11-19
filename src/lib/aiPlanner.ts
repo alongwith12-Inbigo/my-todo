@@ -735,6 +735,133 @@ function allocateSlotDeterministically(
   return null;
 }
 
+interface ConstraintSlotPreference {
+  afternoonLightOnly: boolean;
+  morningLightOnly: boolean;
+  preferAfternoon: boolean;
+  preferMorning: boolean;
+  afterMinutes: number | null;
+}
+
+function parseConstraintSlotPreference(
+  constraint?: string,
+): ConstraintSlotPreference {
+  const text = (constraint ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) {
+    return {
+      afternoonLightOnly: false,
+      morningLightOnly: false,
+      preferAfternoon: false,
+      preferMorning: false,
+      afterMinutes: null,
+    };
+  }
+  const afternoonLightOnly =
+    /(?:오후\S*\s*가벼|가벼\S*\s*오후|오후\S*\s*짧|짧\S*\s*오후)/.test(text);
+  const morningLightOnly =
+    /(?:오전\S*\s*가벼|가벼\S*\s*오전|오전\S*\s*짧|짧\S*\s*오전)/.test(text);
+  const preferAfternoon =
+    !afternoonLightOnly &&
+    !morningLightOnly &&
+    /(?:오후에만|오후만|오후\s*이후|점심\s*이후|오후\s*위주|오후로)/.test(text);
+  const preferMorning =
+    !afternoonLightOnly &&
+    !morningLightOnly &&
+    /(?:오전에만|오전만|오전\s*중|오전\s*위주|오전으로)/.test(text);
+
+  let afterMinutes: number | null = null;
+  const afterMatch = /(\d{1,2})\s*(?:시|:00)\s*이후/.exec(text);
+  if (afterMatch) {
+    const h = Number(afterMatch[1]);
+    if (Number.isInteger(h) && h >= 7 && h <= 20) {
+      afterMinutes = h * 60;
+    }
+  }
+
+  return {
+    afternoonLightOnly,
+    morningLightOnly,
+    preferAfternoon,
+    preferMorning,
+    afterMinutes,
+  };
+}
+
+function allocateSlotWithConstraint(
+  durationMinutes: number,
+  freeCursorIntervals: MinuteInterval[],
+  preference: ConstraintSlotPreference,
+): { startMin: number; endMin: number; updatedFree: MinuteInterval[] } | null {
+  if (freeCursorIntervals.length === 0) return null;
+
+  const NOON_SPLIT_MIN = 12 * 60 + 30;
+  let preferredCandidates: MinuteInterval[] = [];
+
+  if (preference.afterMinutes !== null) {
+    const threshold = preference.afterMinutes;
+    preferredCandidates = freeCursorIntervals
+      .map((seg) => {
+        if (seg.endMin <= threshold) return null;
+        if (seg.startMin >= threshold) return seg;
+        const trimmedMinutes = seg.endMin - threshold;
+        if (trimmedMinutes < 10) return null;
+        return {
+          startMin: threshold,
+          endMin: seg.endMin,
+          startTime: minutesToHhMm(threshold),
+          endTime: seg.endTime,
+          minutes: trimmedMinutes,
+          label: seg.label,
+        };
+      })
+      .filter((seg): seg is MinuteInterval => seg !== null);
+  } else if (preference.afternoonLightOnly) {
+    preferredCandidates =
+      durationMinutes <= 25
+        ? freeCursorIntervals.filter((seg) => seg.startMin >= NOON_SPLIT_MIN)
+        : freeCursorIntervals.filter((seg) => seg.startMin < NOON_SPLIT_MIN);
+  } else if (preference.morningLightOnly) {
+    preferredCandidates =
+      durationMinutes <= 25
+        ? freeCursorIntervals.filter((seg) => seg.startMin < NOON_SPLIT_MIN)
+        : freeCursorIntervals.filter((seg) => seg.startMin >= NOON_SPLIT_MIN);
+  } else if (preference.preferAfternoon) {
+    preferredCandidates = freeCursorIntervals.filter(
+      (seg) => seg.startMin >= NOON_SPLIT_MIN,
+    );
+  } else if (preference.preferMorning) {
+    preferredCandidates = freeCursorIntervals.filter(
+      (seg) => seg.startMin < NOON_SPLIT_MIN,
+    );
+  }
+
+  if (preferredCandidates.length > 0) {
+    const fitInPreferred = preferredCandidates.find(
+      (seg) => seg.minutes >= durationMinutes,
+    );
+    const chosenSeg =
+      fitInPreferred ??
+      [...preferredCandidates].sort((a, b) => b.minutes - a.minutes)[0];
+    if (chosenSeg && chosenSeg.minutes >= 10) {
+      const allocDuration = Math.min(durationMinutes, chosenSeg.minutes);
+      const startMin = chosenSeg.startMin;
+      const endMin = startMin + allocDuration;
+      const updatedFree = subtractIntervals(freeCursorIntervals, [
+        {
+          startMin,
+          endMin,
+          startTime: minutesToHhMm(startMin),
+          endTime: minutesToHhMm(endMin),
+          minutes: allocDuration,
+        },
+      ]);
+      return { startMin, endMin, updatedFree };
+    }
+  }
+
+  return allocateSlotDeterministically(durationMinutes, freeCursorIntervals);
+}
+
 function clampEstimatedMinutes(val: unknown, fallback = 30): number {
   if (typeof val !== 'number' || !Number.isFinite(val)) return fallback;
   return Math.max(10, Math.min(180, Math.round(val / 5) * 5));
@@ -793,12 +920,15 @@ export function validateAndRepairAiPlan(
   const seenIds = new Set<string>();
   const validationRepairs: string[] = [];
   let freeWindows = context.remainingWorkableIntervals.map((seg) => ({ ...seg }));
+  const slotPreference = parseConstraintSlotPreference(
+    context.compressedRequest.constraint,
+  );
 
   const rawRecs = Array.isArray(rawPlan.recommendations)
     ? [...rawPlan.recommendations].sort((a, b) => (a.order ?? 99) - (b.order ?? 99))
     : [];
 
-  const recommendations: ValidatedPlanItem[] = [];
+  let recommendations: ValidatedPlanItem[] = [];
 
   for (const raw of rawRecs) {
     if (recommendations.length >= AI_LIMITS.MAX_PLANNER_RECOMMENDATIONS) break;
@@ -848,7 +978,11 @@ export function validateAndRepairAiPlan(
           },
         ]);
       } else {
-        const allocated = allocateSlotDeterministically(durationMinutes, freeWindows);
+        const allocated = allocateSlotWithConstraint(
+          durationMinutes,
+          freeWindows,
+          slotPreference,
+        );
         if (allocated) {
           slotStart = minutesToHhMm(allocated.startMin);
           slotEnd = minutesToHhMm(allocated.endMin);
@@ -863,11 +997,15 @@ export function validateAndRepairAiPlan(
         }
       }
     } else if (freeWindows.length > 0) {
-      const allocated = allocateSlotDeterministically(durationMinutes, freeWindows);
+      const allocated = allocateSlotWithConstraint(
+        durationMinutes,
+        freeWindows,
+        slotPreference,
+      );
       if (allocated) {
         slotStart = minutesToHhMm(allocated.startMin);
         slotEnd = minutesToHhMm(allocated.endMin);
-        slotStatus = 'repaired';
+        slotStatus = 'scheduled';
         freeWindows = allocated.updatedFree;
       } else {
         validationNote = getDefaultUnscheduledNote(context.availabilityReason);
@@ -914,6 +1052,18 @@ export function validateAndRepairAiPlan(
     });
   }
 
+  let deterministicFallback: ValidatedDayPlan | null = null;
+  if (recommendations.length === 0 && context.rankedTasks.length > 0) {
+    deterministicFallback = buildDeterministicDayPlan(context);
+    recommendations = deterministicFallback.recommendations;
+    for (const item of recommendations) {
+      seenIds.add(item.taskId);
+    }
+    validationRepairs.push(
+      'AI 추천 항목이 비어 있어 기본 우선순위 로직으로 실행 계획을 보완했습니다.',
+    );
+  }
+
   const normalizeTaskNotes = (
     list: Array<{ taskId?: string; reason?: string }> | undefined,
     maxCount = 6,
@@ -939,13 +1089,61 @@ export function validateAndRepairAiPlan(
     return out;
   };
 
-  const attentionTasks = normalizeTaskNotes(rawPlan.attentionTasks);
-  const deferredTasks = normalizeTaskNotes(rawPlan.deferredTasks).filter(
+  // Preserve valid AI-supplied attention/deferred notes, and deterministically fill missing items
+  // from rankedTasks so urgent/due/unselected tasks are never dropped when AI offloads these arrays.
+  const attentionTasks = normalizeTaskNotes(rawPlan.attentionTasks, 5);
+  const attentionSeen = new Set(attentionTasks.map((t) => t.taskId));
+  for (const task of context.rankedTasks) {
+    if (attentionTasks.length >= 5) break;
+    if (attentionSeen.has(task.id)) continue;
+    const dueKey = getKstDateInputValue(timestampToDate(task.dueAt)) || null;
+    const remindKey = getKstDateInputValue(timestampToDate(task.remindAt)) || null;
+    const isOverdue = Boolean(dueKey && dueKey < context.todayKey);
+    const isDueToday = dueKey === context.todayKey;
+    const isRemindDue = Boolean(remindKey && remindKey <= context.todayKey);
+    const isUrgent = task.priority === 'urgent';
+    if (!isOverdue && !isDueToday && !isRemindDue && !isUrgent) continue;
+
+    attentionSeen.add(task.id);
+    attentionTasks.push({
+      taskId: task.id,
+      title: task.title,
+      priority: task.priority,
+      dueDateKey: dueKey,
+      reason: isOverdue
+        ? '마감 기한 초과'
+        : isDueToday
+          ? '오늘 마감 도래'
+          : isRemindDue
+            ? '재확인 날짜 도래'
+            : '긴급 우선순위',
+    });
+  }
+
+  const deferredTasks = normalizeTaskNotes(rawPlan.deferredTasks, 6).filter(
     (d) => !seenIds.has(d.taskId),
   );
+  const deferredSeen = new Set(deferredTasks.map((t) => t.taskId));
+  for (const task of context.rankedTasks) {
+    if (deferredTasks.length >= 6) break;
+    if (seenIds.has(task.id) || deferredSeen.has(task.id)) continue;
+    const dueKey = getKstDateInputValue(timestampToDate(task.dueAt)) || null;
+    deferredSeen.add(task.id);
+    deferredTasks.push({
+      taskId: task.id,
+      title: task.title,
+      priority: task.priority,
+      dueDateKey: dueKey,
+      reason:
+        context.remainingWorkableMinutes <= 0 || freeWindows.length === 0
+          ? '오늘 가용 시간 부족으로 다음 일정 권장'
+          : '상위 추천 업무 우선 처리 후 다음 일정 권장',
+    });
+  }
 
   const coreAdvice =
     sanitizeSingleLine(rawPlan.coreAdvice || '', 260) ||
+    deterministicFallback?.coreAdvice ||
     '오늘 마감 업무와 실제 가용 시간을 기준으로 핵심 실행 순서를 정리했습니다.';
 
   return recomputePlanTotals({

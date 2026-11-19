@@ -25,6 +25,7 @@ import {
   generateSafeRequestId,
   getGeminiModelName,
   getGeminiModelProfile,
+  getGeminiPlannerModelName,
   logAiServerDiagnostic,
   mapGeminiError,
   toCompatibilitySummary,
@@ -1695,12 +1696,15 @@ export async function generateDayPlanWithGemini(
   requestId?: string,
 ): Promise<AiPlannerResponse> {
   const reqId = requestId ?? generateSafeRequestId();
-  const configuredModel = getGeminiModelName();
+  const configuredModel = getGeminiPlannerModelName();
   const ai = clientOverride ?? createGeminiClient(apiKey);
 
-  // Client already priority-ranks tasks via scoreTaskForPlanning; keep top 10 tasks
-  // (2x max recommendations) and omit empty arrays to reduce prompt/output bloat.
-  const plannerTasks = input.tasks.slice(0, 10);
+  // Client already priority-ranks tasks via scoreTaskForPlanning; keep top 8 tasks
+  // for Gemini (max 5 recommendations) and offload exact slot placement & attention/deferred lists to local logic.
+  const plannerTasks = input.tasks.slice(0, AI_LIMITS.MAX_PLANNER_AI_TASKS);
+  const compactSlots = input.workableSlots.map(
+    (s) => `${s.st}~${s.et}(${s.min}m)`,
+  );
   const compactInput: Record<string, unknown> = {
     today: input.todayKey,
     now: input.currentTimeHhMm,
@@ -1708,7 +1712,7 @@ export async function generateDayPlanWithGemini(
     totalTasks: input.totalIncompleteCount,
     overdue: input.overdueCount,
     dueToday: input.dueTodayCount,
-    ...(input.workableSlots.length > 0 ? { slots: input.workableSlots } : {}),
+    ...(compactSlots.length > 0 ? { slots: compactSlots } : {}),
     ...(input.blockedEventsSummary.length > 0
       ? { events: input.blockedEventsSummary }
       : {}),
@@ -1721,13 +1725,14 @@ export async function generateDayPlanWithGemini(
 
   const prompt = [
     `한국 교사의 '오늘의 업무 실행 전략 플래너'입니다.`,
+    `역할: 우선순위 판단, tier('must'|'optional') 구분, 짧은 실행 전략(strategy), 핵심 조언(coreAdvice)에 집중하세요.`,
     `규칙:`,
     `1. recommendations: tasks의 id만 사용해 최대 5건 선택(입력 외 항목·시간 창작 금지).`,
-    `2. slots가 있으면 겹치지 않게 recommendedStart/End(HH:MM)를 배치하고, slots가 없거나 시간이 부족/불명확하면 null로 두세요.`,
+    `2. 시간대 배치·충돌 검사는 로컬에서 처리하므로 recommendedStart/recommendedEnd는 기본 null로 두세요(단, constraint가 특정 시간대 선호를 요구할 때만 slots 안에서 선택 가능).`,
     `3. estimatedMinutes: task.m이 있으면 그대로, null이면 15~90 정수(5단위)로 추정.`,
-    `4. 긴급·마감·오늘 일정 전 준비(ev:true)·공강 길이를 반영해 우선순위와 tier('must'|'optional')를 정하세요.`,
-    `5. attentionTasks(핵심 주의 업무 최대 2건, 없으면 [])와 deferredTasks(미룰 업무 최대 3건, 없으면 [])만 간결히 채우세요.`,
-    `6. reason(25자 이내), strategy(35자 이내), coreAdvice(1문장 70자 이내)로 짧게 작성하세요.`,
+    `4. 긴급·마감·오늘 일정 전 준비(ev:true)·가용 시간(availMin/slots)·constraint를 반영해 우선순위와 tier('must'|'optional')를 정하세요.`,
+    `5. attentionTasks와 deferredTasks는 로컬에서 보완하므로 빈 배열 []로 두세요.`,
+    `6. reason(25자 이내), strategy(35자 이내), coreAdvice(1문장 70자 이내)로 간결히 작성하세요.`,
     `입력JSON:${JSON.stringify(compactInput)}`,
   ].join('\n');
 

@@ -59,7 +59,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
         planner: {
           maxOutputTokens: 4096,
           thinkingLevel: 'LOW',
-          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+          timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
         briefing: {
           maxOutputTokens: 3072,
@@ -92,7 +92,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
         planner: {
           maxOutputTokens: 3072,
           thinkingLevel: 'LOW',
-          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+          timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
         briefing: {
           maxOutputTokens: 2048,
@@ -122,7 +122,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
         planner: {
           maxOutputTokens: 4096,
           thinkingLevel: 'LOW',
-          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+          timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
         briefing: {
           maxOutputTokens: 3072,
@@ -151,7 +151,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
         planner: {
           maxOutputTokens: 3072,
           thinkingBudget: 512,
-          timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+          timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
         },
         briefing: {
           maxOutputTokens: 2048,
@@ -177,7 +177,7 @@ export function getGeminiModelProfile(modelName: string): GeminiModelProfile {
       },
       planner: {
         maxOutputTokens: 3072,
-        timeoutMs: AI_LIMITS.REQUEST_TIMEOUT_MS,
+        timeoutMs: AI_LIMITS.PLANNER_TIMEOUT_MS,
       },
       briefing: {
         maxOutputTokens: 2048,
@@ -274,6 +274,17 @@ export function getGeminiModelName(): string {
     return configured;
   }
   return DEFAULT_GEMINI_MODEL;
+}
+
+export function getGeminiPlannerModelName(): string {
+  const configured = process.env.GEMINI_PLANNER_MODEL?.trim();
+  if (
+    configured &&
+    !DEPRECATED_MODELS.some((prefix) => configured.toLowerCase().startsWith(prefix))
+  ) {
+    return configured;
+  }
+  return getGeminiModelName();
 }
 
 export function getAiStatusBasePayload() {

@@ -724,7 +724,11 @@ export async function resolvePersonalApiKeyForUid(params: {
 export function acquireUidInFlightLock(uid: string): boolean {
   const existing = inFlightUidLocks.get(uid);
   const now = Date.now();
-  if (existing && now - existing < AI_LIMITS.REQUEST_TIMEOUT_MS + 2000) {
+  const maxTimeoutMs = Math.max(
+    AI_LIMITS.REQUEST_TIMEOUT_MS,
+    AI_LIMITS.PLANNER_TIMEOUT_MS,
+  );
+  if (existing && now - existing < maxTimeoutMs + 2000) {
     return false;
   }
   inFlightUidLocks.set(uid, now);

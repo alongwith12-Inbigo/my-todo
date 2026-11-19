@@ -40,8 +40,10 @@ import {
   handleSaveByokKeyRequest,
   handleTestByokKeyRequest,
 } from '../server/aiRoutes.ts';
+import { config as plannerRouteConfig } from '../api/ai/planner.ts';
 import {
   getGeminiModelProfile,
+  getGeminiPlannerModelName,
   mapGeminiError,
   resolveSafeRequestId,
   sanitizeUpstreamErrorMessage,
@@ -2357,16 +2359,17 @@ test('candidate model probe uses 20000ms timeout while standard test stays 8000m
     clearGeminiModelCacheForTesting();
     process.env.GEMINI_MODEL = 'gemini-2.5-flash';
 
-    // 1. Timeout tiers remain strictly separated: 8000ms (standard test), 20000ms (candidate probe), 25000ms (notice/planner)
+    // 1. Timeout tiers remain strictly separated: 8000ms (standard test), 20000ms (candidate probe), 25000ms (notice), 45000ms (planner)
     assert.equal(AI_LIMITS.KEY_TEST_TIMEOUT_MS, 8000);
     assert.equal(AI_LIMITS.CANDIDATE_TEST_TIMEOUT_MS, 20000);
     assert.equal(AI_LIMITS.REQUEST_TIMEOUT_MS, 25000);
+    assert.equal(AI_LIMITS.PLANNER_TIMEOUT_MS, 45000);
     assert.equal(getKeyTestProbeTimeoutMs(false), 8000);
     assert.equal(getKeyTestProbeTimeoutMs(true), 20000);
     assert.equal(getGeminiModelProfile('gemini-4-hydrogen').operations.analyze_notice.timeoutMs, 25000);
-    assert.equal(getGeminiModelProfile('gemini-4-hydrogen').operations.planner.timeoutMs, 25000);
+    assert.equal(getGeminiModelProfile('gemini-4-hydrogen').operations.planner.timeoutMs, 45000);
     assert.equal(getGeminiModelProfile('gemini-2.5-flash').operations.analyze_notice.timeoutMs, 25000);
-    assert.equal(getGeminiModelProfile('gemini-2.5-flash').operations.planner.timeoutMs, 25000);
+    assert.equal(getGeminiModelProfile('gemini-2.5-flash').operations.planner.timeoutMs, 45000);
 
     // 2. mapGeminiError distinguishes local timer timeout vs Google API upstream timeout
     const localTimeoutMapped = mapGeminiError(
@@ -2629,8 +2632,9 @@ test('candidate model probe uses 20000ms timeout while standard test stays 8000m
   }
 });
 
-test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloat without breaking schema, and logs requestId/latencyMs/timeoutMs/timeoutSource/model on 25000ms timeout', async (t) => {
+test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloat to 8 tasks without breaking schema, and logs requestId/latencyMs/timeoutMs/timeoutSource/model on 45000ms timeout', async (t) => {
   const prevModel = process.env.GEMINI_MODEL;
+  const prevPlannerModel = process.env.GEMINI_PLANNER_MODEL;
   const capturedWarnings: string[] = [];
   const capturedInfos: string[] = [];
   const origWarn = console.warn;
@@ -2645,16 +2649,19 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
   try {
     clearGeminiModelCacheForTesting();
     process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+    delete process.env.GEMINI_PLANNER_MODEL;
 
-    // 1. Profile verification for gemini-3.8-flash
+    // 1. Profile & timeout separation verification for gemini-3.8-flash
     const profile38 = getGeminiModelProfile('gemini-3.8-flash');
     assert.equal(profile38.family, 'gemini-3');
     assert.equal(profile38.thinkingParamType, 'thinkingLevel');
     assert.equal(profile38.operations.planner.thinkingLevel, 'LOW');
     assert.equal(profile38.operations.planner.maxOutputTokens, 4096);
-    assert.equal(profile38.operations.planner.timeoutMs, 25000);
+    assert.equal(profile38.operations.planner.timeoutMs, 45000);
+    assert.equal(profile38.operations.analyze_notice.timeoutMs, 25000);
+    assert.equal(plannerRouteConfig.maxDuration, 60);
 
-    // 2. Prompt bloat trim: 15 input tasks -> top 10 in compactInput, empty arrays omitted,
+    // 2. Prompt bloat trim: 15 input tasks -> top 8 in compactInput, compact slots, empty arrays omitted,
     //    thinkingLevel=LOW + PLANNER_RESPONSE_SCHEMA preserved, 1 Gemini call, safe completion log emitted
     const fifteenTasks = Array.from({ length: 15 }, (_, idx) => ({
       id: `task-${idx + 1}`,
@@ -2738,10 +2745,16 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
     const jsonMarker = '입력JSON:';
     const compactPayload = JSON.parse(
       capturedContents.slice(capturedContents.indexOf(jsonMarker) + jsonMarker.length),
-    ) as { tasks: Array<{ id: string }>; events?: unknown; academic?: unknown };
-    assert.equal(compactPayload.tasks.length, 10);
+    ) as {
+      tasks: Array<{ id: string }>;
+      slots?: string[];
+      events?: unknown;
+      academic?: unknown;
+    };
+    assert.equal(compactPayload.tasks.length, 8);
     assert.equal(compactPayload.tasks[0]?.id, 'task-1');
-    assert.equal(compactPayload.tasks[9]?.id, 'task-10');
+    assert.equal(compactPayload.tasks[7]?.id, 'task-8');
+    assert.deepEqual(compactPayload.slots, ['10:00~10:50(50m)']);
     assert.equal('events' in compactPayload, false);
     assert.equal('academic' in compactPayload, false);
 
@@ -2749,14 +2762,14 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
     assert.ok(completionLog);
     assert.ok(completionLog.includes('"requestId":"req_plan_38_ok"'));
     assert.ok(completionLog.includes('"model":"gemini-3.8-flash"'));
-    assert.ok(completionLog.includes('"timeoutMs":25000'));
+    assert.ok(completionLog.includes('"timeoutMs":45000'));
     assert.ok(completionLog.includes('"latencyMs":'));
     assert.ok(!completionLog.includes('AQ.Ab8DummyPlanner38Key'));
 
-    // 3. 25000ms local timeout aborts request cleanly (1 call, 0 retries) and logs all required fields
+    // 3. 45000ms local timeout aborts request cleanly (1 call, 0 retries) and logs all required fields
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     try {
-      let abortedOn25s = false;
+      let abortedOn45s = false;
       let timeoutCalls = 0;
       const pendingRouteRes = handleAiPlannerRequest(
         {
@@ -2801,7 +2814,7 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
                     const sig = params.config?.abortSignal as AbortSignal | undefined;
                     return await new Promise((_resolve, reject) => {
                       sig?.addEventListener('abort', () => {
-                        abortedOn25s = true;
+                        abortedOn45s = true;
                         reject(new Error('aborted'));
                       }, { once: true });
                     });
@@ -2816,12 +2829,12 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
       for (let i = 0; i < 8; i += 1) {
         await Promise.resolve();
       }
-      t.mock.timers.tick(24999);
-      assert.equal(abortedOn25s, false);
+      t.mock.timers.tick(44999);
+      assert.equal(abortedOn45s, false);
       t.mock.timers.tick(1);
       const routeOut = await pendingRouteRes;
 
-      assert.equal(abortedOn25s, true);
+      assert.equal(abortedOn45s, true);
       assert.equal(timeoutCalls, 1);
       assert.equal(routeOut.status, 504);
       const body = routeOut.body as Record<string, unknown>;
@@ -2834,8 +2847,8 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
       );
       assert.ok(attemptWarn);
       assert.ok(attemptWarn.includes('"model":"gemini-3.8-flash"'));
-      assert.ok(attemptWarn.includes('"timeoutMs":25000'));
-      assert.ok(attemptWarn.includes('"latencyMs":25000'));
+      assert.ok(attemptWarn.includes('"timeoutMs":45000'));
+      assert.ok(attemptWarn.includes('"latencyMs":45000'));
       assert.ok(attemptWarn.includes('"timeoutSource":"local"'));
 
       const routeWarn = capturedWarnings.find((line) =>
@@ -2843,8 +2856,8 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
       );
       assert.ok(routeWarn);
       assert.ok(routeWarn.includes('"model":"gemini-3.8-flash"'));
-      assert.ok(routeWarn.includes('"timeoutMs":25000'));
-      assert.ok(routeWarn.includes('"latencyMs":25000'));
+      assert.ok(routeWarn.includes('"timeoutMs":45000'));
+      assert.ok(routeWarn.includes('"latencyMs":45000'));
       assert.ok(routeWarn.includes('"timeoutSource":"local"'));
       assert.ok(!routeWarn.includes('AQ.Ab8DummyPlannerTimeoutSecret'));
     } finally {
@@ -2856,10 +2869,232 @@ test('gemini-3.8-flash planner applies thinkingLevel=LOW, trims prompt/task bloa
     clearGeminiModelCacheForTesting();
     if (prevModel === undefined) delete process.env.GEMINI_MODEL;
     else process.env.GEMINI_MODEL = prevModel;
+    if (prevPlannerModel === undefined) delete process.env.GEMINI_PLANNER_MODEL;
+    else process.env.GEMINI_PLANNER_MODEL = prevPlannerModel;
   }
 });
 
+test('GEMINI_PLANNER_MODEL optionally overrides planner without affecting analyze_notice', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  const prevPlannerModel = process.env.GEMINI_PLANNER_MODEL;
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+    delete process.env.GEMINI_PLANNER_MODEL;
+    assert.equal(getGeminiPlannerModelName(), 'gemini-3.8-flash');
 
+    process.env.GEMINI_PLANNER_MODEL = 'gemini-3.5-flash-lite';
+    assert.equal(getGeminiPlannerModelName(), 'gemini-3.5-flash-lite');
 
+    let plannerModelUsed = '';
+    let noticeModelUsed = '';
+    const mockClient = {
+      models: {
+        list: async () => ({ page: [] }),
+        generateContent: async (params: { model: string; contents: string }) => {
+          if (params.contents.includes('입력JSON:')) {
+            plannerModelUsed = params.model;
+            return {
+              text: JSON.stringify({
+                coreAdvice: '핵심 조언',
+                recommendations: [],
+                attentionTasks: [],
+                deferredTasks: [],
+              }),
+            };
+          }
+          noticeModelUsed = params.model;
+          return {
+            text: JSON.stringify({
+              candidates: [],
+              unparsedSummary: [],
+            }),
+          };
+        },
+      },
+    };
 
+    await generateDayPlanWithGemini(
+      'AQ.Ab8DummyPlannerOverrideKey_1234',
+      {
+        todayKey: '2026-11-18',
+        currentTimeHhMm: '09:00',
+        totalIncompleteCount: 1,
+        overdueCount: 0,
+        dueTodayCount: 1,
+        timetableConfigured: true,
+        remainingWorkableMinutes: 50,
+        workableSlots: [{ st: '10:00', et: '10:50', min: 50, lb: '2교시 공강' }],
+        blockedEventsSummary: [],
+        academicAlertsSummary: [],
+        tasks: [
+          {
+            id: 't1',
+            t: '공문 제출',
+            d: '2026-11-18',
+            ov: false,
+            dd: 0,
+            p: 'u',
+            s: 'td',
+            m: 20,
+            tdy: true,
+          },
+        ],
+      },
+      undefined,
+      mockClient,
+      'req_override_plan',
+    );
 
+    await analyzeNoticeWithGemini(
+      'AQ.Ab8DummyNoticeUnchangedKey_1234',
+      { text: '가정통신문 안내', todayKey: '2026-11-18' },
+      undefined,
+      mockClient,
+      'req_override_notice',
+    );
+
+    assert.equal(plannerModelUsed, 'gemini-3.5-flash-lite');
+    assert.equal(noticeModelUsed, 'gemini-3.8-flash');
+  } finally {
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+    if (prevPlannerModel === undefined) delete process.env.GEMINI_PLANNER_MODEL;
+    else process.env.GEMINI_PLANNER_MODEL = prevPlannerModel;
+  }
+});
+
+test('validateAndRepairAiPlan offloads slots/attention/deferred locally, respects constraint, preserves tier/strategy, and falls back on empty AI recommendations', () => {
+  const now = new Date('2026-11-16T08:40:00+09:00');
+  const timetable = makeTimetable();
+  // Monday slots in makeTimetable():
+  // period 1: class (09:00-09:50)
+  // period 2: workable free (10:00-10:50, 50m)
+  // period 3: fixed_duty (11:00-11:50)
+  // lunch: 12:20-13:20
+  // period 4: workable free (13:20-14:10, 50m)
+  // period 5: workable free (14:20-15:10, 50m)
+  const tasks: TaskRecord[] = [
+    makeTask({
+      id: 't-heavy-overdue',
+      title: '생기부 마감 점검',
+      priority: 'urgent',
+      dueAt: Timestamp.fromDate(new Date('2026-11-15T17:00:00+09:00')),
+      estimatedMinutes: 40,
+    }),
+    makeTask({
+      id: 't-light-today',
+      title: '학부모 안내 문자 발송',
+      priority: 'normal',
+      dueAt: Timestamp.fromDate(new Date('2026-11-16T17:00:00+09:00')),
+      estimatedMinutes: 15,
+    }),
+    makeTask({
+      id: 't-unselected-1',
+      title: '교과협의회 자료 정리',
+      priority: 'normal',
+      estimatedMinutes: 30,
+    }),
+    makeTask({
+      id: 't-unselected-urgent',
+      title: '출결 마감 확인',
+      priority: 'urgent',
+      dueAt: Timestamp.fromDate(new Date('2026-11-16T17:00:00+09:00')),
+      estimatedMinutes: 20,
+    }),
+  ];
+
+  const context = buildAiPlannerContext({
+    uid: 'teacher-offload',
+    now,
+    todayKey: '2026-11-16',
+    timetables: [timetable],
+    overridesByDate: {},
+    academicEvents: [],
+    events: [],
+    tasks,
+    filter: {
+      constraintText: '오후에는 가벼운 업무만',
+    },
+  });
+
+  // 1. AI returns null slots and empty attentionTasks/deferredTasks while keeping tier/strategy
+  const validated = validateAndRepairAiPlan(
+    {
+      coreAdvice: '오전 공강에 핵심 생기부 업무를 마치고 오후에는 짧은 안내 문자를 처리하세요.',
+      recommendations: [
+        {
+          taskId: 't-heavy-overdue',
+          order: 1,
+          recommendedStart: null,
+          recommendedEnd: null,
+          estimatedMinutes: 40,
+          tier: 'must',
+          strategy: '미입력 학반 목록부터 먼저 추출 후 일괄 보완',
+          reason: '기한 지난 필수 업무',
+        },
+        {
+          taskId: 't-light-today',
+          order: 2,
+          recommendedStart: null,
+          recommendedEnd: null,
+          estimatedMinutes: 15,
+          tier: 'optional',
+          strategy: '문자 템플릿 복사 후 1반씩 순차 발송',
+          reason: '오후 짧은 공강에 적합한 가벼운 업무',
+        },
+      ],
+      attentionTasks: [],
+      deferredTasks: [],
+    },
+    context,
+    {
+      model: 'gemini-3.8-flash',
+      generatedAtIso: now.toISOString(),
+    },
+  );
+
+  assert.equal(validated.recommendations.length, 2);
+  assert.equal(validated.validationRepairs.length, 0);
+
+  const first = validated.recommendations[0];
+  const second = validated.recommendations[1];
+  assert.equal(first.tier, 'must');
+  assert.equal(first.strategy, '미입력 학반 목록부터 먼저 추출 후 일괄 보완');
+  assert.equal(first.slotStatus, 'scheduled');
+  // 40m heavy task placed in morning workable slot (<= 12:30, avoiding 09:00-09:50 class & 11:00-11:50 duty)
+  assert.ok(first.slotStart && first.slotEnd);
+  assert.ok(first.slotStart >= '10:00' && first.slotEnd <= '10:50');
+
+  // 15m light task placed in afternoon workable slot (>= 13:20, avoiding lunch 12:20-13:20)
+  assert.equal(second.tier, 'optional');
+  assert.equal(second.strategy, '문자 템플릿 복사 후 1반씩 순차 발송');
+  assert.equal(second.slotStatus, 'scheduled');
+  assert.ok(second.slotStart && second.slotEnd);
+  assert.ok(second.slotStart >= '13:20');
+
+  // attentionTasks & deferredTasks filled deterministically; unselected tasks never dropped
+  assert.ok(validated.attentionTasks.some((t) => t.taskId === 't-heavy-overdue'));
+  assert.ok(validated.attentionTasks.some((t) => t.taskId === 't-unselected-urgent'));
+  assert.ok(validated.deferredTasks.some((t) => t.taskId === 't-unselected-1'));
+  assert.ok(!validated.deferredTasks.some((t) => t.taskId === 't-heavy-overdue'));
+
+  // 2. Empty AI recommendations triggers clean deterministic fallback while preserving coreAdvice
+  const fallbackValidated = validateAndRepairAiPlan(
+    {
+      coreAdvice: '핵심 조언 유지',
+      recommendations: [],
+      attentionTasks: [],
+      deferredTasks: [],
+    },
+    context,
+    {
+      model: 'gemini-3.8-flash',
+      generatedAtIso: now.toISOString(),
+    },
+  );
+  assert.ok(fallbackValidated.recommendations.length > 0);
+  assert.equal(fallbackValidated.coreAdvice, '핵심 조언 유지');
+  assert.ok(fallbackValidated.validationRepairs.some((msg) => msg.includes('기본 우선순위')));
+});

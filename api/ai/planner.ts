@@ -5,6 +5,10 @@ import {
   type VercelLikeResponse,
 } from '../../server/aiRoutes.ts';
 
+export const config = {
+  maxDuration: 60,
+};
+
 export default async function handler(
   req: VercelLikeRequest,
   res: VercelLikeResponse,
