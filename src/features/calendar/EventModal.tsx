@@ -327,6 +327,8 @@ export function EventModal({
     (Boolean(noticeImport.imageFile) ||
       noticeImport.candidates.length > 0 ||
       Boolean(noticeImport.parseError) ||
+      Boolean(noticeImport.aiError) ||
+      noticeImport.aiRunning ||
       showNoticeBox);
 
   function handleModalPaste(e: ClipboardEvent<HTMLElement>) {
@@ -624,7 +626,9 @@ export function EventModal({
                 analysisMode={noticeImport.analysisMode}
                 aiRunning={noticeImport.aiRunning}
                 aiError={noticeImport.aiError}
+                aiErrorInfo={noticeImport.aiErrorInfo}
                 aiModelUsed={noticeImport.aiModelUsed}
+                activePlannerModel={noticeImport.activePlannerModel}
                 canFallbackToRule={noticeImport.canFallbackToRule}
                 onCancelAi={noticeImport.cancelAiAnalysis}
                 onFallbackToRule={noticeImport.runRuleFallbackAfterAiError}

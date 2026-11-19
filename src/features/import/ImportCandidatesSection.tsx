@@ -8,6 +8,7 @@ import {
   RotateCcw,
   Sparkles,
 } from 'lucide-react';
+import type { ClassifiedNoticeAiError } from '../../lib/aiNoticeError';
 import type { ImportCandidate, ImportSourceMode } from '../../lib/importParser';
 import {
   ImportCandidateCard,
@@ -25,7 +26,9 @@ interface ImportCandidatesSectionProps {
   analysisMode?: ImportSourceMode | null;
   aiRunning?: boolean;
   aiError?: string | null;
+  aiErrorInfo?: ClassifiedNoticeAiError | null;
   aiModelUsed?: string | null;
+  activePlannerModel?: string | null;
   canFallbackToRule?: boolean;
   onCancelAi?: () => void;
   onFallbackToRule?: () => void;
@@ -54,7 +57,9 @@ export function ImportCandidatesSection({
   analysisMode,
   aiRunning = false,
   aiError = null,
+  aiErrorInfo = null,
   aiModelUsed = null,
+  activePlannerModel = null,
   canFallbackToRule = false,
   onCancelAi,
   onFallbackToRule,
@@ -99,6 +104,11 @@ export function ImportCandidatesSection({
     return null;
   }
 
+  const errorDetail = aiErrorInfo?.errorDetail;
+  const isCriticalConfigOrAuth =
+    aiErrorInfo?.category === 'auth' ||
+    aiErrorInfo?.category === 'model_unsupported';
+
   return (
     <div
       aria-label="내용 분석 결과 검토"
@@ -128,13 +138,80 @@ export function ImportCandidatesSection({
       {aiError && (
         <div
           role="alert"
-          className="p-3.5 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-3"
+          className="p-3.5 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-950 flex flex-wrap items-start justify-between gap-3"
         >
           <div className="flex items-start gap-2 min-w-0 flex-1">
             <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" aria-hidden="true" />
-            <div className="space-y-0.5">
-              <p className="font-semibold text-amber-900">AI 분석을 완료하지 못했습니다</p>
-              <p>{aiError}</p>
+            <div className="space-y-1.5 min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="font-semibold text-amber-900">AI 분석을 완료하지 못했습니다</p>
+                {aiErrorInfo?.categoryLabel && (
+                  <span
+                    className={`inline-flex items-center px-2 py-0.5 text-[11px] font-semibold rounded-md border ${
+                      isCriticalConfigOrAuth
+                        ? 'bg-red-50 text-red-800 border-red-200'
+                        : 'bg-white text-amber-900 border-amber-300'
+                    }`}
+                  >
+                    {aiErrorInfo.categoryLabel}
+                  </span>
+                )}
+              </div>
+              <p className="leading-relaxed">{aiError}</p>
+              {aiErrorInfo?.guidance && aiErrorInfo.guidance !== aiError && (
+                <p className="text-[11px] text-amber-900/90 leading-relaxed">
+                  {aiErrorInfo.guidance}
+                </p>
+              )}
+              {errorDetail && (
+                <div className="space-y-1">
+                  <p className="text-[11px] text-amber-900/90 bg-white/75 border border-amber-200/80 rounded px-2.5 py-1.5 font-mono tabular-nums break-words">
+                    모델: {errorDetail.model ?? '미확인'}
+                    {typeof errorDetail.upstreamHttpStatus === 'number'
+                      ? ` · HTTP ${errorDetail.upstreamHttpStatus}${
+                          errorDetail.upstreamApiStatus
+                            ? ` (${errorDetail.upstreamApiStatus})`
+                            : ''
+                        }`
+                      : errorDetail.upstreamApiStatus
+                        ? ` · ${errorDetail.upstreamApiStatus}`
+                        : typeof aiErrorInfo?.httpStatus === 'number' && aiErrorInfo.httpStatus > 0
+                          ? ` · HTTP ${aiErrorInfo.httpStatus}`
+                          : ''}
+                    {typeof errorDetail.latencyMs === 'number' ||
+                    typeof errorDetail.timeoutMs === 'number'
+                      ? ` · 경과 ${
+                          typeof errorDetail.latencyMs === 'number'
+                            ? `${errorDetail.latencyMs}ms`
+                            : '-'
+                        }${
+                          typeof errorDetail.timeoutMs === 'number'
+                            ? ` / 제한 ${errorDetail.timeoutMs}ms`
+                            : ''
+                        }`
+                      : ''}
+                    {errorDetail.timeoutSource
+                      ? ` (${errorDetail.timeoutSource === 'local' ? '앱 로컬 제한' : 'Google API 시간 초과'})`
+                      : ''}
+                    {errorDetail.requestEndpoint
+                      ? ` · ${errorDetail.requestApiVersion ? `${errorDetail.requestApiVersion} ` : ''}${errorDetail.requestEndpoint}`
+                      : ''}
+                  </p>
+                  {errorDetail.upstreamErrorMessage && (
+                    <p className="text-[11px] text-amber-950 bg-white/85 border border-amber-200/80 rounded px-2.5 py-1.5 break-words">
+                      <span className="font-semibold">Google API 응답 상세:</span>{' '}
+                      <span className="font-mono">{errorDetail.upstreamErrorMessage}</span>
+                    </p>
+                  )}
+                </div>
+              )}
+              {activePlannerModel &&
+                errorDetail?.model &&
+                activePlannerModel !== errorDetail.model && (
+                  <p className="text-[11px] font-medium text-slate-800 bg-white/80 border border-amber-200 rounded px-2.5 py-1.5 leading-relaxed">
+                    참고: AI 업무 계획에 적용한 모델(<span className="font-mono font-semibold">{activePlannerModel}</span>)은 업무·일정 등록 AI 분석에 자동 적용되지 않으며, 이 기능은 서버 기본 모델(<span className="font-mono font-semibold">{errorDetail.model}</span>)을 사용합니다.
+                  </p>
+                )}
               {candidates.length > 0 && analysisMode !== 'ai' && (
                 <p className="text-amber-900 font-medium">
                   아래에 표시된 목록({candidates.length}건)은 이번에 실패한 AI 결과가 아니라 이전에 실행한 「이전 기본 분석 결과」입니다.

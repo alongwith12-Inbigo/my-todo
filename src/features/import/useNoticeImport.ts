@@ -37,7 +37,12 @@ import {
   inspectAndMaskPrivacy,
   type PrivacyInspectionResult,
 } from '../../lib/privacyGuard';
-import { AiClientError, requestAiNoticeAnalysis } from '../../services/aiClient';
+import {
+  classifyNoticeAiError,
+  getNoticeAiErrorCategoryLabel,
+  type ClassifiedNoticeAiError,
+} from '../../lib/aiNoticeError';
+import { requestAiNoticeAnalysis } from '../../services/aiClient';
 import { useAuth } from '../auth/AuthContext';
 import { useEventData } from '../calendar/EventDataContext';
 import { useOptionalAiWorkspace } from '../tasks/AiWorkspaceContext';
@@ -95,7 +100,10 @@ export function useNoticeImport() {
 
   // Step 5 AI state
   const [aiRunning, setAiRunning] = useState(false);
-  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiError, setAiErrorState] = useState<string | null>(null);
+  const [aiErrorInfo, setAiErrorInfo] = useState<ClassifiedNoticeAiError | null>(
+    null,
+  );
   const [aiModelUsed, setAiModelUsed] = useState<string | null>(null);
   const [aiPendingConsent, setAiPendingConsent] =
     useState<PendingAiConsentState | null>(null);
@@ -109,6 +117,18 @@ export function useNoticeImport() {
   const submitLockRef = useRef(false);
 
   const ocrSupported = useMemo(() => isBrowserOcrSupported(), []);
+
+  const setAiError = useCallback((next: string | null) => {
+    setAiErrorState(next);
+    if (next === null) {
+      setAiErrorInfo(null);
+    }
+  }, []);
+
+  const applyClassifiedAiError = useCallback((info: ClassifiedNoticeAiError) => {
+    setAiErrorState(info.message);
+    setAiErrorInfo(info);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -338,9 +358,15 @@ export function useNoticeImport() {
       setBatchSummary(null);
 
       if (!aiEnabled) {
-        setAiError(
-          '설정에서 AI 스마트 업무비서 기능이 꺼져 있습니다. 설정에서 켜거나 기본 분석을 이용해 주세요.',
-        );
+        applyClassifiedAiError({
+          category: 'setting_or_input',
+          categoryLabel: getNoticeAiErrorCategoryLabel('setting_or_input'),
+          message:
+            '설정에서 AI 스마트 업무비서 기능이 꺼져 있습니다. 설정에서 켜거나 기본 분석을 이용해 주세요.',
+          guidance:
+            '[설정 > AI 스마트 업무비서]에서 기능을 켜거나 아래 「기본 분석」을 이용해 주세요.',
+          errorCode: 'ai_disabled_by_user',
+        });
         return false;
       }
 
@@ -355,9 +381,14 @@ export function useNoticeImport() {
       }
 
       if (trimmed.length > AI_LIMITS.MAX_NOTICE_CHARS) {
-        setAiError(
-          `AI 분석은 한 번에 최대 ${AI_LIMITS.MAX_NOTICE_CHARS.toLocaleString()}자까지 지원합니다. 내용을 나누어 분석하거나 기본 분석을 이용해 주세요.`,
-        );
+        applyClassifiedAiError({
+          category: 'setting_or_input',
+          categoryLabel: getNoticeAiErrorCategoryLabel('setting_or_input'),
+          message: `AI 분석은 한 번에 최대 ${AI_LIMITS.MAX_NOTICE_CHARS.toLocaleString()}자까지 지원합니다. 내용을 나누어 분석하거나 기본 분석을 이용해 주세요.`,
+          guidance:
+            '내용을 나누어 입력하거나 아래 「대신 기본 분석 실행」을 이용해 주세요.',
+          errorCode: 'input_too_long',
+        });
         setLastAiFallbackSource({ text: trimmed, origin: sourceOrigin });
         return false;
       }
@@ -390,9 +421,15 @@ export function useNoticeImport() {
       const { rawSourceText, sourceOrigin, inspection } = aiPendingConsent;
 
       if (inspection.hasHighRisk && !applyMasking) {
-        setAiError(
-          '고위험 민감정보가 가려지지 않아 외부 AI 전송이 차단되었습니다. 가림 처리 후 다시 시도하거나 기본 분석을 이용해 주세요.',
-        );
+        applyClassifiedAiError({
+          category: 'setting_or_input',
+          categoryLabel: getNoticeAiErrorCategoryLabel('setting_or_input'),
+          message:
+            '고위험 민감정보가 가려지지 않아 외부 AI 전송이 차단되었습니다. 가림 처리 후 다시 시도하거나 기본 분석을 이용해 주세요.',
+          guidance:
+            '민감정보 자동 가림 처리를 선택하거나 아래 「대신 기본 분석 실행」을 이용해 주세요.',
+          errorCode: 'privacy_high_risk',
+        });
         return;
       }
 
@@ -433,9 +470,16 @@ export function useNoticeImport() {
         });
 
         if (normalized.candidates.length === 0) {
-          setAiError(
-            'AI가 업무나 일정 후보를 추출하지 못했습니다. 아래 버튼으로 기본 분석을 실행하거나 문장을 보완해 보세요.',
-          );
+          applyClassifiedAiError({
+            category: 'setting_or_input',
+            categoryLabel: getNoticeAiErrorCategoryLabel('setting_or_input'),
+            message:
+              'AI가 업무나 일정 후보를 추출하지 못했습니다. 아래 버튼으로 기본 분석을 실행하거나 문장을 보완해 보세요.',
+            guidance:
+              '날짜·제출·회의 등 구체적인 행동 표현을 보완하거나 「대신 기본 분석 실행」을 이용해 주세요.',
+            errorCode: 'ai_no_candidates',
+            errorDetail: { model: response.model },
+          });
           return;
         }
 
@@ -446,13 +490,7 @@ export function useNoticeImport() {
         setSaveStates({});
       } catch (err) {
         if (controller.signal.aborted) return;
-        const message =
-          err instanceof AiClientError
-            ? err.message
-            : err instanceof Error
-              ? err.message
-              : 'AI 분석에 실패했습니다. 기본 분석을 이용해 주세요.';
-        setAiError(message);
+        applyClassifiedAiError(classifyNoticeAiError(err));
       } finally {
         if (aiAbortRef.current === controller) {
           aiAbortRef.current = null;
@@ -460,7 +498,14 @@ export function useNoticeImport() {
         }
       }
     },
-    [aiPendingConsent, aiWorkspace, briefingTasks, events],
+    [
+      aiPendingConsent,
+      aiWorkspace,
+      applyClassifiedAiError,
+      briefingTasks,
+      events,
+      setAiError,
+    ],
   );
 
   const runRuleFallbackAfterAiError = useCallback(() => {
@@ -677,8 +722,10 @@ export function useNoticeImport() {
     aiEnabled,
     aiRunning,
     aiError,
+    aiErrorInfo,
     setAiError,
     aiModelUsed,
+    activePlannerModel: aiWorkspace?.activePlannerModel ?? null,
     aiPendingConsent,
     canFallbackToRule: Boolean(lastAiFallbackSource),
     requestAiAnalysis,

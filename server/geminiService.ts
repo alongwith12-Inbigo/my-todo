@@ -1058,6 +1058,7 @@ export function parseGeminiJsonResponse<T extends object>(params: {
         'ai_response_truncated',
         'AI 응답 생성 길이가 초과되어 결과를 완성하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
         {
+          model: params.model,
           diagnosticCategory: 'server_error',
           requestId: params.requestId,
         },
@@ -1070,6 +1071,7 @@ export function parseGeminiJsonResponse<T extends object>(params: {
       finishReason: finishReason ?? 'UNKNOWN',
     });
     throw new GeminiServiceError(502, 'ai_empty_response', params.emptyMessage, {
+      model: params.model,
       diagnosticCategory: 'server_error',
       requestId: params.requestId,
     });
@@ -1104,6 +1106,7 @@ export function parseGeminiJsonResponse<T extends object>(params: {
         'ai_response_truncated',
         'AI 응답이 길이 제한으로 중간에 잘려 결과를 처리하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
         {
+          model: params.model,
           diagnosticCategory: 'server_error',
           requestId: params.requestId,
         },
@@ -1114,6 +1117,7 @@ export function parseGeminiJsonResponse<T extends object>(params: {
       'ai_invalid_json',
       'AI 모델이 올바른 JSON 형식의 응답을 반환하지 못했습니다. 잠시 후 다시 시도하거나 기본 기능을 이용해 주세요.',
       {
+        model: params.model,
         diagnosticCategory: 'server_error',
         requestId: params.requestId,
       },

@@ -20,6 +20,15 @@ import {
   normalizeAiBriefingResult,
   normalizeAiNoticeCandidates,
 } from '../src/lib/aiImportValidator.ts';
+import {
+  analyzeNoticeWithGemini,
+  clearGeminiModelCacheForTesting,
+} from '../server/geminiService.ts';
+import {
+  classifyNoticeAiError,
+  sanitizeClientDiagnosticText,
+  type NoticeAiClientErrorLike,
+} from '../src/lib/aiNoticeError.ts';
 import { AI_LIMITS } from '../src/lib/aiTypes.ts';
 import { inspectAndMaskPrivacy } from '../src/lib/privacyGuard.ts';
 import type { CalendarEventRecord, TaskRecord } from '../src/types/domain.ts';
@@ -347,3 +356,254 @@ test('mapGeminiError never leaks raw API key strings or internal details', () =>
   assert.equal(mapped.code, 'invalid_api_key');
   assert.ok(!mapped.message.includes('AIzaSecretKeyShouldNeverAppearInUi'));
 });
+
+test('analyze_notice stays isolated from planner model overrides and returns structured 5xx diagnostics without retries', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  const prevPlannerModel = process.env.GEMINI_PLANNER_MODEL;
+  const origWarn = console.warn;
+  console.warn = () => {};
+
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+    process.env.GEMINI_PLANNER_MODEL = 'gemini-3.5-flash-lite';
+
+    let callCount = 0;
+    let capturedParams:
+      | {
+          model: string;
+          config?: {
+            maxOutputTokens?: number;
+            responseMimeType?: string;
+            responseSchema?: unknown;
+            thinkingConfig?: { thinkingLevel?: string };
+          };
+        }
+      | undefined;
+
+    const mockClient = {
+      models: {
+        list: async () => ({ page: [] }),
+        generateContent: async (params: {
+          model: string;
+          contents: string;
+          config?: Record<string, unknown>;
+        }) => {
+          callCount += 1;
+          capturedParams = params as typeof capturedParams;
+          const err = new Error(
+            JSON.stringify({
+              error: {
+                code: 500,
+                status: 'INTERNAL',
+                message:
+                  'Internal error encountered. (key=AIzaShouldBeRedactedFromMessage)',
+              },
+            }),
+          ) as Error & { status: number };
+          err.status = 500;
+          throw err;
+        },
+      },
+    };
+
+    const routeRes = await handleAnalyzeNoticeRequest(
+      {
+        authorizationHeader: 'Bearer active-token',
+        body: { text: '11월 20일까지 생활기록부 점검표 제출 바랍니다.' },
+      },
+      {
+        verifyAuth: async () => ({
+          uid: 'teacher-notice-5xx',
+          email: 't@icedu.kr',
+          emailVerified: true,
+          accessStatus: 'active',
+          role: 'teacher',
+        }),
+        isConfigured: () => true,
+        rateLimiter: new SlidingWindowRateLimiter(10, 60_000),
+        analyzeNotice: async (input, signal, apiKey, requestId) =>
+          await analyzeNoticeWithGemini(
+            apiKey ?? 'test-injected-key',
+            input,
+            signal,
+            mockClient,
+            requestId,
+          ),
+      },
+    );
+
+    assert.equal(callCount, 1);
+    assert.equal(capturedParams?.model, 'gemini-3.8-flash');
+    assert.equal(capturedParams?.config?.maxOutputTokens, 4096);
+    assert.equal(capturedParams?.config?.responseMimeType, 'application/json');
+    assert.ok(capturedParams?.config?.responseSchema);
+    assert.equal(capturedParams?.config?.thinkingConfig?.thinkingLevel, 'LOW');
+
+    assert.equal(routeRes.status, 502);
+    const body = routeRes.body as Record<string, unknown>;
+    assert.equal(body.error, 'ai_upstream_error');
+    assert.equal(body.diagnosticCategory, 'server_error');
+    assert.equal(body.model, 'gemini-3.8-flash');
+    assert.equal(body.upstreamHttpStatus, 500);
+    assert.equal(body.upstreamApiStatus, 'INTERNAL');
+    assert.equal(body.requestApiVersion, 'v1');
+    assert.equal(
+      body.requestEndpoint,
+      'models/gemini-3.8-flash:generateContent',
+    );
+    assert.ok(typeof body.upstreamErrorMessage === 'string');
+    assert.ok(
+      !String(body.upstreamErrorMessage).includes('AIzaShouldBeRedactedFromMessage'),
+    );
+  } finally {
+    console.warn = origWarn;
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+    if (prevPlannerModel === undefined) delete process.env.GEMINI_PLANNER_MODEL;
+    else process.env.GEMINI_PLANNER_MODEL = prevPlannerModel;
+  }
+});
+
+test('analyzeNoticeWithGemini attaches model name to empty/invalid JSON errors', async () => {
+  const prevModel = process.env.GEMINI_MODEL;
+  const origWarn = console.warn;
+  console.warn = () => {};
+
+  try {
+    clearGeminiModelCacheForTesting();
+    process.env.GEMINI_MODEL = 'gemini-3.8-flash';
+    const mockClient = {
+      models: {
+        list: async () => ({ page: [] }),
+        generateContent: async () => ({ text: '   ' }),
+      },
+    };
+
+    await assert.rejects(
+      () =>
+        analyzeNoticeWithGemini(
+          'AQ.DummyKeyForJsonErrorTest_1234',
+          { text: '11월 20일까지 제출' },
+          undefined,
+          mockClient,
+          'req_empty_notice',
+        ),
+      (err: unknown) => {
+        const svcErr = err as { code?: string; model?: string; diagnosticCategory?: string };
+        return (
+          svcErr.code === 'ai_empty_response' &&
+          svcErr.model === 'gemini-3.8-flash' &&
+          svcErr.diagnosticCategory === 'server_error'
+        );
+      },
+    );
+  } finally {
+    console.warn = origWarn;
+    clearGeminiModelCacheForTesting();
+    if (prevModel === undefined) delete process.env.GEMINI_MODEL;
+    else process.env.GEMINI_MODEL = prevModel;
+  }
+});
+
+test('classifyNoticeAiError distinguishes all required categories and redacts secrets', () => {
+  const makeClientErr = (
+    status: number,
+    code: string,
+    message: string,
+    category?: NoticeAiClientErrorLike['category'],
+    errorDetail?: NoticeAiClientErrorLike['errorDetail'],
+  ): NoticeAiClientErrorLike => ({
+    name: 'AiClientError',
+    status,
+    code,
+    message,
+    category,
+    errorDetail,
+  });
+
+  const authErr = classifyNoticeAiError(
+    makeClientErr(
+      401,
+      'api_key_permission_denied',
+      '인증 실패',
+      'gemini_api',
+      { diagnosticCategory: 'auth_failed', model: 'gemini-3.8-flash' },
+    ),
+  );
+  assert.equal(authErr.category, 'auth');
+  assert.equal(authErr.categoryLabel, '인증 오류');
+
+  const modelErr = classifyNoticeAiError(
+    makeClientErr(
+      404,
+      'model_not_found',
+      '모델 미지원',
+      'gemini_api',
+      { diagnosticCategory: 'model_not_supported', model: 'gemini-3.8-flash' },
+    ),
+  );
+  assert.equal(modelErr.category, 'model_unsupported');
+  assert.equal(modelErr.categoryLabel, '모델 미지원·권한·형식 오류');
+
+  const quotaErr = classifyNoticeAiError(
+    makeClientErr(429, 'rate_limit_exceeded', '호출 한도 초과', 'gemini_api'),
+  );
+  assert.equal(quotaErr.category, 'quota');
+  assert.equal(quotaErr.categoryLabel, '사용량 제한');
+
+  const serverErr = classifyNoticeAiError(
+    makeClientErr(
+      502,
+      'ai_upstream_error',
+      'Google Gemini 서버에서 일시적인 내부 오류가 발생했습니다.',
+      'gemini_api',
+      {
+        diagnosticCategory: 'server_error',
+        model: 'gemini-3.8-flash',
+        upstreamHttpStatus: 500,
+        upstreamApiStatus: 'INTERNAL',
+        upstreamErrorMessage:
+          'Internal error with AIzaLeak1234567890 and AQ.LeakSecretToken1234 and Bearer eyJabc.def.ghi',
+      },
+    ),
+  );
+  assert.equal(serverErr.category, 'server_error');
+  assert.equal(serverErr.categoryLabel, '서버 내부 오류');
+  assert.ok(!serverErr.errorDetail?.upstreamErrorMessage?.includes('AIzaLeak1234567890'));
+  assert.ok(!serverErr.errorDetail?.upstreamErrorMessage?.includes('AQ.LeakSecretToken1234'));
+  assert.ok(!serverErr.errorDetail?.upstreamErrorMessage?.includes('eyJabc.def.ghi'));
+
+  const timeoutErr = classifyNoticeAiError(
+    makeClientErr(
+      504,
+      'ai_timeout',
+      '시간 초과',
+      'gemini_api',
+      {
+        diagnosticCategory: 'timeout',
+        timeoutSource: 'local',
+        timeoutMs: 25000,
+        latencyMs: 25001,
+      },
+    ),
+  );
+  assert.equal(timeoutErr.category, 'timeout');
+  assert.equal(timeoutErr.categoryLabel, '시간 초과');
+  assert.ok(timeoutErr.guidance.includes('25초'));
+
+  const netErr = classifyNoticeAiError(
+    makeClientErr(0, 'network_error', '네트워크 오류', 'network'),
+  );
+  assert.equal(netErr.category, 'network');
+  assert.equal(netErr.categoryLabel, '네트워크 오류');
+
+  const sanitized = sanitizeClientDiagnosticText(
+    'x-goog-api-key: secret123 ?key=abc999 normal detail',
+  );
+  assert.ok(!sanitized.includes('secret123'));
+  assert.ok(!sanitized.includes('abc999'));
+  assert.ok(sanitized.includes('normal detail'));
+});
+

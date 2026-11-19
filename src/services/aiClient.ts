@@ -16,6 +16,7 @@ import type {
   AiStatusResponse,
   AiTimeoutSource,
   AiUsageSnapshot,
+  GeminiDiagnosticErrorCategory,
 } from '../lib/aiTypes';
 
 export class AiClientError extends Error {
@@ -113,6 +114,7 @@ async function fetchAiJson<T>(
             errorCode?: unknown;
             detailCode?: unknown;
             category?: unknown;
+            diagnosticCategory?: unknown;
             message?: unknown;
             model?: unknown;
             timeoutSource?: unknown;
@@ -168,6 +170,7 @@ async function fetchAiJson<T>(
         )
       : undefined;
     const hasDiagnosticFields =
+      typeof errObj.diagnosticCategory === 'string' ||
       typeof errObj.model === 'string' ||
       typeof errObj.timeoutSource === 'string' ||
       typeof errObj.timeoutMs === 'number' ||
@@ -175,12 +178,20 @@ async function fetchAiJson<T>(
       typeof errObj.chunkCount === 'number' ||
       typeof errObj.streamed === 'boolean' ||
       typeof errObj.requestId === 'string' ||
+      typeof errObj.requestApiVersion === 'string' ||
+      typeof errObj.requestEndpoint === 'string' ||
       typeof errObj.upstreamHttpStatus === 'number' ||
       typeof errObj.upstreamApiStatus === 'string' ||
       typeof errObj.upstreamErrorMessage === 'string';
     const errorDetail: AiPlannerErrorDetail | undefined = hasDiagnosticFields
       ? {
           errorCode: code,
+          ...(typeof errObj.diagnosticCategory === 'string'
+            ? {
+                diagnosticCategory:
+                  errObj.diagnosticCategory as GeminiDiagnosticErrorCategory,
+              }
+            : {}),
           ...(typeof errObj.model === 'string' ? { model: errObj.model } : {}),
           ...(errObj.timeoutSource === 'local' || errObj.timeoutSource === 'upstream'
             ? { timeoutSource: errObj.timeoutSource as AiTimeoutSource }

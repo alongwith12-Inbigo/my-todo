@@ -92,6 +92,7 @@ export interface AiStatusResponse {
 
 export interface AiPlannerErrorDetail {
   errorCode?: string;
+  diagnosticCategory?: GeminiDiagnosticErrorCategory;
   model?: string;
   timeoutSource?: AiTimeoutSource;
   timeoutMs?: number;
